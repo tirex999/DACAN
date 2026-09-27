@@ -509,9 +509,10 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
     // core or its SMT sibling.  The symptom is not an error: it is a CPU path at 26.9 GB/s where the same pool
     // runs at 36.32.  It was being done and undone on EVERY token, which is a syscall pair on the critical path
     // for a property that wants to hold for the whole session.
-    const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
-    if (!cores.empty()) {
-        pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
+    // 27.09.2026: `host_core` - the first allowed physical core, or with --numa one on the main card's node
+    const int hc = strata::kernels::cpu::host_core();
+    if (hc >= 0) {
+        pinned_core = strata::kernels::cpu::pin_current_thread(hc);
         pinned = true;
     }
     return true;

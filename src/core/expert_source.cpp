@@ -7,10 +7,14 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 
+#include "strata/kernels/iq_kernels.hpp"
+
 #include <cuda_runtime.h>
+#include <immintrin.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -248,6 +252,55 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     d.experts += k;
 }
 
+namespace {
+
+// 26.09.2026: the second card's share of a verify window's layer.  The caller has written the plan block
+// (`SecondCard::h_plan`); this copies it and the window's activations over, runs the grouped kernels on the card's
+// slots and gathers the rows into the mapped `out` (the same `y_miss` rows the CPU writes).  Asynchronous: the
+// caller computes the CPU share meanwhile and then calls `second_card_wait`, before the main card is told the
+// layer is served.  The plan and `x` are not touched again until then, so the copies cannot race the next layer.
+bool second_card_issue(SecondCard& c, const strata::kernels::cpu::NativeFmt& f, const float* x_f, int64_t n_tok,
+                       int64_t n_embd, float* out, int groups, int entries) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (cudaSetDevice(c.device) != cudaSuccess) return false;
+    cudaStream_t s = (cudaStream_t) c.stream;
+    const int64_t cap = c.cap, ptr_off = (4 + (cap + 1) + 2 * cap + 1) & ~1ll;
+    bool ok = cudaMemcpyAsync(c.d_plan, c.h_plan, (size_t) c.plan_i32 * 4, cudaMemcpyHostToDevice, s) == cudaSuccess &&
+              cudaMemcpyAsync(c.x, x_f, (size_t) n_tok * (size_t) n_embd * 4, cudaMemcpyHostToDevice, s) == cudaSuccess;
+    if (ok) {
+        strata::kernels::quantize_q8_1_rows(c.x, n_tok, n_embd, c.xq, s);
+        const int32_t* counts = c.d_plan;
+        const int32_t* start = counts + 4;
+        const int32_t* dst = start + cap + 1;
+        const int32_t* tok = dst + cap;
+        const unsigned long long* ptr = (const unsigned long long*) (c.d_plan + ptr_off);
+        auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        L.scaled = f.scaled ? 1 : 0;   // 27.09.2026: NVFP4's per-expert global scales at the blob's tail
+        L.scale_off = f.scale_off;
+        L.bytes = f.bytes;
+        strata::kernels::native_expert_grouped(L, ptr, start, counts, dst, tok, groups, entries, c.xq, c.scratch, c.out, s);
+        strata::kernels::gather_rows(c.out, dst, counts + 1, entries, n_embd, out, s);
+        ok = cudaEventRecord((cudaEvent_t) c.done, s) == cudaSuccess;
+    }
+    cudaSetDevice(c.main_device);
+    c.pending = ok;
+    ++c.launches;
+    c.ms_launch += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return ok;
+}
+
+bool second_card_wait(SecondCard& c) {
+    const auto t0 = std::chrono::steady_clock::now();
+    cudaError_t q;
+    while ((q = cudaEventQuery((cudaEvent_t) c.done)) == cudaErrorNotReady) _mm_pause();
+    c.pending = false;
+    c.ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (q != cudaSuccess) std::fprintf(stderr, "strata: second card: %s\n", cudaGetErrorString(q));
+    return q == cudaSuccess;
+}
+
+}  // namespace
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -275,13 +328,21 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+    if (!d.routed_total.empty())
+        for (int64_t i = 0; i < n_tok * k; ++i)
+            if (ids[i] >= 0 && ids[i] < d.n_expert) ++d.routed_total[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]];
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
-    int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe, 2 the second card
+    SecondCard* card = (d.card2 != nullptr && native && n <= d.card2->cap) ? d.card2 : nullptr;
+    auto slot2 = [&](int32_t e) -> int32_t {
+        return card != nullptr ? card->host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] : kNotResident;
+    };
     if (d.plan != nullptr && n <= 128 && n <= d.plan->cap) {
         int64_t distinct[128], first_of[128];
         int nd = 0, nmiss = 0;
+        int n_main = 0, n_card = 0, n_dual = 0;   // distinct experts only the main card / only the second / both hold
         for (int64_t i = 0; i < n; ++i) {
             first_of[i] = i;
             for (int64_t j = 0; j < i; ++j)
@@ -289,8 +350,40 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (first_of[i] == i) {
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
-                if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0) ++nmiss;
+                if (e < 0 || e >= d.n_expert) continue;
+                const bool on_main = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0;
+                const bool on_card = slot2(e) >= 0;
+                if (on_main && on_card) ++n_dual;
+                else if (on_main) ++n_main;
+                else if (on_card) ++n_card;
+                else ++nmiss;   // missed by both cards: the PCIe share and the CPU split these
             }
+        }
+        // 26.09.2026: experts BOTH cards hold are split so that the two finish together.  The main card starts its
+        // hits later (after its shared expert) but has no host round trip; `bias` (STRATA_CARD2_BIAS, in experts) is
+        // how much earlier the second card's share effectively starts.  Main: n_main + (n_dual - k); card: n_card + k.
+        static const double bias = std::getenv("STRATA_CARD2_BIAS") ? std::atof(std::getenv("STRATA_CARD2_BIAS")) : 1.0;
+        int k_dual = 0;
+        if (n_dual > 0) {
+            const double kk = (bias + (double) n_main + (double) n_dual - (double) n_card) / 2.0;
+            k_dual = (int) std::lround(kk);
+            k_dual = k_dual < 0 ? 0 : (k_dual > n_dual ? n_dual : k_dual);
+        }
+        int dual_sent = 0;
+        // 26.09.2026: the second card's groups, in its own plan block (see `SecondCard`)
+        int g2 = 0, e2 = 0;
+        int32_t* c2_counts = nullptr;
+        int32_t* c2_start = nullptr;
+        int32_t* c2_dst = nullptr;
+        int32_t* c2_tok = nullptr;
+        unsigned long long* c2_ptr = nullptr;
+        if (card != nullptr) {
+            const int64_t cap = card->cap, ptr_off = (4 + (cap + 1) + 2 * cap + 1) & ~1ll;
+            c2_counts = card->h_plan;
+            c2_start = c2_counts + 4;
+            c2_dst = c2_start + cap + 1;
+            c2_tok = c2_dst + cap;
+            c2_ptr = (unsigned long long*) (card->h_plan + ptr_off);
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
@@ -305,7 +398,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             unsigned long long ptr = 0;
             if (e >= 0 && e < d.n_expert) {
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
-                if (slot >= 0) {
+                int32_t s2 = slot2(e);
+                if (slot >= 0 && s2 >= 0) {           // held by both: the first k_dual go to the second card
+                    if (dual_sent < k_dual) { ++dual_sent; ++card->dual_card; }
+                    else { s2 = kNotResident; ++card->dual_main; }
+                }
+                if (s2 >= 0) {
+                    kd = 2;
+                    c2_ptr[g2] = (unsigned long long) (card->cache_base + (size_t) card->slot_off[s2]);
+                    c2_start[g2] = e2;
+                    for (int64_t i = i0; i < n; ++i)
+                        if (first_of[i] == i0) {
+                            c2_dst[e2] = (int32_t) i;
+                            c2_tok[e2] = (int32_t) (i / k);
+                            ++e2;
+                        }
+                    ++g2;
+                } else if (slot >= 0) {
                     kd = 0;
                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
                                                                                  : (size_t) slot * (size_t) d.cache_blob));
@@ -359,6 +468,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        // 26.09.2026: the second card's share, issued now so it runs while the CPU computes its own
+        if (g2 > 0) {
+            c2_start[g2] = e2;
+            c2_counts[0] = g2;
+            c2_counts[1] = e2;
+            c2_counts[2] = 0;
+            c2_counts[3] = 0;
+            card->experts += g2;
+            card->entries += e2;
+            if (!second_card_issue(*card, lay.fmt[(size_t) d.layers], x_f, n_tok, H, out, g2, e2)) {
+                d.failed = true;
+                d.fail = "the second card could not issue its experts";
+                d.fail_layer = d.layers;
+                return;
+            }
+        }
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -388,6 +513,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_expert = e;
                 return;
             }
+            if (kind[i] == 2) continue;    // the second card writes this row itself - it must not be cleared here
             if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
                 if (kind[i] == 0) ++d.cache_hits;
                 std::memset(row, 0, (size_t) H * sizeof(float));
@@ -421,6 +547,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("run", njobs);
     if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
     else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+    if (card != nullptr && card->pending && !second_card_wait(*card)) {
+        d.failed = true;
+        d.fail = "the second card failed";
+        d.fail_layer = d.layers;
+        return;
+    }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -563,10 +695,21 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         if (lay.gguf_file.empty() || lay.gguf_file[(size_t) l].empty()) return gguf;
         return dir + lay.gguf_file[(size_t) l];
     };
+    // 27.09.2026: each chunk leaves the file cache once it is in the arena.  The arena is 61 GB and reading it
+    // through the cache pushed the n-gram table - a mapping that must stay in memory - 40 of its 51 GB out to disk;
+    // the table's rows were then 30 ms of a 72 ms round.  STRATA_GGUF_KEEP_CACHE=1 is the old behaviour.
+    static const bool keep_cache = std::getenv("STRATA_GGUF_KEEP_CACHE") != nullptr &&
+                                   std::string(std::getenv("STRATA_GGUF_KEEP_CACHE")) != "0";
     auto worker = [&]() {
         std::ifstream f;
         std::string open_name;
         std::vector<uint8_t> buf;
+#if !defined(_WIN32)
+        struct Fd {
+            int v = -1;
+            ~Fd() { if (v >= 0) ::close(v); }
+        } dfd;
+#endif
         for (;;) {
             const int64_t l = next.fetch_add(1);
             if (l >= lay.n_layers || bad) break;
@@ -577,10 +720,14 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                 f.open(name, std::ios::binary);
                 if (!f) { bad = true; return; }
                 open_name = name;
+#if !defined(_WIN32)
+                if (dfd.v >= 0) ::close(dfd.v);
+                dfd.v = keep_cache ? -1 : ::open(name.c_str(), O_RDONLY);
+#endif
             }
             const auto& fm = lay.fmt[(size_t) l];
-            const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            // the weights end at w_bytes: a scaled (NVFP4) blob has its 16 bytes of global scales after them
+            const uint64_t per[3] = {fm.up_off, fm.up_off, fm.w_bytes - fm.down_off};
             const uint64_t at[3] = {0, fm.up_off, fm.down_off};
             for (int r = 0; r < 3; ++r) {
                 const uint64_t src = lay.gguf_off[(size_t) (3 * l + r)];
@@ -596,6 +743,24 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                         const uint64_t e = done / per[r] + k;
                         std::memcpy(dst + lay.blob_offset(l, (int64_t) e) + at[r], buf.data() + k * per[r], (size_t) per[r]);
                     }
+#if !defined(_WIN32)
+                    if (dfd.v >= 0) (void) posix_fadvise(dfd.v, (off_t) (src + done), (off_t) n, POSIX_FADV_DONTNEED);
+#endif
+                }
+            }
+            // 27.09.2026 (native_experts.txt v4): each expert's three global scales - F32 [n_expert] tensors beside
+            // the weights - into the 16 bytes after its weights, {s_gate, s_up, s_down, 0}
+            if (fm.scaled) {
+                if (lay.gguf_scale_off.empty()) { bad = true; return; }
+                std::vector<float> sc((size_t) (3 * lay.n_expert));
+                for (int r = 0; r < 3; ++r) {
+                    f.seekg((std::streamoff) lay.gguf_scale_off[(size_t) (3 * l + r)]);
+                    f.read((char*) (sc.data() + (size_t) r * (size_t) lay.n_expert), (std::streamsize) (4 * lay.n_expert));
+                    if ((uint64_t) f.gcount() != (uint64_t) (4 * lay.n_expert)) { bad = true; return; }
+                }
+                for (int64_t e = 0; e < lay.n_expert; ++e) {
+                    const float s4[4] = {sc[(size_t) e], sc[(size_t) (lay.n_expert + e)], sc[(size_t) (2 * lay.n_expert + e)], 0.0f};
+                    std::memcpy(dst + lay.blob_offset(l, e) + fm.scale_off, s4, sizeof s4);
                 }
             }
         }
@@ -657,7 +822,41 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
-    PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds);
+    // 27.09.2026: NUMA placement (see `set_numa`): group g's rows of every expert are first touched by up to 16
+    // threads pinned to group g's cores, layers striped over them
+    std::function<void(uint8_t*, uint64_t)> place;
+    if (!numa_cores_.empty() && lay.native) {
+        place = [this, &lay, n_layers, n_expert](uint8_t* base, uint64_t) {
+            const int G = (int) numa_cores_.size();
+            // every page whose START lies in [p, q) is written once, by a thread of the range's group
+            auto touch = [](uint8_t* p, uint8_t* q) {
+                for (uintptr_t x = ((uintptr_t) p + 4095) & ~(uintptr_t) 4095; x < (uintptr_t) q; x += 4096)
+                    *(volatile uint8_t*) x = 0;
+            };
+            std::vector<std::thread> th;
+            for (int g = 0; g < G; ++g) {
+                const std::vector<int>* cores = &numa_cores_[(size_t) g];
+                const int nt = (int) std::min<size_t>(cores->size(), 16);
+                for (int w = 0; w < nt; ++w)
+                    th.emplace_back([&lay, base, touch, cores, g, G, w, nt, n_layers, n_expert] {
+                        strata::kernels::cpu::pin_current_thread((*cores)[(size_t) w]);
+                        for (int64_t l = w; l < n_layers; l += nt) {
+                            const strata::kernels::cpu::NativeFmt& f = lay.fmt[(size_t) l];
+                            const uint64_t f0 = (uint64_t) (f.n_ff * g / G), f1 = (uint64_t) (f.n_ff * (g + 1) / G);
+                            const uint64_t h0 = (uint64_t) (f.n_embd * g / G), h1 = (uint64_t) (f.n_embd * (g + 1) / G);
+                            for (int64_t e = 0; e < n_expert; ++e) {
+                                uint8_t* b = base + lay.blob_offset(l, e);
+                                touch(b + f0 * f.gu_row, b + f1 * f.gu_row);
+                                touch(b + f.up_off + f0 * f.gu_row, b + f.up_off + f1 * f.gu_row);
+                                touch(b + f.down_off + h0 * f.d_row, b + f.down_off + h1 * f.d_row);
+                            }
+                        }
+                    });
+            }
+            for (auto& t : th) t.join();
+        };
+    }
+    PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, place);
     if (!a->valid()) {
         delete a;
         err = "ArenaExpertSource: the arena could not be reserved (" + std::to_string(want) + " B)";

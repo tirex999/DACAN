@@ -24,6 +24,15 @@ struct SamplerParams {
     uint64_t seed = 0;           // drives Philox, which is counter-based on (seed, token index)
     uint64_t counter = 0;        // absolute draw index of row 0; advance across decode calls
     bool greedy = false;
+    /// 27.09.2026: when set, a DEVICE-visible pair {counter, seed} read by the kernel at run time instead of the
+    /// two fields above - so a sampler captured into a CUDA graph draws new numbers on every replay (the verify
+    /// window writes the pair into mapped memory before each launch).
+    const unsigned long long* rng_dev = nullptr;
+    /// 27.09.2026: top_p's cumulative mass over the TEMPERATURE-SCALED survivors - softmax(logits / T), then top_k,
+    /// then top_p - the order of vLLM, SGLang / flashinfer (FreeToken), HF transformers, in which Qwen's card values
+    /// (0.6 / 0.95 / 20) are given.  false keeps the llama.cpp chain above (top_p on the raw logits, a wider keep
+    /// set at T < 1).  The survivors of top_k and the draw are the same either way; only where top_p cuts moves.
+    bool temp_first = false;
 };
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.

@@ -75,6 +75,26 @@ std::vector<int> physical_cores(bool skip_first);
 long long pin_current_thread(int core);
 void restore_thread_affinity(long long previous);
 
+/// 27.09.2026: the allowed physical cores (as `physical_cores(false)`) grouped by NUMA node, index = node id, read
+/// from /sys/devices/system/node.  Empty on a one-node machine, on Windows, or when sysfs is unreadable.
+std::vector<std::vector<int>> numa_physical_cores();
+/// 27.09.2026: every logical CPU of `node` becomes this thread's affinity, so the threads it starts - and the memory
+/// it first touches under the default policy - stay on that node.
+bool bind_current_thread_to_node(int node);
+/// 27.09.2026: the core the host loop is pinned to.  `set_host_core` (the NUMA mode) puts it on the main card's
+/// node; unset, it is the first allowed physical core, as before.
+void set_host_core(int core);
+int host_core();
+
+/// 27.09.2026: a NUMA-aware pool.  One group of workers per node, pinned to that node's cores.  In the native row
+/// phases (5 and 6) group g computes rows [per*g/G, per*(g+1)/G) of every expert - the rows the arena placed in
+/// node g's memory (`ArenaExpertSource::set_numa`) - and only once its own share is claimed does it take what is
+/// left of the others'.  Measured before it: 63 workers over both sockets reading an arena bound to one node.
+struct PoolNuma {
+    std::vector<std::vector<int>> cores;   ///< per group: the cores of its workers (the host's core excluded)
+    int host_group = 0;                    ///< the group the host thread drains with
+};
+
 class ExpertPool {
 public:
     /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores
@@ -91,12 +111,16 @@ public:
     /// With `host_works`, `run()` claims jobs itself instead of spinning on `done_`, and the pool is six
     /// threads on six cores. `false` is the A/B arm and exists so the change is measurable rather than
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true);
+    /// `numa` (27.09.2026): one worker group per NUMA node (see `PoolNuma`); `n_workers` is then ignored.
+    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, const PoolNuma* numa = nullptr);
     ~ExpertPool();
     ExpertPool(const ExpertPool&) = delete;
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    /// 27.09.2026: worker groups (NUMA nodes) and the workers of one of them.
+    int groups() const { return groups_; }
+    int group_workers(int g) const { return g >= 0 && g < kMaxGroups ? gthreads_[g] - (host_works_ && g == host_group_ ? 1 : 0) : 0; }
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
@@ -152,9 +176,28 @@ private:
     void run_phase(int mode, int n_tasks);
     /// Bump `epoch_`, and wake the workers that went to sleep.  Every publish goes through here.
     void publish();
+    /// 27.09.2026: modes 5/6 for one expert's rows [r0, r1) (the body both schedules share).
+    void native_rows(int e, int r0, int r1);
+    /// 27.09.2026: the NUMA schedule of modes 5/6 - `group`'s own share first, then the others'.
+    void drain_numa(int group);
+    /// 27.09.2026: the tasks of a native row phase for `nb` experts; with groups it also sets their shares.
+    int native_tasks(int mode, int nb);
 
     int n_ = 0;
     bool host_works_ = true;
+    // ---- 27.09.2026: NUMA groups.  `group_of_[i]` is worker i's group; `gthreads_[g]` counts the host in its group.
+    static constexpr int kMaxGroups = 4;
+    int groups_ = 1;
+    int host_group_ = 0;
+    std::vector<int> group_of_;
+    int gthreads_[kMaxGroups] = {};
+    struct alignas(64) GroupHead { std::atomic<uint32_t> v{0}; };
+    GroupHead ghead_[kMaxGroups];   // each group's claim counter, on its own line
+    int gtasks_[kMaxGroups] = {};
+    int64_t grows_[kMaxGroups] = {};
+    // 27.09.2026: workers that have left the park for the current epoch.  A phase ends only when all of them have
+    // (and re-parked), so no worker can wake into a phase that is over while the host rewrites the next one's state.
+    alignas(64) std::atomic<uint32_t> woke_{0};
     ExpertJob* jobs_ = nullptr;
     int njobs_ = 0;
     /// The host's own scratch when `host_works_`.  A separate object rather than a share of `scratch_[i]`,

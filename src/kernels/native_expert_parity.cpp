@@ -14,12 +14,14 @@
 
 #include "ggml.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -45,22 +47,35 @@ int main(int argc, char** argv) {
     cudaStreamCreate(&s);
     for (int l : layers) {
         const strata::TensorInfo* t[3] = {};
+        const strata::TensorInfo* ts[3] = {};   // 27.09.2026: NVFP4's per-expert global scales (".scale", F32 [E])
         const char* roles[3] = {"gate", "up", "down"};
         for (const auto& ti : gguf.tensors())
-            for (int r = 0; r < 3; ++r)
+            for (int r = 0; r < 3; ++r) {
                 if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") t[r] = &ti;
+                if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.scale") ts[r] = &ti;
+            }
         if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
         cpu::NativeFmt f;
         std::string err;
         if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {
             std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
         }
+        float sc[3] = {1.f, 1.f, 1.f};
+        if (ts[0] && ts[1] && ts[2]) {
+            cpu::native_fmt_add_scales(f);
+            for (int r = 0; r < 3; ++r) std::memcpy(&sc[r], gguf.tensor_data(*ts[r]) + (size_t) E * 4, 4);
+        }
         std::vector<uint8_t> blob(f.bytes);
         std::memcpy(blob.data(), gguf.tensor_data(*t[0]) + (size_t) E * f.up_off, f.up_off);
         std::memcpy(blob.data() + f.up_off, gguf.tensor_data(*t[1]) + (size_t) E * f.up_off, f.up_off);
-        std::memcpy(blob.data() + f.down_off, gguf.tensor_data(*t[2]) + (size_t) E * (f.bytes - f.down_off),
-                    f.bytes - f.down_off);
-        // (a) the float reference
+        std::memcpy(blob.data() + f.down_off, gguf.tensor_data(*t[2]) + (size_t) E * (f.w_bytes - f.down_off),
+                    f.w_bytes - f.down_off);
+        if (f.scaled) {
+            const float s4[4] = {sc[0], sc[1], sc[2], 0.f};
+            std::memcpy(blob.data() + f.scale_off, s4, sizeof s4);
+            std::printf("          expert %d global scales: gate %.4e up %.4e down %.4e\n", E, sc[0], sc[1], sc[2]);
+        }
+        // (a) the float reference (the global scales multiplied into the dequantized matrices)
         const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);
         const auto* td = ggml_get_type_traits((ggml_type) f.d_type);
         std::vector<float> G((size_t) FF * H), U((size_t) FF * H), D((size_t) H * FF);
@@ -69,6 +84,11 @@ int main(int argc, char** argv) {
             tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
         }
         for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
+        if (f.scaled) {
+            for (auto& v : G) v *= sc[0];
+            for (auto& v : U) v *= sc[1];
+            for (auto& v : D) v *= sc[2];
+        }
         std::mt19937 rng(11 + l);
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<float> x((size_t) NT * H);
@@ -102,6 +122,16 @@ int main(int argc, char** argv) {
                 ffp[k] = ff[k].data();
             }
             cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
+            {   // 27.09.2026: the pool's one-token gate+up path, one thread, the weights cache-resident
+                std::vector<float> tmp(FF);
+                float* f1[1] = {tmp.data()};
+                const int it = 20;
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i) cpu::native_gu_rows(f, blob.data(), a, 1, f1, 0, (int) FF);
+                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+                std::printf("          %s gate+up, one token, one thread: %.0f us (%.2f GB/s of weights)\n",
+                            ggml_type_name((ggml_type) f.gu_type), us, 2.0 * f.up_off / us / 1e3);
+            }
             if (cpu::iq512_supported(f.gu_type)) {
                 // the AVX-512 rows against ggml's own vec_dot, same Q8_K activations: float-order differences only
                 std::vector<float> g512((size_t) NT * FF), gref((size_t) NT * FF);
@@ -160,8 +190,12 @@ int main(int argc, char** argv) {
             }
         }
         // (c) the GPU: one group holding the NT entries
+        double e_dq = 0.0;   // 27.09.2026: the prompt path's fp16 dequant (scales folded in) against the reference
         {
-            const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
+            auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
+            L.scaled = f.scaled ? 1 : 0;
+            L.scale_off = f.scale_off;
+            L.bytes = f.bytes;
             void *dblob, *dx, *dxq, *dscr;
             float* dout;
             unsigned long long* dptr;
@@ -189,14 +223,46 @@ int main(int argc, char** argv) {
             strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
             cudaStreamSynchronize(s);
             cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
+            {   // the prompt path: gate/up interleaved fp16 (row 2r gate, 2r+1 up) and down fp16, scales folded in
+                uint16_t *dgu, *dd;
+                cudaMalloc((void**) &dgu, (size_t) 2 * FF * H * 2);
+                cudaMalloc((void**) &dd, (size_t) H * FF * 2);
+                const uint8_t* b = (const uint8_t*) dblob;
+                if (f.scaled) {
+                    const float* scd = (const float*) (b + f.scale_off);
+                    strata::kernels::iq_dequant_gu_f16_scaled(f.gu_type, b, b + f.up_off, FF, H, dgu, scd, s);
+                    strata::kernels::iq_dequant_f16_scaled(f.d_type, b + f.down_off, H * FF, dd, scd + 2, s);
+                } else {
+                    strata::kernels::iq_dequant_gu_f16(f.gu_type, b, b + f.up_off, FF, H, dgu, s);
+                    strata::kernels::iq_dequant_f16(f.d_type, b + f.down_off, H * FF, dd, s);
+                }
+                cudaStreamSynchronize(s);
+                std::vector<__half> hgu((size_t) 2 * FF * H), hd((size_t) H * FF);
+                cudaMemcpy(hgu.data(), dgu, hgu.size() * 2, cudaMemcpyDeviceToHost);
+                cudaMemcpy(hd.data(), dd, hd.size() * 2, cudaMemcpyDeviceToHost);
+                std::vector<float> a1, b1;
+                a1.reserve((size_t) 3 * FF * H);
+                b1.reserve((size_t) 3 * FF * H);
+                for (int64_t r = 0; r < FF; ++r)
+                    for (int64_t i = 0; i < H; ++i) {
+                        a1.push_back(__half2float(hgu[(size_t) (2 * r) * H + i]));
+                        b1.push_back(G[r * H + i]);
+                        a1.push_back(__half2float(hgu[(size_t) (2 * r + 1) * H + i]));
+                        b1.push_back(U[r * H + i]);
+                    }
+                for (size_t i = 0; i < hd.size(); ++i) { a1.push_back(__half2float(hd[i])); b1.push_back(D[i]); }
+                e_dq = rel(a1, b1);
+                cudaFree(dgu);
+                cudaFree(dd);
+            }
             cudaFree(dblob); cudaFree(dx); cudaFree(dxq); cudaFree(dscr); cudaFree(dout); cudaFree(dptr);
             cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
         }
         const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
-        const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
-        std::printf("layer %2d  %-8s/%-7s blob %8zu  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", l,
-                    ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec, eg, ecg,
-                    ok ? "ok" : "FAIL");
+        const bool ok = ec < 3e-2 && eg < 3e-2 && e_dq < 2e-3 && std::isfinite(ec) && std::isfinite(eg);
+        std::printf("layer %2d  %-8s/%-7s blob %8zu%s  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  fp16 dequant %.2e  %s\n", l,
+                    ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes,
+                    f.scaled ? " (scaled)" : "", ec, eg, ecg, e_dq, ok ? "ok" : "FAIL");
         if (!ok) ++failures;
     }
     std::printf("native_expert_parity: %d failures\n", failures);

@@ -160,6 +160,11 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        if " temperature=" in keys and os.environ.get("STRATA_SAMPLE_ORDER", "") != "llama":
+            # 27.09.2026: top_p / min_p over softmax(logits / T) - the order of vLLM, SGLang (flashinfer) and HF, in
+            # which Qwen's recommended values are given; STRATA_SAMPLE_ORDER=llama keeps the llama.cpp chain
+            # (top_p on the raw logits, a wider keep set at T < 1)
+            keys += " temp_first=1"
         return keys + StrataEngine.projection_key(sampling)
 
     @staticmethod

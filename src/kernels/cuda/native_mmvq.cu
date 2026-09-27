@@ -30,6 +30,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1046,6 +1047,14 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     if (!g_multi_exact) {
+        // 26.09.2026: STRATA_MMVQ_ROWS=4 - four rows per block of four warps (a quarter of the blocks of the exact
+        // layout, each weight block still loaded once for all the columns); otherwise llama.cpp's 2-row table
+        static const bool rows4 = std::getenv("STRATA_MMVQ_ROWS") != nullptr && std::atoi(std::getenv("STRATA_MMVQ_ROWS")) == 4;
+        if (rows4) {
+            const unsigned blocks4 = unsigned((std::size_t(n_out) + 3) / 4);
+            native_mmvq_multi_kernel<F, NCOLS, 4, 4><<<blocks4, dim3(WARP, 4), 0, s>>>(w, x, y, n_in, n_out);
+            return;
+        }
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
         native_mmvq_multi_kernel<F, NCOLS, NW, 2><<<blocks, dim3(WARP, NW), 0, s>>>(w, x, y, n_in, n_out);

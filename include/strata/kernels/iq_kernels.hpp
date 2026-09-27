@@ -33,14 +33,23 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
 /// uses: row 2r = gate row r, row 2r+1 = up row r.
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
                        void* stream);
+/// 27.09.2026: the same with the expert's global scales multiplied in (NVFP4): `scale` is a DEVICE pointer to
+/// {s_gate, s_up} (the gate/up form) or to s_down (the flat form); nullptr = 1.  Only NVFP4 uses it.
+void iq_dequant_gu_f16_scaled(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd,
+                              uint16_t* dst, const float* scale, void* stream);
+void iq_dequant_f16_scaled(int ggml_type, const void* src, int64_t n, uint16_t* dst, const float* scale, void* stream);
 
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
+/// 27.09.2026: `scaled` blobs (NVFP4 from ModelOpt) carry 16 more bytes at `scale_off` = {s_gate, s_up, s_down, 0},
+/// each expert's per-tensor global scale (weight_scale_2), which the kernels multiply into the row results.
 struct NativeExpertLayout {
     int gu_type = -1, d_type = -1;
     int64_t n_embd = 0, n_ff = 0;
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
+    int scaled = 0;                     // 1: the global scales are at scale_off
+    size_t scale_off = 0;
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 
@@ -53,5 +62,12 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
+
+/// 26.09.2026, the second card: rows `ent_dst[0 .. *n_entries)` of `src` (n_embd floats each) copied to the same
+/// rows of `out` - mapped host memory, written in 16-byte stores so the PCIe writes are whole lines rather than
+/// the down kernel's one float per warp.  Ends with a system fence: the host reads `out` once the stream's event
+/// has completed, and the other card reads it after that.
+void gather_rows(const float* src, const int32_t* ent_dst, const int32_t* n_entries, int64_t cap_entries,
+                 int64_t n_embd, float* out, void* stream);
 
 }  // namespace strata::kernels

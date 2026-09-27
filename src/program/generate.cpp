@@ -28,6 +28,8 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -54,6 +56,8 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <iostream>
 #include <thread>
 #include <atomic>
@@ -85,6 +89,7 @@ struct Options {
     int top_k = 20;
     float top_p = 0.95f;
     float temperature = 1.0f;
+    bool temp_first = false;          // 27.09.2026: top_p at temperature T (vLLM / flashinfer order), --temp-first
     std::string dump_logits;          // one line of logits per generated position
     int64_t logits_stride = 1;        // storage selection; all prompt tokens remain conditioned
     /// **THE RESIDUAL, SO THE HEAD CAN BE CHECKED WITHOUT THE LAYERS.**
@@ -145,6 +150,7 @@ struct Options {
     std::string dump_routing;
     bool no_capture = false;          // run the layers directly instead of replaying graphs
     bool no_pool = false;             // skip the CPU expert pool: the GPU-only floor
+    bool numa = false;                ///< 27.09.2026: --numa (or STRATA_NUMA=1): pool and arena split by NUMA node
     bool sync_every_layer = false;
     /// Per-stage CUDA-event timings inside the layer halves.  `--no-capture` only: an event recorded inside a
     /// stream capture is silently dropped, so the captured path cannot carry this.
@@ -229,6 +235,15 @@ struct Options {
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
+    /// 26.09.2026: the second card (CUDA device index, -1 = one card).  It holds the experts the main card does not,
+    /// ranked by `second_card_usage` (a STRU table from STRATA_USAGE_DUMP) when given, and computes them in the
+    /// verify windows beside the CPU pool.
+    int second_card = -1;
+    std::string second_card_usage;
+    int second_card_reserve_mib = 700;
+    /// 26.09.2026: this many of the main card's most-routed experts are ALSO held by the second card, and each
+    /// layer splits such experts between the two so they finish together (0 = the two sets are disjoint).
+    int64_t second_card_dup = 0;
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
@@ -323,6 +338,7 @@ void usage() {
                  "  --greedy             argmax (the default)\n"
                  "  --seed S             enable sampling with this Philox seed\n"
                  "  --top-k N --top-p F --temperature F\n"
+                 "  --temp-first         top_p over the temperature-scaled survivors (vLLM / flashinfer order)\n"
                  "  --dump-logits PATH   write one line of raw logits per position\n"
                  "  --logits-stride N    store every Nth row plus final input (default 1); N>1 requires --max-new 1\n"
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
@@ -365,6 +381,12 @@ void usage() {
                  "  --gpu-stages         R0.9: capture the layer as three graphs (mixer / ffn+router / post)\n"
                  "                       and time them from OUTSIDE the capture.  The per-stage table on the\n"
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
+                 "  --second-card D      a second card (CUDA device D) holds the experts the main card does\n"
+                 "                       not and computes them beside the CPU pool (native packs, --spec).\n"
+                 "  --second-card-usage U  rank its experts by a usage table (STRATA_USAGE_DUMP=U from runs)\n"
+                 "  --second-card-reserve-mib M  VRAM left free on it (default 700)\n"
+                 "  --second-card-dup N  also hold the main card's N most-routed experts there; each layer\n"
+                 "                       splits those between the cards (STRATA_CARD2_BIAS tunes the split)\n"
                  "  --expert-profile P   R4.2e: pre-load the VRAM tier from a `profile.bin` (see\n"
                  "                       tools/make_profile.py) instead of admitting on first use.\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
@@ -387,6 +409,10 @@ void usage() {
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
                  "                       except the one the host loop spins on.  A sweep is how the pool's\n"
                  "                       deviation from `cpu_s2` is attributed.\n"
+                 "  --numa               27.09.2026: one worker group per NUMA node, each computing the half of\n"
+                 "                       every expert's rows that the arena placed in its node's memory; the host\n"
+                 "                       thread on the main card's node (also STRATA_NUMA=1; STRATA_NUMA_WORKERS=a,b\n"
+                 "                       caps the workers per node).  Run it without numactl --membind.\n"
                  "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n");
@@ -692,6 +718,7 @@ int main(int argc, char** argv) {
         else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
         else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
         else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
+        else if (a == "--temp-first") o.temp_first = true;
         else if (a == "--dump-logits") o.dump_logits = next("--dump-logits");
         else if (a == "--logits-stride") {
             if (have_logits_stride) { std::fprintf(stderr, "--logits-stride must be supplied only once\n"); return 2; }
@@ -758,6 +785,10 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
+        else if (a == "--second-card") o.second_card = std::atoi(next("--second-card"));
+        else if (a == "--second-card-usage") o.second_card_usage = next("--second-card-usage");
+        else if (a == "--second-card-reserve-mib") o.second_card_reserve_mib = std::atoi(next("--second-card-reserve-mib"));
+        else if (a == "--second-card-dup") o.second_card_dup = std::atoll(next("--second-card-dup"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
@@ -817,6 +848,7 @@ int main(int argc, char** argv) {
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--stats") o.stats = true;
+        else if (a == "--numa") o.numa = true;
         else if (a == "--shared-late") o.shared_late = true;
         else if (a == "--keep-canonical") o.keep_canonical = true;
         else if (a == "--no-token-graph") o.no_token_graph = true;
@@ -964,6 +996,85 @@ int main(int argc, char** argv) {
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
     if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
+    // 26.09.2026: the multi-column dense projections in llama.cpp's layout (2 rows per block) instead of the exact
+    // one-row-per-block layout the author kept "until the upstream layout is timed" - timed here, on a 2080 Ti.
+    if (const char* up = std::getenv("STRATA_MMVQ_UPSTREAM"); up != nullptr && std::string(up) != "0") {
+        strata::kernels::native_mmvq_set_multi_exact(false);
+        std::fprintf(stderr, "strata generate: multi-column projections in the upstream layout (STRATA_MMVQ_UPSTREAM)\n");
+    }
+    // 26.09.2026: the second card's context exists before any pinned memory is allocated or registered, so the
+    // portable allocations and the expert arena are pinned for it too.  The main card stays device 0.
+    if (o.second_card >= 0) {
+        int nd = 0;
+        cudaGetDeviceCount(&nd);
+        if (!native_pack || o.spec < 2 || o.second_card == 0 || o.second_card >= nd) {
+            std::fprintf(stderr, "strata generate: --second-card %d needs a native pack, --spec and a second visible "
+                                 "device (%d visible; the main card is device 0)\n", o.second_card, nd);
+            return 2;
+        }
+        if (cudaSetDevice(o.second_card) != cudaSuccess || cudaFree(nullptr) != cudaSuccess || cudaSetDevice(0) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: cannot open device %d: %s\n", o.second_card, cudaGetErrorString(cudaGetLastError()));
+            return 1;
+        }
+    }
+    // 27.09.2026: NUMA (--numa).  The expert arena is split by rows between the nodes and each node's workers
+    // compute the rows that live in its own memory; the host thread - and everything it allocates from here on -
+    // stays on the main card's node.  Before this, `physical_cores`' dangling `else` spread 63 workers over both
+    // sockets while `numactl --membind=1` kept every expert byte on node 1, and the host loop spun on CPU 0.
+    if (!o.numa && std::getenv("STRATA_NUMA") != nullptr && std::string(std::getenv("STRATA_NUMA")) != "0") o.numa = true;
+    strata::kernels::cpu::PoolNuma numa_cfg;
+    std::vector<int> host_node_cores;   // where the n-gram table's pages are read in
+    if (o.numa) {
+        std::vector<std::vector<int>> nodes = strata::kernels::cpu::numa_physical_cores();
+        int host_node = 0;
+        char bus[32] = {};
+        if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, 0) == cudaSuccess) {
+            std::string id(bus);
+            for (char& c : id) c = (char) std::tolower((unsigned char) c);
+            if (FILE* f = std::fopen(("/sys/bus/pci/devices/" + id + "/numa_node").c_str(), "r")) {
+                int nn = -1;
+                if (std::fscanf(f, "%d", &nn) == 1 && nn >= 0) host_node = nn;
+                std::fclose(f);
+            }
+        }
+        if (nodes.size() < 2 || host_node >= (int) nodes.size() || nodes[(size_t) host_node].empty()) {
+            std::fprintf(stderr, "strata generate: --numa: one NUMA node in reach (or none of the main card's cores is "
+                                 "allowed) - the pool stays as it was\n");
+            o.numa = false;
+        } else {
+            const int hc = nodes[(size_t) host_node][0];
+            nodes[(size_t) host_node].erase(nodes[(size_t) host_node].begin());
+            if (const char* w = std::getenv("STRATA_NUMA_WORKERS")) {   // "a,b": at most a on node 0, b on node 1
+                std::string s(w);
+                size_t n = 0, at = 0;
+                while (n < nodes.size() && at <= s.size()) {
+                    const size_t comma = s.find(',', at);
+                    const int cap = std::atoi(s.substr(at, comma == std::string::npos ? std::string::npos : comma - at).c_str());
+                    if (cap >= 0 && (size_t) cap < nodes[n].size()) nodes[n].resize((size_t) cap);
+                    ++n;
+                    if (comma == std::string::npos) break;
+                    at = comma + 1;
+                }
+            }
+            for (size_t n = 0; n < nodes.size(); ++n) {
+                if (nodes[n].empty() && (int) n != host_node) continue;
+                if ((int) n == host_node) numa_cfg.host_group = (int) numa_cfg.cores.size();
+                numa_cfg.cores.push_back(nodes[n]);
+            }
+            if (numa_cfg.cores.size() < 2) {
+                std::fprintf(stderr, "strata generate: --numa: the other nodes have no allowed cores - off\n");
+                o.numa = false;
+            } else {
+                strata::kernels::cpu::set_host_core(hc);
+                strata::kernels::cpu::bind_current_thread_to_node(host_node);
+                host_node_cores = numa_cfg.cores[(size_t) numa_cfg.host_group];
+                std::fprintf(stderr, "strata generate: NUMA: the main card (%s) is on node %d; the host loop on CPU %d, "
+                                     "workers per group:", bus, host_node, hc);
+                for (const auto& c : numa_cfg.cores) std::fprintf(stderr, " %zu", c.size());
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
@@ -1264,6 +1375,7 @@ int main(int argc, char** argv) {
         srcp = &src;
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
+        if (o.numa) arena_src.set_numa(numa_cfg.cores);   // 27.09.2026: each group's rows in its node's memory
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -1273,6 +1385,16 @@ int main(int argc, char** argv) {
                      (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
+    }
+    // 27.09.2026: the n-gram table into memory NOW, after the arena: read before it, the arena's 61 GB through the
+    // file cache pushed 40 of its 51 GB back out, and a token's 16 rows became disk reads (30 of a 72 ms round).
+    // Locked by default so nothing else evicts it later (STRATA_PLE_LOCK=0: not locked; STRATA_PLE_RESIDENT=0: skip).
+    if (ple_table.is_open() && ple_table.mode() == strata::kernels::PleIo::Mmap &&
+        !(std::getenv("STRATA_PLE_RESIDENT") != nullptr && std::string(std::getenv("STRATA_PLE_RESIDENT")) == "0")) {
+        const bool lock = !(std::getenv("STRATA_PLE_LOCK") != nullptr && std::string(std::getenv("STRATA_PLE_LOCK")) == "0");
+        std::string note;
+        ple_table.make_resident(16, lock, host_node_cores, note);
+        std::fprintf(stderr, "strata generate: n-gram table: %s\n", note.c_str());
     }
     // Plan v0.3 P6: the MTP draft layer, loaded before the VRAM expert tier is sized from what is left.
     strata::core::MtpDrafter mtp;
@@ -1284,7 +1406,8 @@ int main(int argc, char** argv) {
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
         if (!o.mtp.empty() && !mtp.load(o.mtp, g, ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     }
-    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
+    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker,
+                                          o.numa ? &numa_cfg : nullptr);
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
@@ -1578,6 +1701,11 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "strata generate: %d expert-pool workers%s%s\n", pool.workers(),
                  pool.host_works() ? " + the host thread" : "",
                  o.no_pool ? " (UNUSED: --no-pool)" : "");
+    if (pool.groups() > 1) {
+        std::fprintf(stderr, "strata generate: pool by NUMA node, workers per group:");
+        for (int gi = 0; gi < pool.groups(); ++gi) std::fprintf(stderr, " %d", pool.group_workers(gi));
+        std::fprintf(stderr, "; the host drains with group %d\n", numa_cfg.host_group);
+    }
 
     // **THE MISALIGNMENT WARNING THAT STOOD HERE IS GONE, BECAUSE THE MISALIGNMENT IS FIXED.**
     //
@@ -1686,6 +1814,7 @@ int main(int argc, char** argv) {
     sp.top_k = o.top_k;
     sp.top_p = o.top_p;
     sp.temperature = o.temperature;
+    sp.temp_first = o.temp_first;
 
     std::FILE* dump = nullptr;
     const int64_t dump_positions = (int64_t) o.tokens.size() - 1 + o.max_new;
@@ -2062,6 +2191,145 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: token graph captured (48 layers, one launch per token)\n");
     }
 
+    // ================================ 26.09.2026: THE SECOND CARD ================================
+    //
+    // A slot cache on device `--second-card` of the experts the main card does NOT hold, most-routed first (by the
+    // usage table when one is given, else in layer order), filled once from the arena.  In a verify window each
+    // layer's experts resident here are computed on this card beside the CPU pool and written into the same mapped
+    // `y_miss` rows as the CPU's, so the main card's graph does not change (see `SecondCard`).  The main card's
+    // adaptive tier still swaps its own slots; an expert it takes over is simply found there first.
+    strata::core::ExpertCache xcache2;
+    strata::core::SecondCard card2;
+    std::vector<int32_t> host_res2;
+    if (o.second_card >= 0) {
+        if (host_res.empty() || srcp == nullptr) {
+            std::fprintf(stderr, "strata generate: --second-card needs the profile-filled token graph path\n");
+            return 2;
+        }
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const size_t n_pairs = (size_t) (g.n_layers * g.n_expert);
+        std::vector<uint64_t> usage2(n_pairs, 0);
+        uint64_t usage_total = 0, usage_main = 0;
+        if (!o.second_card_usage.empty()) {
+            FILE* f = std::fopen(o.second_card_usage.c_str(), "rb");
+            char magic[4] = {};
+            int32_t dims[2] = {};
+            if (f == nullptr || std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "STRU", 4) != 0 ||
+                std::fread(dims, 4, 2, f) != 2 || dims[0] != (int32_t) g.n_layers || dims[1] != (int32_t) g.n_expert ||
+                std::fread(usage2.data(), sizeof(uint64_t), n_pairs, f) != n_pairs) {
+                std::fprintf(stderr, "strata generate: %s is not a usage table for this model\n", o.second_card_usage.c_str());
+                if (f != nullptr) std::fclose(f);
+                return 2;
+            }
+            std::fclose(f);
+        }
+        // expert-major, so without a usage table (all counts equal) every layer is covered alike rather than the
+        // first layers entirely
+        std::vector<int32_t> order;
+        order.reserve(n_pairs);
+        for (size_t i = 0; i < n_pairs; ++i) {
+            usage_total += usage2[i];
+            if (host_res[i] >= 0) usage_main += usage2[i];
+        }
+        for (int64_t e = 0; e < g.n_expert; ++e)
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                if (host_res[(size_t) (l * g.n_expert + e)] < 0) order.push_back((int32_t) (l * g.n_expert + e));
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return usage2[(size_t) a] > usage2[(size_t) b]; });
+        // dual residency: the main card's most-routed experts go here FIRST, so the per-layer split can balance
+        int64_t n_dup = 0;
+        if (o.second_card_dup > 0) {
+            std::vector<int32_t> dup;
+            for (size_t i = 0; i < n_pairs; ++i) if (host_res[i] >= 0) dup.push_back((int32_t) i);
+            std::stable_sort(dup.begin(), dup.end(), [&](int32_t a, int32_t b) { return usage2[(size_t) a] > usage2[(size_t) b]; });
+            if ((int64_t) dup.size() > o.second_card_dup) dup.resize((size_t) o.second_card_dup);
+            n_dup = (int64_t) dup.size();
+            order.insert(order.begin(), dup.begin(), dup.end());
+        }
+        if (cudaSetDevice(o.second_card) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: cannot select device %d\n", o.second_card);
+            return 1;
+        }
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const int64_t cap = (int64_t) strata::kernels::cpu::MAXT * K;
+        const int64_t n_ff = lay.fmt.empty() ? (int64_t) strata::kernels::cpu::FF : lay.fmt[0].n_ff;
+        // this card's own buffers come off the top before the slots are sized
+        const uint64_t buffers = (uint64_t) strata::kernels::cpu::MAXT * g.n_embd * 4 +
+                                 (uint64_t) strata::kernels::cpu::MAXT * (g.n_embd / 32) * 36 +
+                                 (uint64_t) strata::kernels::native_expert_scratch_bytes(cap, n_ff) +
+                                 (uint64_t) cap * g.n_embd * 4 + (64u << 10);
+        const uint64_t reserve = ((uint64_t) o.second_card_reserve_mib << 20) + buffers;
+        const uint64_t budget = free_b > reserve ? free_b - reserve : 0;
+        std::vector<int64_t> sizes;
+        std::vector<int32_t> chosen;
+        uint64_t used = 0, usage_card2 = 0;
+        for (int32_t i : order) {
+            const int64_t l = i / g.n_expert;
+            const uint64_t b = (lay.blob_bytes(l) + 255) / 256 * 256;
+            if (used + b > budget) break;
+            used += b;
+            sizes.push_back((int64_t) lay.blob_bytes(l));
+            chosen.push_back(i);
+            usage_card2 += usage2[(size_t) i];
+        }
+        if (chosen.empty() || !xcache2.open_sized(sizes, g.n_layers, g.n_expert, err)) {
+            std::fprintf(stderr, "strata generate: the second card's cache could not open (%s)\n", chosen.empty() ? "no room" : err.c_str());
+            return 1;
+        }
+        host_res2.assign(n_pairs, strata::core::kNotResident);
+        const Clock::time_point tf = Clock::now();
+        for (int32_t i : chosen) {
+            const int64_t l = i / g.n_expert, e = i % g.n_expert;
+            const int32_t slot = xcache2.admit(l, e);
+            const uint8_t* b = srcp->blob(l, e);
+            if (slot == strata::core::kNotResident || b == nullptr ||
+                !xcache2.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(l))) {
+                std::fprintf(stderr, "strata generate: the second card's fill failed at pair %d: %s\n", i, err.c_str());
+                return 1;
+            }
+            host_res2[(size_t) i] = slot;
+        }
+        {
+            const int32_t i0 = chosen.front();
+            if (!xcache2.verify_slot(host_res2[(size_t) i0], srcp->blob(i0 / g.n_expert, i0 % g.n_expert), err,
+                                     (int64_t) lay.blob_bytes(i0 / g.n_expert))) {
+                std::fprintf(stderr, "strata generate: second card: %s\n", err.c_str());
+                return 1;
+            }
+        }
+        const double fill_s = std::chrono::duration<double>(Clock::now() - tf).count();
+        card2.device = o.second_card;
+        card2.main_device = 0;
+        card2.host_res = host_res2.data();
+        card2.cache_base = xcache2.device_slot(0);
+        card2.slot_off = xcache2.slot_offsets();
+        card2.cap = cap;
+        card2.plan_i32 = ((4 + (cap + 1) + 2 * cap + 1) & ~1ll) + 2 * cap;
+        cudaStream_t s2 = nullptr;
+        cudaEvent_t e2 = nullptr;
+        if (cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&e2, cudaEventDisableTiming) != cudaSuccess ||
+            cudaMalloc((void**) &card2.x, (size_t) strata::kernels::cpu::MAXT * g.n_embd * 4) != cudaSuccess ||
+            cudaMalloc(&card2.xq, (size_t) strata::kernels::cpu::MAXT * (g.n_embd / 32) * 36) != cudaSuccess ||
+            cudaMalloc(&card2.scratch, strata::kernels::native_expert_scratch_bytes(cap, n_ff)) != cudaSuccess ||
+            cudaMalloc((void**) &card2.out, (size_t) cap * g.n_embd * 4) != cudaSuccess ||
+            cudaMalloc((void**) &card2.d_plan, (size_t) card2.plan_i32 * 4) != cudaSuccess ||
+            cudaHostAlloc((void**) &card2.h_plan, (size_t) card2.plan_i32 * 4, cudaHostAllocPortable) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: the second card's buffers could not be allocated\n");
+            return 1;
+        }
+        card2.stream = s2;
+        card2.done = e2;
+        cudaSetDevice(0);
+        drive.d.card2 = &card2;
+        if (n_dup > 0) std::fprintf(stderr, "strata generate: second card: %lld of them are the main card's most-routed (dual residency)\n", (long long) n_dup);
+        std::fprintf(stderr, "strata generate: second card (device %d): %zu experts, %.2f GiB, filled in %.1f s; "
+                             "of the usage table's %llu routed entries the main card holds %.1f%%, this card %.1f%%\n",
+                     o.second_card, chosen.size(), (double) used / 1073741824.0, fill_s, (unsigned long long) usage_total,
+                     usage_total ? 100.0 * (double) usage_main / (double) usage_total : 0.0,
+                     usage_total ? 100.0 * (double) usage_card2 / (double) usage_total : 0.0);
+    }
+
     // ================================ WHERE THE HOST TERM GOES, PER TOKEN ================================
     //
     // **`--gpu-only-full` MEASURES THE 48 LAYER GRAPHS AND THE LM HEAD AND NOTHING ELSE.**  It never enters
@@ -2209,6 +2477,7 @@ int main(int argc, char** argv) {
         };
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+        ver.set_pcie_share(drive.d.pcie_num > 0);
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         cudaStream_t adapt_stream = nullptr;
         if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
@@ -2369,6 +2638,7 @@ int main(int argc, char** argv) {
             unsigned long long req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
+            int req_temp_first = 0;   // 27.09.2026: temp_first=1 - top_p / min_p at temperature T (SamplerParams)
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             if (endp != nullptr) {   // GENI takes only cvec=; its file path is the first token without an =
                 for (;;) {
@@ -2392,6 +2662,7 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    else if (key == "temp_first") req_temp_first = std::atoi(tok.c_str() + eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -2654,6 +2925,7 @@ int main(int argc, char** argv) {
             req_sp.penalty_repeat = req_penalty_repeat;
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
+            req_sp.temp_first = req_temp_first != 0;
             req_sp.counter = 0;
             ver.set_sampling(req_sp);
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
@@ -3288,8 +3560,24 @@ int main(int argc, char** argv) {
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
+        ver.set_pcie_share(drive.d.pcie_num > 0);
+        if (!o.greedy) {   // 27.09.2026: --seed / --temperature / --top-k / --top-p reach the verify window too
+            strata::kernels::SamplerParams vsp;
+            vsp.greedy = false;
+            vsp.temperature = o.temperature;
+            vsp.top_k = o.top_k;
+            vsp.top_p = o.top_p;
+            vsp.temp_first = o.temp_first;
+            vsp.seed = o.seed;
+            vsp.counter = 0;
+            ver.set_sampling(vsp);
+        }
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        // 26.09.2026: raw routing counts for a longer residency plan; ADDED to the file if it already exists, so
+        // several prompts accumulate into one table ("STRU", n_layers, n_expert, then uint64 counts).
+        const char* usage_dump = std::getenv("STRATA_USAGE_DUMP");
+        if (usage_dump != nullptr) drive.d.routed_total.assign((size_t) (g.n_layers * g.n_expert), 0u);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
         cudaStream_t adapt_stream = nullptr;
@@ -3507,6 +3795,8 @@ int main(int argc, char** argv) {
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
         if (rounds > 0)
+            std::printf("%-24s %.3f ms/round issuing the window graph\n", "graph launch", ver.ms_launch / rounds);
+        if (rounds > 0)
             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
                         "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,
                         pool.ms_multi_q / rounds, pool.ms_multi_down / rounds,
@@ -3523,11 +3813,47 @@ int main(int argc, char** argv) {
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
                         drive.d.pcie_num);
+        if (rounds > 0 && drive.d.card2 != nullptr)
+            std::printf("%-24s %.2f distinct experts / %.2f entries per layer on device %d; issue %.3f  wait %.3f ms/round\n",
+                        "second card", (double) drive.d.card2->experts / (double) (rounds * g.n_layers),
+                        (double) drive.d.card2->entries / (double) (rounds * g.n_layers), drive.d.card2->device,
+                        drive.d.card2->ms_launch / rounds, drive.d.card2->ms_wait / rounds);
+        if (rounds > 0 && drive.d.card2 != nullptr && drive.d.card2->dual_card + drive.d.card2->dual_main > 0)
+            std::printf("%-24s %.2f / %.2f per layer of the experts both cards hold went to the second / the main card\n",
+                        "dual residency", (double) drive.d.card2->dual_card / (double) (rounds * g.n_layers),
+                        (double) drive.d.card2->dual_main / (double) (rounds * g.n_layers));
         (void) pool_ms0;
         if (use_mtp && rounds > 0)
             std::printf("%-24s %.3f ms/round drafting (%lld rounds), MTP prompt %.1f ms, %.0f MiB of VRAM\n", "mtp",
                         mtp.ms_draft / (double) mtp.rounds, (long long) mtp.rounds, mtp.ms_prefill,
                         (double) mtp.vram_bytes() / 1048576.0);
+        if (usage_dump != nullptr && !drive.d.routed_total.empty()) {
+            const size_t n = drive.d.routed_total.size();
+            std::vector<uint64_t> acc(n, 0);
+            if (FILE* f = std::fopen(usage_dump, "rb")) {
+                char magic[4] = {};
+                int32_t dims[2] = {};
+                if (std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "STRU", 4) == 0 && std::fread(dims, 4, 2, f) == 2 &&
+                    dims[0] == (int32_t) g.n_layers && dims[1] == (int32_t) g.n_expert &&
+                    std::fread(acc.data(), sizeof(uint64_t), n, f) == n) {
+                } else {
+                    std::fill(acc.begin(), acc.end(), 0);
+                    std::fprintf(stderr, "strata generate: %s is not a usage table for this model; starting it afresh\n", usage_dump);
+                }
+                std::fclose(f);
+            }
+            uint64_t added = 0;
+            for (size_t i = 0; i < n; ++i) { acc[i] += drive.d.routed_total[i]; added += drive.d.routed_total[i]; }
+            const int32_t dims[2] = {(int32_t) g.n_layers, (int32_t) g.n_expert};
+            FILE* f = std::fopen(usage_dump, "wb");
+            if (f == nullptr || std::fwrite("STRU", 1, 4, f) != 4 || std::fwrite(dims, 4, 2, f) != 2 ||
+                std::fwrite(acc.data(), sizeof(uint64_t), n, f) != n) {
+                std::fprintf(stderr, "strata generate: cannot write the usage table %s\n", usage_dump);
+            } else {
+                std::printf("%-24s %llu routed entries added to %s\n", "usage table", (unsigned long long) added, usage_dump);
+            }
+            if (f != nullptr) std::fclose(f);
+        }
     }
 
     if (dump != nullptr && std::fclose(dump) != 0) {

@@ -26,6 +26,9 @@ struct ExpertLayout {
     /// Per layer, the GGUF file (a name beside the --native shard) that holds its experts when the model's
     /// shards split the layers (Swift's GGUFs: layers 13-47 in shard 2).  Empty = the --native shard itself.
     std::vector<std::string> gguf_file;
+    /// 27.09.2026 (v4): per layer, the offsets of the gate / up / down `.scale` tensors (F32, one per expert) when
+    /// the layer's blobs are `scaled` (NVFP4 from ModelOpt); empty otherwise.
+    std::vector<uint64_t> gguf_scale_off;
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size
 

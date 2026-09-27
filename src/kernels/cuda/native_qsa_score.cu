@@ -32,6 +32,7 @@ constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
 struct TileA { uint32_t x[4]; };
 struct TileB { uint32_t x[2]; };
 struct TileC { float x[4]={0.0f,0.0f,0.0f,0.0f}; };
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void load_a(TileA& a,const float* p) {
     const float* src=p+(threadIdx.x%16)*STRIDE+(threadIdx.x/16)*4;
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
@@ -48,6 +49,7 @@ __device__ __forceinline__ void mma(TileC& c,const TileA& a,const TileB& b) {
         : "+f"(c.x[0]),"+f"(c.x[1]),"+f"(c.x[2]),"+f"(c.x[3])
         : "r"(a.x[0]),"r"(a.x[1]),"r"(a.x[2]),"r"(a.x[3]),"r"(b.x[0]),"r"(b.x[1]));
 }
+#endif
 __global__ __launch_bounds__(64,1) void score_kernel(
         const float* __restrict__ pooled,const float* __restrict__ query,
         const float* __restrict__ bias,const int32_t* __restrict__ step,
@@ -59,6 +61,39 @@ __global__ __launch_bounds__(64,1) void score_kernel(
     if(row0>full)return;
     const int lane=threadIdx.x,warp=threadIdx.y;
     __shared__ __align__(16) float shared[WARPS*16*STRIDE];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // Turing (sm_75) has no tf32 mma. Each warp takes 16 of the block's 32 rows and forms the full fp32 dot
+    // product of a row with each head's query (lane covers d = lane + 32*k, then a shuffle reduction); the full
+    // sum goes into the "warp 0" slot and 0 into the "warp 1" slot, so the shared epilogue below is unchanged.
+    // Not bit-identical to the tf32 path (tf32 truncates the inputs); these scores only rank blocks for top-k.
+    float q[HEADS][D/32];
+#pragma unroll
+    for(int j=0;j<HEADS;++j)
+#pragma unroll
+        for(int k=0;k<D/32;++k)q[j][k]=query[j*D+lane+32*k];
+    for(int r=warp*16;r<warp*16+16;++r){
+        const int row=row0+r;
+        float s[HEADS]={0.0f,0.0f,0.0f,0.0f};
+        if(row<=full){
+#pragma unroll
+            for(int k=0;k<D/32;++k){
+                const float p=pooled[size_t(row)*D+lane+32*k];
+#pragma unroll
+                for(int j=0;j<HEADS;++j)s[j]=fmaf(p,q[j][k],s[j]);
+            }
+        }
+#pragma unroll
+        for(int j=0;j<HEADS;++j){
+#pragma unroll
+            for(int o=16;o>0;o>>=1)s[j]+=__shfl_xor_sync(0xffffffffu,s[j],o);
+        }
+        if(lane==0){
+#pragma unroll
+            for(int j=0;j<HEADS;++j){shared[j*COMBINE+r]=s[j];shared[j*COMBINE+ROWS+r]=0.0f;}
+        }
+    }
+    __syncthreads();
+#else
     float* tile=shared+warp*16*STRIDE;
     TileC c[2];
     // mmf's launch heuristic picks2warps for K128. Each warp accumulates
@@ -99,6 +134,7 @@ __global__ __launch_bounds__(64,1) void score_kernel(
         }
     }
     __syncthreads();
+#endif
     // In the reference: +0 then warp0 partial then warp1 partial, followed
     // by materialized ReLU, CONT(head0), ADD(head1), ADD(head2), ADD(head3).
     if(warp==0){
