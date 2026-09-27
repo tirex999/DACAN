@@ -298,9 +298,10 @@ __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(const void* __restrict__ vb
 // (weight_scale_2) is not in the blocks: the grouped kernels multiply it in (NativeExpertLayout::scaled).
 __device__ __forceinline__ float ue4m3_to_f32(uint8_t x) {
     if (x == 0 || x == 0x7F) return 0.0f;   // ggml: NaN (0x7F) -> 0, as its CPU path does
-    const int exp = (x >> 3) & 0xF, man = x & 0x7;
-    const float raw = exp == 0 ? ldexpf((float) man, -9) : ldexpf(1.0f + (float) man / 8.0f, exp - 7);
-    return raw / 2;
+    // 28.09.2026: the same values without ldexpf (two per NVFP4 call in the grouped kernels): (1 + m/8) 2^(e-7) / 2
+    // is the float with exponent field e + 119 and mantissa m << 20; a subnormal m 2^-9 / 2 is m / 1024, exact
+    const uint32_t exp = (x >> 3) & 0xF, man = x & 0x7;
+    return exp == 0 ? (float) man * 0.0009765625f : __uint_as_float(((exp + 119u) << 23) | (man << 20));
 }
 
 __device__ __forceinline__ float vec_dot_nvfp4_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
@@ -335,6 +336,61 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
 #pragma unroll
     for (int i = 0; i < 2; ++i) sumi = ggml_cuda_dp4a(get_int_b2(bq8_0->qs, iqs + i), get_int_b4(bq8_1->qs, iqs + i), sumi);
     return __half2float(bq8_0->d) * __low2float(bq8_1->ds) * (float) sumi;
+}
+
+// ---------------------------------------------------------------- 28.09.2026: several activations, one weight read
+// An expert of a verify window is routed from ~1.3 of its tokens on average; the grouped kernels ran the whole row
+// dot once per entry, reading and unpacking the weights again each time (bench: NVFP4, 20 experts x 2 entries 249 us
+// vs x 1 145 us).  These unpack a call's weights once and dot them with `ne` activations; per activation every
+// operation is the single dot's, in its order, so each result is bitwise that of vec_dot_*_q8_1.
+template<int ME>
+__device__ __forceinline__ void vec_dot_nvfp4_q8_1_multi(const void* __restrict__ vbq, const block_q8_1* const* ys, int ne,
+                                                        int kbx, int iqs, float* acc) {
+    const block_nvfp4* bq4 = (const block_nvfp4*) vbq + kbx;
+    int2 v0[2], v1[2];
+    float dw[2];
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int iqs0 = iqs + 2 * i;
+        v0[i] = get_int_from_table_16(get_int_b4(bq4->qs, iqs0), kvalues_fp4);
+        v1[i] = get_int_from_table_16(get_int_b4(bq4->qs, iqs0 + 1), kvalues_fp4);
+        dw[i] = ue4m3_to_f32(bq4->d[iqs0 >> 1]);
+    }
+#pragma unroll
+    for (int e = 0; e < ME; ++e) {
+        if (e >= ne) break;
+        const block_q8_1* bq8_1 = ys[e] + kbx * 2;      // row_dot's x + kbx * (qk / 32), qk = 64
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int is = (iqs + 2 * i) >> 1;
+            const block_q8_1* bq8 = bq8_1 + (is >> 1);
+            const int i8 = (is & 1) << 2;
+            int sumi = ggml_cuda_dp4a(v0[i].x, get_int_b4(bq8->qs, i8 + 0), 0);
+            sumi = ggml_cuda_dp4a(v0[i].y, get_int_b4(bq8->qs, i8 + 2), sumi);
+            sumi = ggml_cuda_dp4a(v1[i].x, get_int_b4(bq8->qs, i8 + 1), sumi);
+            sumi = ggml_cuda_dp4a(v1[i].y, get_int_b4(bq8->qs, i8 + 3), sumi);
+            const float d = dw[i] * __low2float(bq8->ds);
+            sum += d * (float) sumi;
+        }
+        acc[e] += sum;
+    }
+}
+
+template<int ME>
+__device__ __forceinline__ void vec_dot_q8_0_q8_1_multi(const void* __restrict__ vbq, const block_q8_1* const* ys, int ne,
+                                                       int kbx, int iqs, float* acc) {
+    const block_q8_0* bq8_0 = (const block_q8_0*) vbq + kbx;
+    const int w0 = get_int_b2(bq8_0->qs, iqs), w1 = get_int_b2(bq8_0->qs, iqs + 1);
+    const float dq = __half2float(bq8_0->d);
+#pragma unroll
+    for (int e = 0; e < ME; ++e) {
+        if (e >= ne) break;
+        const block_q8_1* bq8_1 = ys[e] + kbx;           // qk = 32
+        int sumi = ggml_cuda_dp4a(w0, get_int_b4(bq8_1->qs, iqs), 0);
+        sumi = ggml_cuda_dp4a(w1, get_int_b4(bq8_1->qs, iqs + 1), sumi);
+        acc[e] += dq * __low2float(bq8_1->ds) * (float) sumi;
+    }
 }
 
 // ---------------------------------------------------------------- the formats
@@ -382,6 +438,38 @@ __device__ __forceinline__ float row_dot(const uint8_t* row, const block_q8_1* x
     return warp_sum(s);
 }
 
+// 28.09.2026: the formats whose weights a grouped kernel reads once for all of a group's entries (see *_multi above)
+template<int TY> struct MultiDot { static constexpr bool ok = false; };
+template<> struct MultiDot<40> {
+    static constexpr bool ok = true;
+    template<int ME> __device__ static void dot(const void* v, const block_q8_1* const* ys, int ne, int kbx, int iqs, float* acc) {
+        vec_dot_nvfp4_q8_1_multi<ME>(v, ys, ne, kbx, iqs, acc);
+    }
+};
+template<> struct MultiDot<8> {
+    static constexpr bool ok = true;
+    template<int ME> __device__ static void dot(const void* v, const block_q8_1* const* ys, int ne, int kbx, int iqs, float* acc) {
+        vec_dot_q8_0_q8_1_multi<ME>(v, ys, ne, kbx, iqs, acc);
+    }
+};
+// entries per pass; 4, not 8: the bench showed the 8-wide arrays costing single-entry groups ~20 % (registers)
+constexpr int kMultiEntries = 4;
+
+// `row_dot` for up to ME activations at once: each s[e] is summed call by call in row_dot's order, so it is bitwise
+// row_dot(row, ys[e], ...).  `ys[e]` are the activations' block 0 (row_dot's `x`).
+template<int TY, int ME>
+__device__ __forceinline__ void row_dot_multi(const uint8_t* row, const block_q8_1* const* ys, int ne, int nb, int lane,
+                                              float* s) {
+    using F = Fmt<TY>;
+    for (int k = lane; k < nb * F::ipb; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        MultiDot<TY>::template dot<ME>(row, ys, ne, kbx, iqs, s);
+    }
+#pragma unroll
+    for (int e = 0; e < ME; ++e)
+        if (e < ne) s[e] = warp_sum(s[e]);
+}
+
 template<int TY>
 __global__ void __launch_bounds__(128) mmvq_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                    const block_q8_1* __restrict__ x, float* __restrict__ y, int n_in,
@@ -420,6 +508,26 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
     // 27.09.2026: the expert's global scale for this matrix (NVFP4), applied to the row result like llama.cpp does
     const float sc = L.scaled ? ((const float*) (blob + L.scale_off))[is_up ? 1 : 0] : 1.0f;
+    // 28.09.2026: a group of 2+ entries reads the row's weights once for all of them; a single entry keeps row_dot
+    if constexpr (MultiDot<TG>::ok) {
+        if (e1 - e0 > 1) {
+            constexpr int ME = kMultiEntries;
+            for (int eb = e0; eb < e1; eb += ME) {
+                const int ne = min(ME, e1 - eb);
+                const block_q8_1* ys[ME];
+                float s[ME];
+#pragma unroll
+                for (int j = 0; j < ME; ++j) {
+                    ys[j] = xq + (size_t) ent_tok[j < ne ? eb + j : eb] * xb;
+                    s[j] = 0.0f;
+                }
+                row_dot_multi<TG, ME>(wr, ys, ne, nb, lane, s);
+                if (lane == 0)
+                    for (int j = 0; j < ne; ++j) (is_up ? up : gate)[(size_t) (eb + j) * L.n_ff + r] = s[j] * sc;
+            }
+            return;
+        }
+    }
     for (int e = e0; e < e1; ++e) {
         const float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
         if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s * sc;
@@ -451,6 +559,26 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
     const float sc = L.scaled ? ((const float*) (blob + L.scale_off))[2] : 1.0f;   // s_down (NVFP4)
+    // 28.09.2026: a group of 2+ entries reads the row's weights once for all of them; a single entry keeps row_dot
+    if constexpr (MultiDot<TD>::ok) {
+        if (e1 - e0 > 1) {
+            constexpr int ME = kMultiEntries;
+            for (int eb = e0; eb < e1; eb += ME) {
+                const int ne = min(ME, e1 - eb);
+                const block_q8_1* ys[ME];
+                float s[ME];
+#pragma unroll
+                for (int j = 0; j < ME; ++j) {
+                    ys[j] = hq + (size_t) (j < ne ? eb + j : eb) * hb;
+                    s[j] = 0.0f;
+                }
+                row_dot_multi<TD, ME>(wr, ys, ne, nb, lane, s);
+                if (lane == 0)
+                    for (int j = 0; j < ne; ++j) out[(size_t) ent_dst[eb + j] * L.n_embd + r] = s[j] * sc;
+            }
+            return;
+        }
+    }
     for (int e = e0; e < e1; ++e) {
         const float s = row_dot<TD>(wr, hq + (size_t) e * hb, nb, lane);
         if (lane == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s * sc;
