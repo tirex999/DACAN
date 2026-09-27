@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -27,7 +28,7 @@ namespace strata::core {
 namespace {
 
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
-void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
+void* reserve(uint64_t bytes, PageBacking& got, std::string& note, bool large = true) {
 #ifdef _WIN32
     // MEM_LARGE_PAGES needs SeLockMemoryPrivilege; a normal account does not have it and VirtualAlloc then
     // fails with ERROR_PRIVILEGE_NOT_HELD.  That is the EXPECTED outcome on a desktop, not an error.
@@ -50,17 +51,40 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
     got = PageBacking::NormalPages;
     return p;
 #else
-    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
-    if (p != MAP_FAILED) {
-        got = PageBacking::LargePages;
-        note = "hugetlb 2 MB pages";
-        return p;
+    void* p = MAP_FAILED;
+    if (large) {
+        p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+        if (p != MAP_FAILED) {
+            got = PageBacking::LargePages;
+            note = "hugetlb 2 MB pages";
+            return p;
+        }
     }
     note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     got = PageBacking::NormalPages;
-    return p == MAP_FAILED ? nullptr : p;
+    if (p == MAP_FAILED) return nullptr;
+    if (!large) {
+        // 27.09.2026: the NUMA placement puts neighbouring half-experts on different nodes; a 2 MB page would take
+        // both to whichever node touched it first
+        (void) madvise(p, bytes, MADV_NOHUGEPAGE);
+        note = "4 KB pages (NUMA placement)";
+        return p;
+    }
+    // 26.09.2026: no hugetlb pool, but transparent huge pages need none - on a kernel in `madvise` mode the
+    // region only has to ask, BEFORE the first touch (cudaHostRegister below faults every page in).  2 MB pages
+    // cut the pool's TLB misses and let the hardware prefetcher run past 4 KB boundaries.  STRATA_ARENA_THP=0
+    // is the A/B arm.
+    {
+        const char* thp = std::getenv("STRATA_ARENA_THP");
+        if (thp == nullptr || std::string(thp) != "0") {
+            if (madvise(p, bytes, MADV_HUGEPAGE) == 0) note = "MAP_HUGETLB unavailable; transparent huge pages requested (madvise)";
+            else note += "; madvise(MADV_HUGEPAGE) refused";
+        } else {
+            note += "; transparent huge pages off (STRATA_ARENA_THP=0)";
+        }
+    }
+    return p;
 #endif
 }
 
@@ -103,9 +127,20 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, un
     if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size
 }
 
-PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : capacity(bytes) {
+PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
+                         const std::function<void(uint8_t*, uint64_t)>& place) : capacity(bytes) {
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note);
+    base = reserve(bytes, backing, note, /*large=*/!place);
+    // 27.09.2026: the placement's first touches decide the node of every page; the registration below then pins
+    // pages that already exist (on Linux that costs a walk of the page table, not a fault per page)
+    if (base && place) {
+        const auto t0 = std::chrono::steady_clock::now();
+        place((uint8_t*) base, bytes);
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "placed by NUMA node in %.1f s; ",
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        note = buf + note;
+    }
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.

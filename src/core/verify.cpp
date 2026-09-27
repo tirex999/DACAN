@@ -57,7 +57,8 @@ struct Bump {
 };
 
 bool mapped(size_t bytes, void** h, void** d) {
-    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped) != cudaSuccess) return false;
+    // PORTABLE (26.09.2026): the second card reads `x` and writes `y_miss` through these as well
+    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) return false;
     std::memset(*h, 0, bytes);
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
@@ -90,6 +91,14 @@ bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
 }  // namespace
 
 Verifier::~Verifier() {
+    if (launch_thr_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(launch_mu_);
+            launch_stop_ = true;
+        }
+        launch_cv_.notify_one();
+        launch_thr_.join();
+    }
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
@@ -98,9 +107,23 @@ Verifier::~Verifier() {
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_};
+                     h_flagA_, h_plan_, h_flagB_, h_rng_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
+}
+
+void Verifier::set_sampling(const strata::kernels::SamplerParams& p, uint64_t seed) {
+    seed_ = seed;
+    const bool same = p.greedy == sp_.greedy && (p.greedy || (p.temperature == sp_.temperature && p.top_k == sp_.top_k &&
+                                                             p.top_p == sp_.top_p && p.min_keep == sp_.min_keep &&
+                                                             p.temp_first == sp_.temp_first));
+    if (same) return;
+    // the sampler's filters are kernel arguments inside the captured windows: capture them again on next use
+    if (cs_) cudaStreamSynchronize(cs_);
+    for (auto& e : exec_)
+        if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    sp_ = p;
+    sp_.rng_dev = nullptr;
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
@@ -161,6 +184,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
+              mapped(64, (void**) &h_rng_, (void**) &m_rng_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
@@ -242,9 +266,33 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: stream create failed";
         return false;
     }
-    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
-                 (double) count.used / 1048576.0);
+    {
+        async_launch_ = std::getenv("STRATA_ASYNC_LAUNCH") != nullptr && std::string(std::getenv("STRATA_ASYNC_LAUNCH")) != "0";
+        cudaGetDevice(&launch_device_);
+        if (async_launch_) launch_thr_ = std::thread([this] { launcher_main(); });
+    }
+    std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers; graph launched from %s\n",
+                 max_t, (double) count.used / 1048576.0, async_launch_ ? "its own thread" : "the pool's thread");
     return true;
+}
+
+void Verifier::launcher_main() {
+    cudaSetDevice(launch_device_);
+    for (;;) {
+        cudaGraphExec_t ex = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(launch_mu_);
+            launch_cv_.wait(lk, [&] { return launch_stop_ || launch_state_.load(std::memory_order_acquire) == 1; });
+            if (launch_stop_) return;
+            ex = launch_exec_;
+        }
+        const Clock::time_point t0 = Clock::now();
+        cudaError_t e = cudaGraphLaunch(ex, cs_);
+        if (e == cudaSuccess) (void) cudaStreamQuery(cs_);
+        ms_launch += ms_since(t0);
+        launch_err_ = e;
+        launch_state_.store(2, std::memory_order_release);
+    }
 }
 
 const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
@@ -533,7 +581,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                L.scaled = f.scaled ? 1 : 0;   // 27.09.2026: NVFP4's per-expert global scales at the blob's tail
+                L.scale_off = f.scale_off;
+                L.bytes = f.bytes;
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
             } else {
@@ -542,14 +593,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         grouped(p_ptr, p_start, p_counts);
-        wait_flag_ge(m_flagB_, ring, cs);                      // the PCIe share is in staging (DMA) or mapped
-        if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-            const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-            uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+        // 26.09.2026: with no PCIe share (--pcie-frac 0, e.g. a second card holding the misses) its wait and its four
+        // kernels are left out of the graph - ~15 us per layer of launches over empty groups on a 2080 Ti
+        if (pcie_share_) {
+            wait_flag_ge(m_flagB_, ring, cs);                  // the PCIe share is in staging (DMA) or mapped
+            if (sink_.pcie_mode == 2) {                        // stage it with a copy kernel, then point at staging
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            }
+            grouped(p_ptr2, p_start2, p_counts + 2);
         }
-        grouped(p_ptr2, p_start2, p_counts + 2);
         wait_flag_ge(m_flag_, ring, cs);                       // the CPU's share is in the mapped rows
         copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
         moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
@@ -595,9 +650,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 return false;
             }
         }
-        SamplerParams sp;
-        sp.greedy = true;
-        sp.temperature = 0.0f;
+        // 27.09.2026: was hard-wired to greedy, whatever the request asked; now `set_sampling`'s choice, with the
+        // draw's {counter, seed} read from mapped memory at run time (written in `run` before each launch)
+        SamplerParams sp = sp_;
+        sp.rng_dev = m_rng_;
         sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
     }
     return true;
@@ -730,15 +786,40 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    // 27.09.2026: the sampler's draw for token t of this window is Philox(seed, pos0 + t) - a fresh number for
+    // every position, read by the captured kernel at run time
+    ((volatile unsigned long long*) h_rng_)[0] = (unsigned long long) pos0;
+    ((volatile unsigned long long*) h_rng_)[1] = (unsigned long long) seed_;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
-    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs_);
+    // 26.09.2026: the launch goes to `launch_thr_` (see the header); `issued` says whether it has returned, and
+    // until it has, an idle stream means "not submitted yet", not "finished" - the watchdog below waits for it.
+    bool issued = false;
+    auto check_issued = [&]() -> bool {
+        if (issued) return true;
+        if (launch_state_.load(std::memory_order_acquire) != 2) return false;
+        issued = true;
+        return true;
+    };
+    if (async_launch_) {
+        {
+            std::lock_guard<std::mutex> lk(launch_mu_);
+            launch_exec_ = exec_[T];
+            launch_state_.store(1, std::memory_order_release);
+        }
+        launch_cv_.notify_one();
+    } else {
+        const Clock::time_point tl = Clock::now();
+        const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+        if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+        (void) cudaStreamQuery(cs_);
+        ms_launch += ms_since(tl);
+        issued = true;
+    }
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -755,16 +836,26 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             _mm_pause();
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
-            if (now - last_flush > std::chrono::microseconds(2000)) {
+            if (now - last_flush > std::chrono::microseconds(2000) && check_issued()) {
                 last_flush = now;
+                if (async_launch_ && launch_err_ != cudaSuccess) {
+                    err = std::string("verify: launch: ") + cudaGetErrorString(launch_err_);
+                    launch_state_.store(0, std::memory_order_release);
+                    return false;
+                }
                 const cudaError_t q = cudaStreamQuery(cs_);
                 if (q != cudaErrorNotReady && *seq < want) {
                     err = "verify: layer " + std::to_string(l) + " never rang (" +
                           (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                    if (async_launch_) launch_state_.store(0, std::memory_order_release);   // issued: nothing in flight
                     return false;
                 }
             }
-            if (now - a > std::chrono::seconds(20)) { err = "verify: timed out at layer " + std::to_string(l); return false; }
+            if (now - a > std::chrono::seconds(20)) {
+                err = "verify: timed out at layer " + std::to_string(l);
+                if (async_launch_ && check_issued()) launch_state_.store(0, std::memory_order_release);
+                return false;
+            }
         }
         const Clock::time_point b = Clock::now();
         VDBG("layer %lld rang\n", (long long) l);
@@ -790,6 +881,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+    }
+    if (async_launch_) {
+        // every layer rang, so the device has run the whole graph's layers - but the launch call itself may not
+        // have returned yet, and a stream sync before it has would not cover the head
+        while (!check_issued()) _mm_pause();
+        launch_state_.store(0, std::memory_order_release);
+        if (launch_err_ != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(launch_err_); return false; }
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }

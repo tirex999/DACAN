@@ -27,12 +27,24 @@ struct NativeFmt {
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
+    /// 27.09.2026: NVFP4 experts from ModelOpt have a per-expert global scale per matrix (weight_scale_2).  A
+    /// `scaled` blob carries it in 16 bytes after the weights - {s_gate, s_up, s_down, 0} at `scale_off` - and
+    /// every kernel multiplies it into its row results, as llama.cpp does with its `.scale` tensors.
+    bool scaled = false;
+    size_t w_bytes = 0;                 ///< where the weights end (= bytes unless scaled)
+    size_t scale_off = 0;
 };
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+/// Makes `f` a scaled blob: 16 more bytes after the weights (see NativeFmt::scaled).
+inline void native_fmt_add_scales(NativeFmt& f) {
+    f.scaled = true;
+    f.scale_off = f.w_bytes;
+    f.bytes = f.w_bytes + 16;
+}
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);

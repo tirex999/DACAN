@@ -49,7 +49,9 @@ if(STRATA_ENABLE_CUDA)
     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
       continue()
     endif()
-    if(_base LESS 80)
+    # sm_75 (Turing, RTX 20): the tf32 scorer has a scalar branch and fused_gr splits its verify window to fit
+    # Turing's 64 KB of shared memory per block (26.09.2026, 2x RTX 2080 Ti 22 GB port).
+    if(_base LESS 75)
       message(FATAL_ERROR
         "Strata needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50 series), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")

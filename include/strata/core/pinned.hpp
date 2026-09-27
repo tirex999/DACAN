@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -39,7 +40,12 @@ struct PinnedArena {
     explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
     /// Plan v0.3 P6: slices of different sizes (one per layer of a native pack), given as their start offsets
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
-    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds);
+    ///
+    /// `place` (27.09.2026), when given, runs after the reservation and BEFORE the registration touches a page: a
+    /// first touch from a thread on node N puts the page in node N's memory, and the registration pins it where
+    /// it is.  Such an arena gets 4 KB pages (a 2 MB page cannot be split between nodes).
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
+                const std::function<void(uint8_t*, uint64_t)>& place = {});
     std::vector<uint64_t> slice_starts;
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;

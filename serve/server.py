@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import queue
+import random
 import subprocess
 import sys
 import tempfile
@@ -80,12 +81,14 @@ class StrataEngine:
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.can_sample = False          # 27.09.2026: it takes a SAMPLE line before a GEN (READY <ctx> ... sample)
         self.last = {}
         for line in self.proc.stdout:
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.can_sample = "sample" in f[2:]
                 break
         if self.max_context <= 0:
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
@@ -108,6 +111,24 @@ class StrataEngine:
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         head = f"GENI {int(max_new)} {embeddings}" if embeddings else f"GEN {int(max_new)}"
+        if self.can_sample:
+            # 27.09.2026: the request's sampling reaches the engine.  Until today `sampling` (the request) was not
+            # read at all and every answer was greedy - which Qwen's card forbids for the thinking mode.  Absent
+            # fields take the card's thinking-mode values; temperature 0 asks for greedy, as in the OpenAI API.
+            s = sampling if isinstance(sampling, dict) else {}
+            temp = s.get("temperature")
+            temp = 0.6 if temp is None else float(temp)
+            top_k = s.get("top_k")
+            top_k = 20 if top_k is None else int(top_k)
+            top_p = s.get("top_p")
+            top_p = 0.95 if top_p is None else float(top_p)
+            seed = s.get("seed")
+            seed = random.getrandbits(63) if seed is None else int(seed) & ((1 << 63) - 1)
+            # the last field: 1 = top_p at temperature T, the order of vLLM / SGLang (flashinfer) / HF, which is what
+            # these OpenAI-style fields mean and how Qwen's values were set; STRATA_SAMPLE_ORDER=llama -> the
+            # llama.cpp chain (top_p on the raw logits, a wider keep set at T < 1)
+            order = 0 if os.environ.get("STRATA_SAMPLE_ORDER", "") == "llama" else 1
+            self.proc.stdin.write(f"SAMPLE {temp} {top_k} {top_p} {seed} {order}\n")
         self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
         self.proc.stdin.flush()
         done = False

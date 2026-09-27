@@ -103,11 +103,6 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         }
         NativeFmt f;
         if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
-        if (f.bytes != blob) {
-            err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
-                  " B but its formats make " + std::to_string(f.bytes);
-            return false;
-        }
         if (ss >> go >> uo >> dox) {   // v2 lines: the GGUF offsets
             if (L.gguf_off.empty()) L.gguf_off.assign((size_t) (3 * n_layers), 0);
             L.gguf_off[(size_t) (3 * l)] = go;
@@ -115,9 +110,26 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             L.gguf_off[(size_t) (3 * l + 2)] = dox;
             std::string file;             // v3: the shard that holds this layer (a file name beside --native)
             if (ss >> file) {
-                if (L.gguf_file.empty()) L.gguf_file.assign((size_t) n_layers, std::string());
-                L.gguf_file[(size_t) l] = file;
+                if (file != "-") {        // v4 writes "-" for "the --native shard itself"
+                    if (L.gguf_file.empty()) L.gguf_file.assign((size_t) n_layers, std::string());
+                    L.gguf_file[(size_t) l] = file;
+                }
+                // v4 (27.09.2026): the per-expert global scales (F32 [n_expert] each) of gate / up / down - NVFP4
+                // from ModelOpt; the blob then carries them in 16 bytes after its weights (NativeFmt::scaled)
+                unsigned long long gso = 0, uso = 0, dso = 0;
+                if (ss >> gso >> uso >> dso) {
+                    if (L.gguf_scale_off.empty()) L.gguf_scale_off.assign((size_t) (3 * n_layers), 0);
+                    L.gguf_scale_off[(size_t) (3 * l)] = gso;
+                    L.gguf_scale_off[(size_t) (3 * l + 1)] = uso;
+                    L.gguf_scale_off[(size_t) (3 * l + 2)] = dso;
+                    native_fmt_add_scales(f);
+                }
             }
+        }
+        if (f.bytes != blob) {
+            err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
+                  " B but its formats make " + std::to_string(f.bytes);
+            return false;
         }
         L.fmt[(size_t) l] = f;
         L.offset[(size_t) l] = off;

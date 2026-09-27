@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::kernels {
 
@@ -45,6 +46,8 @@ inline constexpr float NG_RMS_EPS = 1e-6f;
 // 5 blocks of 32 at 18 bytes = 90 bytes.  The head-slowest flatten then makes 16 rows exactly n_embd = 2560.
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
 inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90
+// 27.09.2026: the table may also be Q8_0 (NVIDIA's FP8 table requantized to 8 bits): 5 blocks of fp16 d + 32 int8.
+inline constexpr int PLE_ROW_BYTES_Q8 = (PLE_HEAD_DIM / 32) * 34;        // 170
 
 /// The artifact's own hash constants, transcribed from `docs/gguf-dump-shard1.txt`:
 ///
@@ -96,6 +99,10 @@ int iq4nl_code(int code);
 /// a perfectly plausible embedding of the wrong 160 values.
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
 
+/// One 170-byte Q8_0 row -> 160 floats: five blocks of { fp16 d ; int8 qs[32] }, value = d * qs[j] in order
+/// (`dequantize_row_q8_0`; no split halves). The Mmap path only: the Direct reader moves 90-byte rows.
+void q8_0_dequant_row(const uint8_t* row, float* out160);
+
 /// How the table's rows are read (plan v0.3 P2). `Direct` is the default: unbuffered 4 KiB reads from the SSD,
 /// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the
 /// A/B arm; it returns the same bytes.
@@ -135,6 +142,12 @@ public:
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);
+
+    /// 27.09.2026: the mapped table read into memory by `threads` threads (pinned round-robin to `cores` when it is
+    /// not empty - pages read in from disk land on their node) and, with `lock`, locked there.  A token's rows are
+    /// random reads: with the table mostly on disk they were 30 ms of a 72 ms round.  Mmap mode only; `note` says
+    /// what was done.  Returns the bytes resident afterwards.
+    uint64_t make_resident(int threads, bool lock, const std::vector<int>& cores, std::string& note);
 
     /// Maps the ORIGINAL second GGUF shard read-only.  The tensor's data does NOT start at file offset 0:
     /// the manifest's `shard2_tensor.offset` is relative to the GGUF's DATA SECTION, and the header before it

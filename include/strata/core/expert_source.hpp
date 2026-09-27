@@ -88,6 +88,38 @@ struct GpuPlanSink {
     int pcie_mode = 0;
 };
 
+/// 26.09.2026: THE SECOND CARD AS A THIRD EXECUTOR OF A VERIFY WINDOW'S EXPERTS.
+///
+/// The main card's graph is untouched.  Experts the main card does not hold but this card does are computed here,
+/// beside the CPU pool: the pool launches them right after publishing the main card's plan, computes its own share,
+/// then waits for this card's event.  Its rows land in the SAME mapped `y_miss` rows the CPU writes, so to the main
+/// card they look exactly like CPU rows and its `post` needs no change.  Needs the verify window's mapped buffers
+/// allocated PORTABLE (this card reads `x` and writes `y_miss` through them).
+struct SecondCard {
+    int device = -1;                          ///< CUDA device of this card; the main card is device `main_device`
+    int main_device = 0;
+    const int32_t* host_res = nullptr;        ///< [n_layers * n_expert] -> slot on this card, or -1
+    const uint8_t* cache_base = nullptr;      ///< device address of slot 0
+    const uint64_t* slot_off = nullptr;       ///< byte offset of each slot (sized slots)
+    void* stream = nullptr;                   ///< cudaStream_t on this card
+    void* done = nullptr;                     ///< cudaEvent_t, recorded after the rows are in `y_miss`
+    float* x = nullptr;                       ///< device: MAXT x n_embd activations
+    void* xq = nullptr;                       ///< device: their q8_1 blocks
+    void* scratch = nullptr;                  ///< device: `native_expert_scratch_bytes(cap, n_ff)`
+    float* out = nullptr;                     ///< device: cap x n_embd rows, indexed like `y_miss`
+    int32_t* h_plan = nullptr;                ///< pinned host: counts[4] | start[cap+1] | dst[cap] | tok[cap] | ptr[cap] (u64)
+    int32_t* d_plan = nullptr;                ///< device copy
+    int64_t cap = 0;                          ///< entries (MAXT x k)
+    int64_t plan_i32 = 0;                     ///< int32 words in the plan block
+    bool pending = false;                     ///< launched in this layer, not yet waited for
+    int64_t entries = 0;                      ///< routed entries it computed
+    int64_t experts = 0;                      ///< distinct (layer, expert) pairs it computed
+    int64_t launches = 0;                     ///< layers it took part in
+    int64_t dual_card = 0, dual_main = 0;     ///< experts both cards hold, sent here / left to the main card
+    double ms_launch = 0;                     ///< host time spent issuing its work
+    double ms_wait = 0;                       ///< host time spent waiting for it after the CPU share
+};
+
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
@@ -204,12 +236,18 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
+    /// 26.09.2026: the second card (null = one card).  See `SecondCard`.
+    SecondCard* card2 = nullptr;
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// 26.09.2026: RAW routed counts per (layer, expert) over the whole run - no decay, empty = off.  `usage` above
+    /// is decayed by the adaptive tier and cannot rank experts past the profile's 8000; this one can, and it is
+    /// what a residency plan for a second card is built from (STRATA_USAGE_DUMP=path in generate).
+    std::vector<uint32_t> routed_total;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
@@ -323,6 +361,10 @@ public:
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads, std::string& err);
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's shard 1.
     void set_gguf(const std::string& shard1) { gguf_ = shard1; }
+    /// 27.09.2026: NUMA placement.  Group g's rows of every expert - [n*g/G, n*(g+1)/G) of gate, up and down, the
+    /// rows `ExpertPool`'s group g computes - are first touched from `cores[g]`, so they live in that node's
+    /// memory.  Native packs only; empty (the default) leaves the pages to the process's policy.
+    void set_numa(const std::vector<std::vector<int>>& cores) { numa_cores_ = cores; }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -349,6 +391,7 @@ private:
     double gib_per_s_ = 0.0;
     uint64_t pinned_bytes_ = 0;
     std::string gguf_;
+    std::vector<std::vector<int>> numa_cores_;
 };
 
 }  // namespace strata::core

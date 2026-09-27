@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace strata::kernels::cpu {
@@ -57,6 +58,9 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.up_off = f.gu_row * (size_t) n_ff;
     f.down_off = 2 * f.up_off;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
+    f.w_bytes = f.bytes;
+    f.scaled = false;
+    f.scale_off = 0;
     f.act_bytes = ggml_row_size(tg->vec_dot_type, n_embd);
     f.h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
     if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
@@ -79,12 +83,18 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // the AVX-512 kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster at
     // one (both are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
-    if (avx512 && nt >= 2 && iq512_supported(f.gu_type)) {   // one token: ggml-cpu is as fast or faster
+    if (avx512 && nt >= 2 && !f.scaled && iq512_supported(f.gu_type)) {   // one token: ggml-cpu is as fast or faster
         iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
+    // 27.09.2026: the expert's global scales (NVFP4), on the row results before SiLU - as llama.cpp applies them
+    float sg = 1.f, su = 1.f;
+    if (f.scaled) {
+        std::memcpy(&sg, blob + f.scale_off, 4);
+        std::memcpy(&su, blob + f.scale_off + 4, 4);
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
@@ -92,6 +102,8 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             float g = 0.f, u = 0.f;
             dot(n, &g, 0, gr, 0, act[t], 0, 1);
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
+            g *= sg;
+            u *= su;
             ff[t][r] = (g / (1.f + std::exp(-g))) * u;
         }
     }
@@ -101,12 +113,14 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
                       int r0, int r1) {
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
+    float sd = 1.f;
+    if (f.scaled) std::memcpy(&sd, blob + f.scale_off + 8, 4);   // s_down (NVFP4)
     for (int r = r0; r < r1; ++r) {
         const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
         for (int t = 0; t < nt; ++t) {
             float s = 0.f;
             dot(n, &s, 0, dr, 0, hq[t], 0, 1);
-            out[t][r] = s;
+            out[t][r] = s * sd;
         }
     }
 }

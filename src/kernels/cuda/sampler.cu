@@ -9,6 +9,10 @@
 // valid token, so only a comparison at the distribution level can tell them apart; the parity test does that
 // explicitly by running the wrong order and requiring it to differ.
 //
+// 27.09.2026: `SamplerParams::temp_first` is the OTHER order on purpose - top_p's mass at temperature T, as vLLM,
+// SGLang / flashinfer and HF compute it.  An OpenAI-style request ("temperature 0.6, top_p 0.95, top_k 20", Qwen's
+// card) means that order, so the server asks for it; the llama.cpp chain stays the default of the kernel.
+//
 // Everything happens on the logits of ONE token in one thread.  The vocab is 248,320, which is far too large
 // to sort per token on a naive path, so `top_k` uses `k` passes of a maximum scan - 20 x 248,320 = 5.0M
 // comparisons per token.  Phase 3's note ("sort-free sampler: top-k = 20 makes this easy") is the optimisation;
@@ -232,15 +236,17 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
 
         // ---- top_p over the survivors, in descending order (which the selection above already produced)
         if (p.top_p < 1.0f) {
-            // softmax over the keep set for the cumulative mass
+            // softmax over the keep set for the cumulative mass; `temp_first` (27.09.2026) takes it at temperature
+            // T, as vLLM / flashinfer do - `* 1.0` otherwise, which is exact, so the llama.cpp path is unchanged
+            const double ts = p.temp_first ? (double) inv_t : 1.0;
             float mx = keep_logit[0];
             for (int i = 1; i < n_keep; ++i) mx = fmaxf(mx, keep_logit[i]);
             double sum = 0.0;
-            for (int i = 0; i < n_keep; ++i) sum += exp((double) keep_logit[i] - (double) mx);
+            for (int i = 0; i < n_keep; ++i) sum += exp(((double) keep_logit[i] - (double) mx) * ts);
             double cum = 0.0;
             int cut = n_keep;
             for (int i = 0; i < n_keep; ++i) {
-                cum += exp((double) keep_logit[i] - (double) mx) / sum;
+                cum += exp(((double) keep_logit[i] - (double) mx) * ts) / sum;
                 if (cum >= (double) p.top_p) { cut = i + 1; break; }
             }
             if (cut < p.min_keep) cut = p.min_keep < n_keep ? p.min_keep : n_keep;
@@ -278,7 +284,8 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     for (int i = 1; i < n_keep; ++i) mx = fmaxf(mx, keep_logit[i]);
     double sum = 0.0;
     for (int i = 0; i < n_keep; ++i) sum += exp((double) keep_logit[i] - (double) mx);
-    const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+    const uint64_t rng_ctr = p.rng_dev ? p.rng_dev[0] : p.counter, rng_seed = p.rng_dev ? p.rng_dev[1] : p.seed;
+    const float u = philox_uniform(rng_seed, rng_ctr + (uint64_t) t);
     double cum = 0.0;
     int pick = keep_ids[n_keep - 1];
     for (int i = 0; i < n_keep; ++i) {
@@ -286,6 +293,269 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
         if ((double) u < cum) { pick = keep_ids[i]; break; }
     }
     out[t] = pick;
+}
+
+// ---- 27.09.2026: THE SAMPLED PATH FOR REAL DECODING - one block per token instead of one thread.
+//
+// `sampler_kernel` above is the correctness version: one thread scans the 248,320 logits `top_k` times.  That is
+// why the verify window was hard-wired to greedy - and greedy is exactly what Qwen's own card forbids for the
+// thinking mode ("do not use greedy decoding ... endless repetitions").  This kernel gives the SAME token for the
+// same (seed, counter): the survivors come out in the same order - value descending, the smaller id first on a tie,
+// which is what `k` passes of "best < 0 || l[v] > bv" over ascending ids produce - and thread 0 then runs the
+// reference's own top_p / temperature / softmax / draw code, in double where the reference is in double.
+//   1. every thread keeps the K best of its strided slice of the vocabulary (insertion into a sorted list);
+//   2. K rounds of a block-wide arg-best over the heads of those lists give the K survivors in order;
+//   3. thread 0 finishes like the reference.
+// No penalties (they need a history the verify window does not carry); `sample_tokens` falls back otherwise.
+constexpr int kFastThreads = 256;
+constexpr int kFastKmax = 64;
+
+__device__ __forceinline__ bool fast_better(float va, int ia, float vb, int ib) {
+    return va > vb || (va == vb && ia < ib);
+}
+
+__global__ void __launch_bounds__(kFastThreads) sampler_topk_block_kernel(const float* __restrict__ logits,
+                                                                          int n_vocab, const SamplerParams p,
+                                                                          int* __restrict__ out) {
+    const int t = blockIdx.x;
+    const float* l = logits + (size_t) t * n_vocab;
+    const int K = p.top_k < kFastKmax ? p.top_k : kFastKmax;
+    // 1. this thread's K best, sorted.  The loads go 8 at a time (27.09.2026): one dependent load per step left
+    // the scan latency-bound, ~970 DRAM round trips per thread; the ids are visited in the same ascending order.
+    float lv[kFastKmax];
+    int li[kFastKmax];
+    int n = 0;
+    constexpr int kBatch = 8;
+    for (int v0 = threadIdx.x; v0 < n_vocab; v0 += kFastThreads * kBatch) {
+        float xs[kBatch];
+#pragma unroll
+        for (int u = 0; u < kBatch; ++u) {
+            const int v = v0 + u * kFastThreads;
+            xs[u] = v < n_vocab ? l[v] : 0.0f;
+        }
+#pragma unroll
+        for (int u = 0; u < kBatch; ++u) {
+            const int v = v0 + u * kFastThreads;
+            if (v >= n_vocab) break;
+            const float x = xs[u];
+            if (n == K && !fast_better(x, v, lv[K - 1], li[K - 1])) continue;
+            int j = n < K ? n++ : K - 1;
+            while (j > 0 && fast_better(x, v, lv[j - 1], li[j - 1])) {
+                lv[j] = lv[j - 1];
+                li[j] = li[j - 1];
+                --j;
+            }
+            lv[j] = x;
+            li[j] = v;
+        }
+    }
+    // 2. K rounds of a block-wide arg-best over the list heads
+    constexpr int W = kFastThreads / 32;
+    __shared__ float s_v[W];
+    __shared__ int s_i[W], s_o[W];
+    __shared__ float keep_v[kFastKmax];
+    __shared__ int keep_i[kFastKmax];
+    __shared__ int s_winner;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n_keep0 = K < n_vocab ? K : n_vocab;
+    int head = 0;
+    for (int r = 0; r < n_keep0; ++r) {
+        float bv = head < n ? lv[head] : -INFINITY;
+        int bi = head < n ? li[head] : 0x7fffffff;
+        int bo = threadIdx.x;
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+            const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+            const int oo = __shfl_down_sync(0xffffffffu, bo, off);
+            if (fast_better(ov, oi, bv, bi)) { bv = ov; bi = oi; bo = oo; }
+        }
+        if (lane == 0) { s_v[warp] = bv; s_i[warp] = bi; s_o[warp] = bo; }
+        __syncthreads();
+        if (warp == 0) {
+            bv = lane < W ? s_v[lane] : -INFINITY;
+            bi = lane < W ? s_i[lane] : 0x7fffffff;
+            bo = lane < W ? s_o[lane] : -1;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+                const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+                const int oo = __shfl_down_sync(0xffffffffu, bo, off);
+                if (fast_better(ov, oi, bv, bi)) { bv = ov; bi = oi; bo = oo; }
+            }
+            if (lane == 0) { keep_v[r] = bv; keep_i[r] = bi; s_winner = bo; }
+        }
+        __syncthreads();
+        if ((int) threadIdx.x == s_winner) ++head;
+    }
+    if (threadIdx.x != 0) return;
+    // 3. the reference's own finish (sampler_kernel), on the same survivors in the same order
+    float keep_logit[kFastKmax];
+    int n_keep = n_keep0;
+    for (int i = 0; i < n_keep; ++i) keep_logit[i] = keep_v[i];
+    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    if (p.top_p < 1.0f) {
+        const double ts = p.temp_first ? (double) inv_t : 1.0;   // the reference's expression, see there
+        float mx = keep_logit[0];
+        for (int i = 1; i < n_keep; ++i) mx = fmaxf(mx, keep_logit[i]);
+        double sum = 0.0;
+        for (int i = 0; i < n_keep; ++i) sum += exp(((double) keep_logit[i] - (double) mx) * ts);
+        double cum = 0.0;
+        int cut = n_keep;
+        for (int i = 0; i < n_keep; ++i) {
+            cum += exp(((double) keep_logit[i] - (double) mx) * ts) / sum;
+            if (cum >= (double) p.top_p) { cut = i + 1; break; }
+        }
+        if (cut < p.min_keep) cut = p.min_keep < n_keep ? p.min_keep : n_keep;
+        n_keep = cut;
+    }
+    for (int i = 0; i < n_keep; ++i) keep_logit[i] = apply_penalties(keep_logit[i] * inv_t, 0, p);
+    float mx = keep_logit[0];
+    for (int i = 1; i < n_keep; ++i) mx = fmaxf(mx, keep_logit[i]);
+    double sum = 0.0;
+    for (int i = 0; i < n_keep; ++i) sum += exp((double) keep_logit[i] - (double) mx);
+    const uint64_t rng_ctr = p.rng_dev ? p.rng_dev[0] : p.counter, rng_seed = p.rng_dev ? p.rng_dev[1] : p.seed;
+    const float u = philox_uniform(rng_seed, rng_ctr + (uint64_t) t);
+    double cum = 0.0;
+    int pick = keep_i[n_keep - 1];
+    for (int i = 0; i < n_keep; ++i) {
+        cum += exp((double) keep_logit[i] - (double) mx) / sum;
+        if ((double) u < cum) { pick = keep_i[i]; break; }
+    }
+    out[t] = pick;
+}
+
+// ---- 27.09.2026: the same sampled path for top_k <= 32, the way FAISS's WarpSelect does it.
+//
+// `sampler_topk_block_kernel` measured 1.1 ms for a 5-row window (GPU events) against 48 us for the greedy kernel:
+// its per-thread lists (64 + 64 entries, dynamically indexed) live in local memory - 128 KB a block, past L1 - and
+// its finish runs the double math on one thread.  Here each WARP keeps one sorted list in registers, lane l holding
+// the l-th best of what the warp has seen (value descending, the smaller id first on a tie - the reference's order),
+// and a vocabulary entry costs one compare against the K-th best and a ballot; only the rare entries that beat it
+// are inserted (a shuffle shift).  32 warps a row, then warp 0 merges the 32 lists the same way.  The finish is the
+// reference's own arithmetic with the exps computed one per lane and every sum taken in the reference's order
+// through shuffles, so the pick is the same bit for bit.
+constexpr int kWsThreads = 1024;
+constexpr int kWsWarps = kWsThreads / 32;
+constexpr int kWsKmax = 32;
+constexpr unsigned kFull = 0xffffffffu;
+
+// insert (cv, ci) into the warp list if it beats a listed entry; entries sort descending, so the lanes it beats are
+// a suffix [pos, K) and they shift down by one
+__device__ __forceinline__ void ws_insert(float& wv, int& wi, float cv, int ci, int lane, int K) {
+    const bool b = lane < K && fast_better(cv, ci, wv, wi);
+    const unsigned bm = __ballot_sync(kFull, b);
+    const float up_v = __shfl_up_sync(kFull, wv, 1);
+    const int up_i = __shfl_up_sync(kFull, wi, 1);
+    if (bm != 0u && lane < K) {
+        const int pos = __ffs(bm) - 1;
+        if (lane > pos) {
+            wv = up_v;
+            wi = up_i;
+        } else if (lane == pos) {
+            wv = cv;
+            wi = ci;
+        }
+    }
+}
+
+// offer this lane's (x, id) to the warp list (each lane may offer one); candidates go in one at a time, each one
+// re-checked against the threshold the previous insert raised
+__device__ __forceinline__ void ws_offer(float& wv, int& wi, float& thr_v, int& thr_i, bool valid, float x, int id,
+                                         int lane, int K) {
+    bool cand = valid && fast_better(x, id, thr_v, thr_i);
+    unsigned bal = __ballot_sync(kFull, cand);
+    while (bal != 0u) {
+        const int s = __ffs(bal) - 1;
+        const float cv = __shfl_sync(kFull, x, s);
+        const int ci = __shfl_sync(kFull, id, s);
+        ws_insert(wv, wi, cv, ci, lane, K);
+        thr_v = __shfl_sync(kFull, wv, K - 1);
+        thr_i = __shfl_sync(kFull, wi, K - 1);
+        if (lane == s) cand = false;
+        cand = cand && fast_better(x, id, thr_v, thr_i);
+        bal = __ballot_sync(kFull, cand);
+    }
+}
+
+__global__ void __launch_bounds__(kWsThreads) sampler_warpselect_kernel(const float* __restrict__ logits, int n_vocab,
+                                                                        const SamplerParams p, int* __restrict__ out) {
+    const int t = blockIdx.x;
+    const float* l = logits + (size_t) t * n_vocab;
+    const int K = p.top_k;                               // 1..kWsKmax, checked by the caller
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __shared__ float s_v[kWsWarps][kWsKmax];
+    __shared__ int s_i[kWsWarps][kWsKmax];
+
+    // 1. every warp: the K best of its contiguous slice of the vocabulary, 4 loads in flight per lane
+    float wv = -INFINITY, thr_v = -INFINITY;
+    int wi = 0x7fffffff, thr_i = 0x7fffffff;             // sentinels lose to every real entry, -inf ones too
+    const int per = (n_vocab + kWsWarps - 1) / kWsWarps;
+    const int lo = warp * per, hi = min(n_vocab, lo + per);
+    constexpr int U = 4;
+    for (int base = lo; base < hi; base += 32 * U) {
+        float xs[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int v = base + u * 32 + lane;
+            xs[u] = v < hi ? l[v] : -INFINITY;
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int v = base + u * 32 + lane;
+            ws_offer(wv, wi, thr_v, thr_i, v < hi, xs[u], v, lane, K);
+        }
+    }
+    if (lane < K) {
+        s_v[warp][lane] = wv;
+        s_i[warp][lane] = wi;
+    }
+    __syncthreads();
+    if (warp != 0) return;
+
+    // 2. warp 0 merges the other warps' lists into its own
+    for (int w = 1; w < kWsWarps; ++w) {
+        const bool valid = lane < K;
+        const float x = valid ? s_v[w][lane] : -INFINITY;
+        const int id = valid ? s_i[w][lane] : 0x7fffffff;
+        ws_offer(wv, wi, thr_v, thr_i, valid && id != 0x7fffffff, x, id, lane, K);
+    }
+    // lanes 0..K-1 now hold the K survivors in the reference's order (n_vocab > kWsKmax, so K of them exist)
+
+    // 3. the finish of sampler_kernel: exps one per lane, sums in the reference's order
+    int n_keep = K;
+    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    if (p.top_p < 1.0f) {
+        const double ts = p.temp_first ? (double) inv_t : 1.0;
+        const float mx = __shfl_sync(kFull, wv, 0);      // the list is sorted: lane 0 is the maximum
+        const double e = lane < n_keep ? exp(((double) wv - (double) mx) * ts) : 0.0;
+        double sum = 0.0;
+        for (int i = 0; i < n_keep; ++i) sum += __shfl_sync(kFull, e, i);
+        const double term = e / sum;
+        double cum = 0.0;
+        int cut = n_keep;
+        for (int i = 0; i < n_keep; ++i) {
+            cum += __shfl_sync(kFull, term, i);
+            if (cum >= (double) p.top_p) { cut = i + 1; break; }
+        }
+        if (cut < p.min_keep) cut = p.min_keep < n_keep ? p.min_keep : n_keep;
+        n_keep = cut;
+    }
+    const float kl = lane < n_keep ? apply_penalties(wv * inv_t, 0, p) : -INFINITY;
+    float mx = kl;
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(kFull, mx, off));
+    const double e = lane < n_keep ? exp((double) kl - (double) mx) : 0.0;
+    double sum = 0.0;
+    for (int i = 0; i < n_keep; ++i) sum += __shfl_sync(kFull, e, i);
+    const double term = e / sum;
+    const uint64_t rng_ctr = p.rng_dev ? p.rng_dev[0] : p.counter, rng_seed = p.rng_dev ? p.rng_dev[1] : p.seed;
+    const float u = philox_uniform(rng_seed, rng_ctr + (uint64_t) t);
+    double cum = 0.0;
+    int pick_lane = n_keep - 1;
+    for (int i = 0; i < n_keep; ++i) {
+        cum += __shfl_sync(kFull, term, i);
+        if ((double) u < cum) { pick_lane = i; break; }
+    }
+    const int pick = __shfl_sync(kFull, wi, pick_lane);
+    if (lane == 0) out[t] = pick;
 }
 
 }  // namespace
@@ -305,6 +575,16 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         const int gthreads = 1024;
         sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, 0, (cudaStream_t) stream>>>(
             logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
+    } else if (p.penalty_last_n <= 0 && p.top_k >= 1 && p.top_k <= kWsKmax && n_vocab > kWsKmax &&
+               std::getenv("STRATA_SAMPLER_REFERENCE") == nullptr && std::getenv("STRATA_SAMPLER_BLOCK") == nullptr) {
+        // 27.09.2026: top_k <= 32 - the warp lists (see sampler_warpselect_kernel), the same tokens as the reference
+        sampler_warpselect_kernel<<<(unsigned) n_tokens, kWsThreads, 0, (cudaStream_t) stream>>>(logits, n_vocab, p,
+                                                                                                 out);
+    } else if (p.penalty_last_n <= 0 && p.top_k >= 1 && p.top_k <= kFastKmax &&
+               std::getenv("STRATA_SAMPLER_REFERENCE") == nullptr) {
+        // 27.09.2026: the block-per-token kernel, the same tokens as the reference (see above)
+        sampler_topk_block_kernel<<<(unsigned) n_tokens, kFastThreads, 0, (cudaStream_t) stream>>>(logits, n_vocab,
+                                                                                                    p, out);
     } else {
         sampler_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(logits, n_vocab, n_tokens, history,
                                                                    history_len, p, out);

@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <climits>
+#include <cstdlib>
 #include <immintrin.h>
 
 #include <cstdio>
@@ -13,8 +15,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
+#include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace strata::kernels::cpu {
@@ -49,17 +54,96 @@ std::vector<int> physical_cores(bool skip_first) {
 #else
     cpu_set_t set;
     CPU_ZERO(&set);
-    if (sched_getaffinity(0, sizeof set, &set) == 0)
+    // 27.09.2026: BRACES.  Without them the `else` belonged to the inner `if (CPU_ISSET)`, so every CPU OUTSIDE the
+    // affinity mask appended the whole machine: under `numactl --cpunodebind=1` the list began 0, 1, 2 ... and the
+    // pool put 31 of its 63 workers - and the host loop, on CPU 0 - on the other socket, reading an arena bound to
+    // node 1 across the socket link.
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
         for (int i = 0; i < CPU_SETSIZE; ++i)
             if (CPU_ISSET(i, &set)) cores.push_back(i);
-    else
+    } else {
         for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) cores.push_back((int) i);
+    }
+    // Linux lists LOGICAL CPUs here, SMT siblings included - the same trap the Windows branch avoids above: two
+    // workers per physical core halve the bandwidth the expert kernel is bound by.  Keep the first logical CPU
+    // of each (package, core) pair, read from sysfs; if topology is unreadable, keep the list as it is.
+    // (26.09.2026, 2x Xeon Ice Lake: the container's cpuset mixed siblings of the same cores.)
+    {
+        std::vector<int> firsts;
+        std::vector<std::pair<int, int>> seen;
+        bool ok = true;
+        for (int c : cores) {
+            char path[128];
+            int pkg = -1, core = -1;
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", c);
+            if (FILE* f = std::fopen(path, "r")) { if (std::fscanf(f, "%d", &pkg) != 1) pkg = -1; std::fclose(f); }
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/core_id", c);
+            if (FILE* f = std::fopen(path, "r")) { if (std::fscanf(f, "%d", &core) != 1) core = -1; std::fclose(f); }
+            if (pkg < 0 || core < 0) { ok = false; break; }
+            const std::pair<int, int> key(pkg, core);
+            bool dup = false;
+            for (const auto& s : seen) if (s == key) { dup = true; break; }
+            if (!dup) { seen.push_back(key); firsts.push_back(c); }
+        }
+        if (ok && !firsts.empty()) cores.swap(firsts);
+    }
 #endif
     if (skip_first && !cores.empty()) cores.erase(cores.begin());
     return cores;
 }
 
 namespace {
+
+#if !defined(_WIN32)
+// "0-31,64-95" -> the CPUs it names
+std::vector<int> parse_cpulist(const char* s) {
+    std::vector<int> out;
+    const char* p = s;
+    for (;;) {
+        while (*p == ',' || *p == ' ' || *p == '\n') ++p;
+        if (*p == 0) break;
+        char* end = nullptr;
+        const long a = std::strtol(p, &end, 10);
+        if (end == p) break;
+        long b = a;
+        p = end;
+        if (*p == '-') {
+            b = std::strtol(p + 1, &end, 10);
+            p = end;
+        }
+        for (long c = a; c <= b && c < CPU_SETSIZE; ++c) out.push_back((int) c);
+    }
+    return out;
+}
+
+std::vector<int> node_cpus(int node) {
+    char path[96];
+    std::snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node);
+    std::vector<int> out;
+    if (FILE* f = std::fopen(path, "r")) {
+        char buf[8192];
+        const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+        std::fclose(f);
+        buf[n] = 0;
+        out = parse_cpulist(buf);
+    }
+    return out;
+}
+
+void futex_wait(std::atomic<uint32_t>* a, uint32_t v) {
+    syscall(SYS_futex, reinterpret_cast<uint32_t*>(a), FUTEX_WAIT_PRIVATE, v, nullptr, nullptr, 0);
+}
+
+void futex_wake_all(std::atomic<uint32_t>* a) {
+    syscall(SYS_futex, reinterpret_cast<uint32_t*>(a), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+}
+#else
+void futex_wait(std::atomic<uint32_t>*, uint32_t) {}
+void futex_wake_all(std::atomic<uint32_t>*) {}
+#endif
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t), "the epoch doubles as a futex word");
+
+int g_host_core = -1;
 
 void pin_this_thread(int core) {
     if (core < 0) return;
@@ -107,10 +191,70 @@ void restore_thread_affinity(long long previous) {
 #endif
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(host_works) {
-    const std::vector<int> cores = physical_cores(true);
-    n_ = n_workers > 0 ? n_workers : (int) cores.size();
+std::vector<std::vector<int>> numa_physical_cores() {
+    std::vector<std::vector<int>> out;
+#if !defined(_WIN32)
+    const std::vector<int> cores = physical_cores(false);
+    std::vector<int> node_of(CPU_SETSIZE, -1);
+    int nodes = 0;
+    for (int n = 0; n < 64; ++n) {
+        const std::vector<int> cpus = node_cpus(n);
+        if (cpus.empty()) continue;
+        for (int c : cpus) node_of[(size_t) c] = n;
+        nodes = n + 1;
+    }
+    if (nodes < 2) return out;
+    out.resize((size_t) nodes);
+    for (int c : cores)
+        if (c >= 0 && c < CPU_SETSIZE && node_of[(size_t) c] >= 0) out[(size_t) node_of[(size_t) c]].push_back(c);
+#endif
+    return out;
+}
+
+bool bind_current_thread_to_node(int node) {
+#if defined(_WIN32)
+    (void) node;
+    return false;
+#else
+    const std::vector<int> cpus = node_cpus(node);
+    if (cpus.empty()) return false;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int c : cpus) CPU_SET(c, &set);
+    return pthread_setaffinity_np(pthread_self(), sizeof set, &set) == 0;
+#endif
+}
+
+void set_host_core(int core) { g_host_core = core; }
+
+int host_core() {
+    if (g_host_core >= 0) return g_host_core;
+    const std::vector<int> c = physical_cores(false);
+    return c.empty() ? -1 : c[0];
+}
+
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, const PoolNuma* numa) : host_works_(host_works) {
+    if (const char* s = std::getenv("STRATA_POOL_IDLE_MS")) idle_sleep_ms_ = std::atoi(s);
+    std::vector<int> cores;
+    if (numa != nullptr && numa->cores.size() >= 2 && numa->cores.size() <= (size_t) kMaxGroups &&
+        numa->host_group >= 0 && numa->host_group < (int) numa->cores.size()) {
+        // 27.09.2026: one group per node, worker i pinned to its node's cores in order
+        groups_ = (int) numa->cores.size();
+        host_group_ = numa->host_group;
+        for (int g = 0; g < groups_; ++g)
+            for (int c : numa->cores[(size_t) g]) {
+                cores.push_back(c);
+                group_of_.push_back(g);
+            }
+        n_ = (int) cores.size();
+    } else {
+        cores = physical_cores(true);
+        n_ = n_workers > 0 ? n_workers : (int) cores.size();
+    }
     if (n_ < 1) n_ = 1;
+    group_of_.resize((size_t) n_, 0);
+    for (int i = 0; i < n_; ++i) ++gthreads_[group_of_[(size_t) i]];
+    if (host_works_) ++gthreads_[host_group_];
     scratch_.resize((size_t) n_);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
@@ -125,10 +269,18 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
 }
 
 ExpertPool::~ExpertPool() {
-    stop_.store(true, std::memory_order_release);
+    stop_.store(true, std::memory_order_seq_cst);
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
-    epoch_.fetch_add(1, std::memory_order_release);
+    epoch_.fetch_add(1, std::memory_order_seq_cst);
+    futex_wake_all(&epoch_);   // 27.09.2026: and a SLEEPING one
     for (auto& t : threads_) t.join();
+}
+
+void ExpertPool::wake() {
+    // The Dekker pair with the worker's sleep: it raises `sleepers_` and then re-reads `epoch_`; this bumped `epoch_`
+    // and then reads `sleepers_`, both seq_cst - so either the worker sees the new epoch and does not sleep, or this
+    // sees the sleeper and wakes it.  With nobody asleep (every layer of a generation) it is one load.
+    if (sleepers_.load(std::memory_order_seq_cst) != 0) futex_wake_all(&epoch_);
 }
 
 void ExpertPool::worker(int id) {
@@ -147,13 +299,31 @@ void ExpertPool::worker(int id) {
         // - a locked read-modify-write, five workers against one cache line - so the workers spent their wait
         // invalidating each other's caches and the very line the host writes to publish work.  The counter was
         // diagnostic and nothing branched on it.  See the note on the atomics in pool.hpp.
+        //
+        // 27.09.2026: after `idle_sleep_ms_` of it the worker sleeps on `epoch_` (see `wake`).  The clock is read
+        // once per 4096 pauses, and a spin that ends inside a generation never gets near the limit.
+        uint32_t spins = 0;
+        std::chrono::steady_clock::time_point idle_from{};
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
             _mm_pause();
+            if (idle_sleep_ms_ > 0 && (++spins & 4095u) == 0) {
+                const auto now = std::chrono::steady_clock::now();
+                if (spins == 4096u) {
+                    idle_from = now;
+                } else if (now - idle_from > std::chrono::milliseconds(idle_sleep_ms_)) {
+                    sleepers_.fetch_add(1, std::memory_order_seq_cst);
+                    if (epoch_.load(std::memory_order_seq_cst) == seen && !stop_.load(std::memory_order_seq_cst))
+                        futex_wait(&epoch_, seen);
+                    sleepers_.fetch_sub(1, std::memory_order_seq_cst);
+                    spins = 0;
+                }
+            }
         }
         if (stop_.load(std::memory_order_acquire)) return;
         seen = epoch_.load(std::memory_order_relaxed);
         parked_.fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
+        woke_.fetch_add(1, std::memory_order_acq_rel);     // 27.09.2026: and saying so (see `woke_`)
 
         // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more.
         // Every job is the same size (all experts are 1,382,400 bytes), so there is nothing to schedule.
@@ -163,7 +333,10 @@ void ExpertPool::worker(int id) {
 }
 
 void ExpertPool::drain(int id, ExpertScratch& scratch) {
-    (void) id;
+    if (groups_ > 1 && mode_ >= 5) {   // 27.09.2026: the native row phases by NUMA group
+        drain_numa(id < 0 ? host_group_ : group_of_[(size_t) id]);
+        return;
+    }
     for (;;) {
         const uint32_t i = head_.fetch_add(1, std::memory_order_relaxed);
         if (i >= (uint32_t) njobs_) break;
@@ -185,34 +358,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch) {
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
-                SplitBufMulti& sb = split_multi_[(size_t) e];
-                if (mode_ == 5 && nfmt_->gu_type == 42) {
-                    // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
-                    thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
-                    float* gp[MAXT];
-                    float* up[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
-                    const int nbk = (int) (nfmt_->n_embd / 64);
-                    q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
-                    for (int t = 0; t < mjobs_[e].nt; ++t)
-                        for (int r = r0; r < r1; ++r)
-                            sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
-                } else if (mode_ == 5) {
-                    float* ff[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                } else if (nfmt_->d_type == 42) {
-                    // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
-                    const ActQ* a2[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
-                                mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                } else {
-                    const void* hq[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                }
+                native_rows(e, r0, r1);
                 r += r1 - r0;
             }
         } else {
@@ -239,15 +385,92 @@ void ExpertPool::drain(int id, ExpertScratch& scratch) {
     }
 }
 
+void ExpertPool::native_rows(int e, int r0, int r1) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    if (mode_ == 5 && nfmt_->gu_type == 42) {
+        // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
+        thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
+        float* gp[MAXT];
+        float* up[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
+        const int nbk = (int) (nfmt_->n_embd / 64);
+        q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
+        q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
+        for (int t = 0; t < mjobs_[e].nt; ++t)
+            for (int r = r0; r < r1; ++r)
+                sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+    } else if (mode_ == 5) {
+        float* ff[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
+        native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+    } else if (nfmt_->d_type == 42) {
+        // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
+        const ActQ* a2[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
+        q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
+                    mjobs_[e].nt, mjobs_[e].out, r0, r1);
+    } else {
+        const void* hq[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+        native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+    }
+}
+
+void ExpertPool::drain_numa(int group) {
+    const int per = mode_ == 5 ? FF : H;
+    for (int k = 0; k < groups_; ++k) {
+        const int g = (group + k) % groups_;   // own share first (local memory), then what is left of the others'
+        const int lo = per * g / groups_, hi = per * (g + 1) / groups_, cnt = hi - lo;
+        const int ntask = gtasks_[g];
+        const int64_t rows = grows_[g];
+        for (;;) {
+            const uint32_t i = ghead_[g].v.fetch_add(1, std::memory_order_relaxed);
+            if (i >= (uint32_t) ntask) break;
+            const int64_t a = rows * (int64_t) i / ntask, b = rows * (int64_t) (i + 1) / ntask;
+            for (int64_t r = a; r < b;) {
+                const int e = (int) (r / cnt), r0 = lo + (int) (r % cnt);
+                const int r1 = (int) std::min<int64_t>(hi, r0 + (b - r));
+                native_rows(e, r0, r1);
+                r += r1 - r0;
+            }
+            done_.fetch_add(1, std::memory_order_release);
+        }
+    }
+}
+
+int ExpertPool::native_tasks(int mode, int nb) {
+    if (groups_ <= 1) return mtasks_;
+    const int per = mode == 5 ? FF : H;
+    int total = 0;
+    for (int g = 0; g < groups_; ++g) {
+        const int cnt = per * (g + 1) / groups_ - per * g / groups_;
+        grows_[g] = (int64_t) nb * cnt;
+        gtasks_[g] = (std::max)(1, 3 * gthreads_[g]);   // about three tasks per thread of the group, as before
+        total += gtasks_[g];
+    }
+    return total;
+}
+
 void ExpertPool::run_phase(int mode, int n_tasks) {
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) _mm_pause();
     mode_ = mode;
     njobs_ = n_tasks;
-    head_.store(0, std::memory_order_relaxed);
+    // 27.09.2026: A LATE WORKER MUST FIND NOTHING TO CLAIM.  A worker still in the park when the phase ends counts
+    // as parked, so the host moves on without it; when it does see the epoch it drains with whatever `mode_` the
+    // host has set since, and the protocol relies on `head_` being used up by then.  A NUMA phase claims through
+    // `ghead_`, so `head_` starts used up - otherwise a worker woken from its sleep after the phase took job 0 of
+    // mode 0 from an empty `jobs_` (the first run: SIGSEGV at 0x10 on a node-0 worker, right after the prefill).
+    head_.store(groups_ > 1 && mode >= 5 ? (uint32_t) n_tasks : 0u, std::memory_order_relaxed);
     done_.store(0, std::memory_order_relaxed);
-    epoch_.fetch_add(1, std::memory_order_release);
+    for (int g = 0; g < groups_; ++g) ghead_[g].v.store(0, std::memory_order_relaxed);
+    woke_.store(0, std::memory_order_relaxed);
+    epoch_.fetch_add(1, std::memory_order_seq_cst);
+    wake();
     if (host_works_) drain(-1, host_scratch_);
     while (done_.load(std::memory_order_acquire) != (uint32_t) n_tasks) _mm_pause();
+    // 27.09.2026: every worker has woken for THIS epoch (a sleeper may still be on its way) and parked again - so none
+    // can wake into it later, while the host is writing the next phase's state
+    while (woke_.load(std::memory_order_acquire) != (uint32_t) n_) _mm_pause();
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) _mm_pause();
 }
 
@@ -318,7 +541,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mtasks_ = 3 * threads;
         mrows_ = (int64_t) nb * FF;
         const auto a = std::chrono::steady_clock::now();
-        run_phase(5, mtasks_);
+        run_phase(5, native_tasks(5, nb));
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e)
             for (int t = 0; t < mjobs_[e].nt; ++t)
@@ -326,7 +549,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * H;
-        run_phase(6, mtasks_);
+        run_phase(6, native_tasks(6, nb));
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
         ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
@@ -356,7 +579,9 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     mode_ = 0;
     head_.store(0, std::memory_order_relaxed);
     done_.store(0, std::memory_order_relaxed);
-    epoch_.fetch_add(1, std::memory_order_release);   // release: jobs_/njobs_ are visible before the bump
+    woke_.store(0, std::memory_order_relaxed);
+    epoch_.fetch_add(1, std::memory_order_seq_cst);   // release: jobs_/njobs_ are visible before the bump
+    wake();
 
     // ---- **THE HOST DRAINS TOO (R2.2), INSTEAD OF SPINNING ON `done_`.**
     //
@@ -386,6 +611,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     // And park again, so the next `run` starts from a known state.  See the header for why `done` alone is
     // not enough.
     const auto t_c = std::chrono::steady_clock::now();
+    while (woke_.load(std::memory_order_acquire) != (uint32_t) n_) _mm_pause();   // 27.09.2026: see `run_phase`
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) _mm_pause();
     const auto t_d = std::chrono::steady_clock::now();
 

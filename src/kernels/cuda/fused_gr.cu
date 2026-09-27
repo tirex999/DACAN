@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace strata::kernels {
 namespace {
@@ -293,12 +294,204 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
     }
 }
 
+// ================================ 26.09.2026: the T-token read shaped for a 68-SM Turing card ================================
+//
+// Measured on a 2080 Ti (nsys, verify window of 4): gr_norm_multi 9 us on 4 blocks, gr_down_multi 25 us on 41 blocks
+// (262 GB/s of 616), gr_up_multi 18 us - twice per layer, ~105 us of a ~424 us layer.  The same arithmetic with
+// the work spread over the card:
+//   gr_norm2 : one block per (token, stream) - 16 instead of 4 - and one pass (the values stay in registers);
+//   gr_down2 : the 10240 columns in KS = 4 chunks of one TILE, so 41 x 4 = 164 blocks; each writes its partial dot
+//              per (token, row) to `g_gr_part`, in a fixed place - deterministic, no atomics;
+//   gr_up2   : sums the 4 partials (silu for `lo`, the raw dot for `inject_out`) and runs 8 columns per block
+//              (320 blocks) instead of 16.
+// The summation order differs from gr_*_multi (per-chunk warp sums, then the 4 chunks), so the outputs are not
+// bitwise the single-token kernel's; STRATA_GR_V1=1 is the A/B arm back to the kernels above.
+constexpr int KS = D / TILE;                      // 4 column chunks
+constexpr int PROWS = LR + HC;                    // 320 down rows + 4 inject rows per (token, chunk)
+constexpr int UPM2_COLS = 8;
+constexpr int UPM2_BLOCKS = N / UPM2_COLS;        // 320
+__device__ float g_gr_part[kFusedGrMaxT * KS * PROWS];
+
+__global__ void __launch_bounds__(THREADS) gr_norm2_kernel(GrMulti m) {
+    __shared__ float part[WARPS];
+    __shared__ float s_rs;
+    const int tok = blockIdx.x, c = blockIdx.y;
+    const FusedGrArgs& a = m.a[tok];
+    float* xn = m.xn + (size_t) tok * D + (size_t) c * N;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    constexpr int PER = (N / 4 + THREADS - 1) / THREADS;   // float4s per thread (3)
+    float4 rr[PER], gg[PER];
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int q = t + j * THREADS;
+        if (q < N / 4) {
+            const int i = c * N + q * 4;
+            float4 r = *reinterpret_cast<const float4*>(a.R + i);
+            if (a.apply) {
+                const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + q * 4);
+                r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y);
+                r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
+            }
+            rr[j] = r;
+            gg[j] = *reinterpret_cast<const float4*>(a.w_norm + i);
+            ss += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+        }
+    }
+    ss = warp_sum(ss);
+    if (lane == 0) part[warp] = ss;
+    __syncthreads();
+    if (t == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < WARPS; ++w) s += part[w];
+        s_rs = rsqrtf(s / (float) N + a.eps);
+        a.rs[c] = s_rs;
+    }
+    __syncthreads();
+    const float rs = s_rs;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int q = t + j * THREADS;
+        if (q < N / 4) {
+            const float4 r = rr[j], g = gg[j];
+            *reinterpret_cast<float4*>(xn + q * 4) =
+                make_float4(r.x * g.x * rs, r.y * g.y * rs, r.z * g.z * rs, r.w * g.w * rs);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(THREADS) gr_down2_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float tile[];   // [T][TILE]
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const int ks = blockIdx.y, base = ks * TILE;
+    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    uint4 wv[TQ];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < TQ; ++q) wv[q] = __ldg(w4 + base / 8 + lane + 32 * q);
+    }
+    const float4* src4 = reinterpret_cast<const float4*>(m.xn);
+    float4* tile4 = reinterpret_cast<float4*>(tile);
+    for (int i = t; i < T * (TILE / 4); i += THREADS) {
+        const int k = i / (TILE / 4), off = i - k * (TILE / 4);
+        tile4[i] = src4[((size_t) k * D + base) / 4 + off];
+    }
+    __syncthreads();
+    if (!active) return;
+    float acc[kFusedGrMaxT];
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
+#pragma unroll
+    for (int q = 0; q < TQ; ++q) {
+        const int j = lane + 32 * q;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k)
+            if (k < T) acc[k] += dot8(wv[q], tile + k * TILE + j * 8);
+    }
+    float s[kFusedGrMaxT];
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) s[k] = k < T ? warp_sum(acc[k]) : 0.0f;
+    const int prow = inject_block ? LR + row : row;
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k)
+        if (k < T && lane == k) g_gr_part[((size_t) k * KS + ks) * PROWS + prow] = s[k];
+}
+
+__global__ void __launch_bounds__(THREADS) gr_up2_kernel(GrMulti m) {
+    __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
+    __shared__ float g[kFusedGrMaxT][HC][UPM2_COLS];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const int d0 = blockIdx.x * UPM2_COLS;
+    for (int i = t; i < T * LR; i += THREADS) {
+        const int k = i / LR, r = i - k * LR;
+        const float* p = g_gr_part + (size_t) k * KS * PROWS + r;
+        float sum = p[0];
+#pragma unroll
+        for (int c = 1; c < KS; ++c) sum += p[c * PROWS];
+        const float x = sum / (float) HC;
+        lo[k][r] = x / (1.0f + __expf(-x));
+    }
+    if (blockIdx.x == 0 && m.a[0].w_inject != nullptr && t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        const float* p = g_gr_part + (size_t) k * KS * PROWS + LR + c;
+        float sum = p[0];
+#pragma unroll
+        for (int cc = 1; cc < KS; ++cc) sum += p[cc * PROWS];
+        m.a[k].inject_out[c] = sum;
+    }
+    __syncthreads();
+    for (int r = warp; r < HC * UPM2_COLS; r += WARPS) {
+        const int c = r / UPM2_COLS, dd = r - c * UPM2_COLS, i = c * N + d0 + dd;
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+        const uint4 wa = __ldg(w4 + lane);
+        const uint4 wb = lane < LR / 8 - 32 ? __ldg(w4 + 32 + lane) : make_uint4(0, 0, 0, 0);
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            rsc = a.rs[c];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            float acc = dot8(wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                m.a[lane].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsc;
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < T * UPM2_COLS; i += THREADS) {
+        const int k = i / UPM2_COLS, col = i - k * UPM2_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.a[k].mixed[d0 + col] = s / (float) HC;
+    }
+}
+
 }  // namespace
 
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
+    }
+    // How many tokens' activation tiles fit in this GPU's shared memory: all 8 on sm_80+, 6 on Turing (64 KB
+    // opt-in).  Tokens are independent (each output is bitwise fused_gr_read(a[t])), so a longer window is split;
+    // the second half only re-reads the weights.
+    static int s_max_t = 0;
+    if (s_max_t == 0) {
+        int dev = 0, optin = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        const int fit = optin / (int) (TILE * sizeof(float));
+        s_max_t = fit < 1 ? 1 : (fit > kFusedGrMaxT ? kFusedGrMaxT : fit);
+    }
+    if (n_tok > s_max_t) {
+        fused_gr_read_multi(a, s_max_t, xn_scratch, stream);
+        fused_gr_read_multi(a + s_max_t, n_tok - s_max_t, xn_scratch + (size_t) s_max_t * D, stream);
+        return;
     }
     GrMulti m;
     for (int t = 0; t < n_tok; ++t) {
@@ -314,15 +507,24 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
-    gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+    static const bool v1 = std::getenv("STRATA_GR_V1") != nullptr && std::string(std::getenv("STRATA_GR_V1")) != "0";
     static bool attr = false;
     if (!attr) {
         cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int) (kFusedGrMaxT * TILE * sizeof(float)));
+                             (int) (s_max_t * TILE * sizeof(float)));
+        cudaFuncSetAttribute(gr_down2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int) (s_max_t * TILE * sizeof(float)));
         attr = true;
     }
-    gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
-    gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    if (v1) {
+        gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+        gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
+        gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    } else {
+        gr_norm2_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+        gr_down2_kernel<<<dim3(DOWN_BLOCKS + 1, KS), THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
+        gr_up2_kernel<<<UPM2_BLOCKS, THREADS, 0, st>>>(m);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));

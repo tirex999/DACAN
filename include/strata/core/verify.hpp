@@ -24,11 +24,16 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
 
 namespace strata::core {
 
@@ -77,11 +82,44 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
+    /// 26.09.2026: whether the pool can hand the GPU a PCIe share at all (`--pcie-frac` > 0).  Off leaves the PCIe
+    /// groups out of the captured graph.  Set before the first `run`.
+    void set_pcie_share(bool on) { pcie_share_ = on; }
+    /// 27.09.2026: how the window picks its tokens.  Greedy until this is called (as before).  A sampled setting
+    /// draws with Philox on (seed, absolute position); the pair goes through mapped memory before each launch, so a
+    /// new seed needs no new graph.  A change of greedy / temperature / top_k / top_p drops the captured windows.
+    /// Exact for the MTP drafts: a draft is kept only if it equals the token sampled at its position, and on a
+    /// mismatch the sampled token itself is emitted - for a deterministic draft that is the target distribution.
+    void set_sampling(const strata::kernels::SamplerParams& p, uint64_t seed);
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_launch = 0;   ///< 26.09.2026: time the window's cudaGraphLaunch took (on whichever thread issued it)
     int64_t windows = 0;
 
 private:
+    // 26.09.2026: THE WINDOW'S GRAPH IS LAUNCHED FROM ITS OWN THREAD.  On sm_75 `cudaGraphLaunch` of the ~5000-node
+    // window graph blocks its caller for ~5 ms while the device already runs the first nodes - and the first thing
+    // the device needs is layer 0's plan from the very thread stuck in the launch.  Measured (nsys): the graph
+    // waited 4.7 ms at layer 0 in every round.  With the launch on this thread, the pool's thread serves layer 0 at
+    // once and the submission stays ahead of the execution.  BUT without nsys the launch measured 1.3 ms, not 5,
+    // and the thread came out 0.8 % slower (61.09 vs 60.58 t/s), so it is opt-in: STRATA_ASYNC_LAUNCH=1.
+    void launcher_main();
+    std::thread launch_thr_;
+    std::mutex launch_mu_;
+    std::condition_variable launch_cv_;
+    bool launch_stop_ = false;
+    cudaGraphExec_t launch_exec_ = nullptr;
+    int launch_device_ = 0;
+    std::atomic<int> launch_state_{0};   ///< 0 idle, 1 requested, 2 issued (launch_err_ valid)
+    cudaError_t launch_err_ = cudaSuccess;
+    bool async_launch_ = false;
+    bool pcie_share_ = true;
+    // 27.09.2026: the window's sampler (see `set_sampling`); {counter, seed} for the kernel in mapped memory
+    strata::kernels::SamplerParams sp_ = [] { strata::kernels::SamplerParams p; p.greedy = true; p.temperature = 0.0f; return p; }();
+    uint64_t seed_ = 0;
+    unsigned long long* h_rng_ = nullptr;
+    unsigned long long* m_rng_ = nullptr;
+
     bool capture(int T, std::string& err);
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
