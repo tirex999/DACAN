@@ -237,6 +237,37 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     check_launch("copy_from_mapped");
 }
 
+// 28.09.2026: the peer rows are read past L1 (__ldcg): the second card wrote them over NVLink after this card's L1
+// may have seen the buffer, and only L2 is where both cards' writes to this memory meet.
+__global__ void assemble_rows_kernel(float4* __restrict__ dst, const volatile float4* host, const float4* peer,
+                                     const int32_t* __restrict__ src, const int32_t* __restrict__ mode, int row4) {
+    const int r = blockIdx.x;
+    const int m = *mode < 0 ? 1 : src[r];
+    float4* o = dst + (size_t) r * row4;
+    if (m == 1) {
+        const float4* h = const_cast<const float4*>(host) + (size_t) r * row4;
+        for (int i = threadIdx.x; i < row4; i += blockDim.x) o[i] = h[i];
+    } else if (m == 2) {
+        const float4* p = peer + (size_t) r * row4;
+        for (int i = threadIdx.x; i < row4; i += blockDim.x) o[i] = __ldcg(p + i);
+    } else {
+        for (int i = threadIdx.x; i < row4; i += blockDim.x) o[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+}
+
+void assemble_rows(float* dst, const float* host, const float* peer, const int32_t* src, const int32_t* mode,
+                   int64_t rows, int64_t row_len, void* stream) {
+    if (rows <= 0) return;
+    if ((row_len & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) host & 15) != 0 || ((uintptr_t) peer & 15) != 0) {
+        std::fprintf(stderr, "assemble_rows: row_len must be a multiple of 4 and the pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    assemble_rows_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) host,
+                                                                            (const float4*) peer, src, mode,
+                                                                            (int) (row_len / 4));
+    check_launch("assemble_rows");
+}
+
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {

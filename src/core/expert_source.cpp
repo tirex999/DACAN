@@ -260,7 +260,7 @@ namespace {
 // caller computes the CPU share meanwhile and then calls `second_card_wait`, before the main card is told the
 // layer is served.  The plan and `x` are not touched again until then, so the copies cannot race the next layer.
 bool second_card_issue(SecondCard& c, const strata::kernels::cpu::NativeFmt& f, const float* x_f, int64_t n_tok,
-                       int64_t n_embd, float* out, int groups, int entries) {
+                       int64_t n_embd, float* out, int groups, int entries, bool peer) {
     const auto t0 = std::chrono::steady_clock::now();
     if (cudaSetDevice(c.device) != cudaSuccess) return false;
     cudaStream_t s = (cudaStream_t) c.stream;
@@ -279,7 +279,11 @@ bool second_card_issue(SecondCard& c, const strata::kernels::cpu::NativeFmt& f, 
         L.scale_off = f.scale_off;
         L.bytes = f.bytes;
         strata::kernels::native_expert_grouped(L, ptr, start, counts, dst, tok, groups, entries, c.xq, c.scratch, c.out, s);
-        strata::kernels::gather_rows(c.out, dst, counts + 1, entries, n_embd, out, s);
+        // 28.09.2026 (the cards over NVLink, step A): straight into the main card's buffer over NVLink when the caller's
+        // plan says so (`peer`: only the verify window's rows, `out` inside its y_miss), the row at the same offset
+        // it has in y_miss; else into `out` as before
+        float* target = peer ? c.peer_rows + (out - c.host_rows) : out;
+        strata::kernels::gather_rows(c.out, dst, counts + 1, entries, n_embd, target, s);
         ok = cudaEventRecord((cudaEvent_t) c.done, s) == cudaSuccess;
     }
     cudaSetDevice(c.main_device);
@@ -335,7 +339,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
     int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe, 2 the second card
+    bool rows_planned = false;             // 28.09.2026: the plan says where each row comes from (see GpuPlanSink::rowsrc)
     SecondCard* card = (d.card2 != nullptr && native && n <= d.card2->cap) ? d.card2 : nullptr;
+    // 28.09.2026 (the cards over NVLink, step A): the second card writes this layer's rows into the main card's buffer
+    // when it has one bound and `out` is the verify window's y_miss (the buffer mirrors it); only such a plan (with
+    // `rowsrc`) tells the main card to take them from there
+    const bool c2_peer = card != nullptr && card->peer_rows != nullptr && card->host_rows != nullptr &&
+                         d.plan != nullptr && d.plan->rowsrc != nullptr && out >= card->host_rows &&
+                         out + n * H <= card->host_rows + card->cap * H;
     auto slot2 = [&](int32_t e) -> int32_t {
         return card != nullptr ? card->host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] : kNotResident;
     };
@@ -463,6 +474,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[0] = groups;
         P.counts[1] = entries;
         P.counts[2] = fetches;
+        // 28.09.2026 (the cards over NVLink, step A): where the main card takes each row of parts from - the CPU's rows
+        // from mapped y_miss, the second card's from its NVLink buffer (or y_miss when it writes there), the GPU's own
+        // rows start at zero - so it no longer pulls every row across PCIe and the pool no longer zeroes them
+        if (P.rowsrc != nullptr) {
+            for (int64_t i = 0; i < n; ++i)
+                P.rowsrc[i] = kind[i] == -1 ? 1 : kind[i] == 2 ? (c2_peer ? 2 : 1) : 0;
+            P.counts[3] = (int32_t) n;
+            rows_planned = true;
+        } else {
+            P.counts[3] = -1;
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
@@ -477,7 +499,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             c2_counts[3] = 0;
             card->experts += g2;
             card->entries += e2;
-            if (!second_card_issue(*card, lay.fmt[(size_t) d.layers], x_f, n_tok, H, out, g2, e2)) {
+            if (!second_card_issue(*card, lay.fmt[(size_t) d.layers], x_f, n_tok, H, out, g2, e2, c2_peer && rows_planned)) {
                 d.failed = true;
                 d.fail = "the second card could not issue its experts";
                 d.fail_layer = d.layers;
@@ -516,7 +538,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] == 2) continue;    // the second card writes this row itself - it must not be cleared here
             if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
                 if (kind[i] == 0) ++d.cache_hits;
-                std::memset(row, 0, (size_t) H * sizeof(float));
+                // 28.09.2026: with the per-row plan the main card zeroes it itself and never reads this row
+                if (!rows_planned) std::memset(row, 0, (size_t) H * sizeof(float));
                 continue;
             }
             ++d.cache_refused;

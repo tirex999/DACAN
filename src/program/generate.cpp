@@ -2200,6 +2200,7 @@ int main(int argc, char** argv) {
     // adaptive tier still swaps its own slots; an expert it takes over is simply found there first.
     strata::core::ExpertCache xcache2;
     strata::core::SecondCard card2;
+    bool card2_peer = false;   // 28.09.2026: the second card may write into the main card's memory (NVLink)
     std::vector<int32_t> host_res2;
     if (o.second_card >= 0) {
         if (host_res.empty() || srcp == nullptr) {
@@ -2320,8 +2321,24 @@ int main(int argc, char** argv) {
         }
         card2.stream = s2;
         card2.done = e2;
+        // 28.09.2026 (the cards over NVLink, step A): this card writes its rows straight into the main card's memory
+        // (peer access card -> main card; over NVLink when the cards are bridged) instead of through mapped host
+        // memory.  The target buffer is the verifier's, set once it exists (`card2.peer_rows`).  STRATA_CARD2_NVLINK=0
+        // keeps the old path.
+        {
+            const char* nv = std::getenv("STRATA_CARD2_NVLINK");
+            int can = 0;
+            if ((nv == nullptr || std::string(nv) != "0") && cudaDeviceCanAccessPeer(&can, o.second_card, 0) == cudaSuccess &&
+                can != 0) {
+                const cudaError_t pe = cudaDeviceEnablePeerAccess(0, 0);   // the current device is the second card
+                if (pe == cudaSuccess || pe == cudaErrorPeerAccessAlreadyEnabled) card2_peer = true;
+                (void) cudaGetLastError();
+            }
+        }
         cudaSetDevice(0);
         drive.d.card2 = &card2;
+        std::fprintf(stderr, "strata generate: second card -> main card: %s\n",
+                     card2_peer ? "peer access (rows over NVLink / PCIe P2P)" : "through mapped host memory");
         if (n_dup > 0) std::fprintf(stderr, "strata generate: second card: %lld of them are the main card's most-routed (dual residency)\n", (long long) n_dup);
         std::fprintf(stderr, "strata generate: second card (device %d): %zu experts, %.2f GiB, filled in %.1f s; "
                              "of the usage table's %llu routed entries the main card holds %.1f%%, this card %.1f%%\n",
@@ -2428,6 +2445,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         mem_mark("the verifier and the drafter's binding");
+        if (card2_peer) { card2.peer_rows = ver.card2_rows(); card2.host_rows = ver.host_rows(); }   // 28.09.2026
         ver.set_split(o.spec_split);
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : o.pcie_mode == "kernel" ? 2
                           : native_pack ? 0 : 2);   // auto: DMA for the native packs, the copy kernel for Q2_0
@@ -3553,6 +3571,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         mem_mark("the verifier and the drafter's binding");
+        if (card2_peer) { card2.peer_rows = ver.card2_rows(); card2.host_rows = ver.host_rows(); }   // 28.09.2026
         ver.set_split(o.spec_split);
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : o.pcie_mode == "kernel" ? 2
                           : native_pack ? 0 : 2);   // auto: DMA for the native packs, the copy kernel for Q2_0

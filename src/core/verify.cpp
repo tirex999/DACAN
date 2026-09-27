@@ -178,11 +178,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
+    // | pad | rowsrc(cap) (28.09.2026: where each row of parts comes from, see GpuPlanSink::rowsrc)
     {
         const int64_t cap = (int64_t) (T * K);
         const int64_t i32 = 4 + (cap + 1) + cap + cap;
         const int64_t ptr_off = (i32 + 1) & ~1ll;
-        plan_i32_ = ptr_off + 4 * cap + (cap + 1) + 1;
+        rowsrc_off_ = ptr_off + 4 * cap + (cap + 1) + 1;
+        plan_i32_ = rowsrc_off_ + cap;
         if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
             err = "verify: mapped plan allocation failed";
             return false;
@@ -194,6 +196,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sink_.ptr = (unsigned long long*) (h_plan_ + ptr_off);
         sink_.ptr2 = sink_.ptr + cap;
         sink_.start2 = h_plan_ + ptr_off + 4 * cap;
+        sink_.rowsrc = h_plan_ + rowsrc_off_;
         sink_.cap = cap;
         sink_.publish = &Verifier::publish_plan;
         sink_.fetch = &Verifier::fetch_dma;
@@ -221,6 +224,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         tail_snap_ = b.take<float>(nQ * TS);
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
+        rows2_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
@@ -606,7 +610,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr2, p_start2, p_counts + 2);
         }
         wait_flag_ge(m_flag_, ring, cs);                       // the CPU's share is in the mapped rows
-        copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+        // 28.09.2026 (the cards over NVLink, step A): only the CPU's rows cross PCIe from mapped memory (was every row
+        // of the group, ~0.5 MB a layer, mostly the zeros of the GPU's own rows); the second card's rows came over
+        // NVLink into rows2_; the rest are zero here, and moe_hit_add adds this card's hits into them
+        assemble_rows(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, rows2_ + (size_t) tb * K * N,
+                      pl + rowsrc_off_, p_counts + 3, (int64_t) n * K, N, cs);
         moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         for (int t = tb; t < te; ++t) {
             MoEBuffers mb = ss.moe;
@@ -874,6 +882,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
             sink_.counts[2] = 0;
+            sink_.counts[3] = -1;   // no per-row plan: every row from y_miss (the pool zeroed the GPU's)
             sink_.start[0] = 0;
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -926,6 +935,7 @@ void Verifier::set_plan_slot(int grp) {
     sink_.ptr = (unsigned long long*) (base + ptr_off);
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
+    sink_.rowsrc = base + rowsrc_off_;
     const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);

@@ -103,6 +103,15 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream);
 /// operation, which WDDM submits separately and which measured 67 flushes per token).
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 
+/// 28.09.2026 (the cards over NVLink, step A): a verify window's `parts` rows of one layer group, each taken from where
+/// it was computed instead of all of them from mapped host memory.  `src[r]`: 0 = zero (a row this card's grouped
+/// kernels add into afterwards), 1 = the CPU's row in MAPPED host memory `host`, 2 = the second card's row, which it
+/// wrote over NVLink into `peer` (device memory of this card).  `*mode` < 0: the pool published no per-row plan -
+/// every row from `host`, as `copy_from_mapped` does.  One block per row; `row_len` a multiple of 4, pointers 16-byte
+/// aligned.
+void assemble_rows(float* dst, const float* host, const float* peer, const int32_t* src, const int32_t* mode,
+                   int64_t rows, int64_t row_len, void* stream);
+
 /// Plan v0.3 P3: the doorbell's payload and its ring in ONE kernel.  Copies `x` (n floats), `ids` and `weights`
 /// (k each) into the mapped host regions, fences, and increments the mapped sequence number - replacing three
 /// device-to-host memcpy nodes (copy-engine operations in the middle of the layer chain) and the ring kernel.

@@ -89,6 +89,10 @@ public:
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return &sink_; }
+    /// 28.09.2026 (the cards over NVLink, step A): the device buffer on this card the second card writes its rows into
+    /// (laid out like `y_miss`, a row's place = its offset in `host_rows`), and the mapped `y_miss` itself.
+    float* card2_rows() const { return rows2_; }
+    const float* host_rows() const { return h_ymiss_; }
     /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
     /// of the other (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }
@@ -171,6 +175,7 @@ private:
     static void raise_flag(uint32_t* flag, uint32_t value);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
+    int64_t rowsrc_off_ = 0;                                      // 28.09.2026: where `rowsrc` starts in it
     GpuPlanSink sink_;
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
@@ -192,6 +197,7 @@ private:
     float* tail_snap_ = nullptr;                              // per QSA layer
     int32_t* sel_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
+    float* rows2_ = nullptr;                                      // 28.09.2026: the second card's rows, over NVLink
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses

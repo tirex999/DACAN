@@ -75,6 +75,11 @@ struct GpuPlanSink {
     /// copy engine.  counts[0] = VRAM groups, counts[1] = all entries, counts[2] = PCIe groups.
     unsigned long long* ptr2 = nullptr;
     int32_t* start2 = nullptr;
+    /// 28.09.2026 (the cards over NVLink, step A): per row of the layer group's `parts`, where the main card takes it
+    /// from - 0 zero (its own grouped kernels add the hit in), 1 the CPU's row in mapped `y_miss`, 2 the second
+    /// card's row (written over NVLink).  counts[3] = rows when filled, -1 when not (then every row comes from
+    /// `y_miss`, which the pool must then zero for the GPU's rows as before).  Null: the consumer has no such list.
+    int32_t* rowsrc = nullptr;
     unsigned long long staging = 0;
     int64_t staging_cap = 0;
     int64_t cap = 0;
@@ -118,6 +123,11 @@ struct SecondCard {
     int64_t dual_card = 0, dual_main = 0;     ///< experts both cards hold, sent here / left to the main card
     double ms_launch = 0;                     ///< host time spent issuing its work
     double ms_wait = 0;                       ///< host time spent waiting for it after the CPU share
+    /// 28.09.2026 (the cards over NVLink, step A): when set, the rows go over NVLink straight into this buffer on the
+    /// MAIN card (the verifier's `card2_rows`, laid out like `y_miss`) instead of through mapped host memory; a row's
+    /// place there is its offset from `host_rows` (the verifier's `y_miss`).  Needs peer access card -> main card.
+    float* peer_rows = nullptr;
+    const float* host_rows = nullptr;
 };
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
