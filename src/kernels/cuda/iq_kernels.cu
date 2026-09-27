@@ -326,6 +326,17 @@ __device__ __forceinline__ float vec_dot_nvfp4_q8_1(const void* __restrict__ vbq
     return sum;
 }
 
+// Q8_0 (27.09.2026, 8-bit experts made from the FP8 checkpoint): llama.cpp's vec_dot_q8_0_q8_1, VDR 2 - QI8_0 = 8
+// ints a block, four calls a block at iqs 0, 2, 4, 6.  block_q8_0 is 34 bytes, so its ints are read 16 bits at a time.
+__device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q8_0* bq8_0 = (const block_q8_0*) vbq + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) sumi = ggml_cuda_dp4a(get_int_b2(bq8_0->qs, iqs + i), get_int_b4(bq8_1->qs, iqs + i), sumi);
+    return __half2float(bq8_0->d) * __low2float(bq8_1->ds) * (float) sumi;
+}
+
 // ---------------------------------------------------------------- the formats
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
 template<int TY> struct Fmt;
@@ -350,6 +361,8 @@ template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
 // NVFP4: QI = 64 / (4 * 2) = 8 ints a block, VDR 4 -> 2 calls a block, iqs 0 and 4 (llama.cpp mmvq's kqs)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<8> { static constexpr int qk = 32, ipb = 4, step = 2;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -721,6 +734,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
         case 29: mmvq_kernel<29><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
         case 42: mmvq_kernel<42><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
         case 40: mmvq_kernel<40><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
+        case 8: mmvq_kernel<8><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols); break;
         default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
     }
     check("iq_mmvq");
@@ -819,6 +833,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 29: native_gu_kernel<29><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 42: native_gu_kernel<42><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 40: native_gu_kernel<40><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 8: native_gu_kernel<8><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
     }
     check("native_expert_grouped/gu");
@@ -831,6 +846,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 23: native_down_kernel<23><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 42: native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 40: native_down_kernel<40><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 8: native_down_kernel<8><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
