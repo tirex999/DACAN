@@ -1,3 +1,21 @@
+> ## DACAN — an engine for one model
+>
+> **DACAN** ([Дацан](README-2x2080Ti.md)) is our fork of Strata for **2× RTX 2080 Ti (NVLink) and two AVX-512 Xeon
+> sockets**. Like Strata, it runs **one model family only: [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**.
+>
+> - **Architecture:** `qwen4exp` (Hugging Face: `Qwen4ExpForConditionalGeneration`, `model_type: qwen4_exp`) — 125B
+>   parameters with 6B activated per token, plus a 51B n-gram embedding and a 4B MTP layer; 48 layers laid out as
+>   12 × (3 × Gated DeltaNet + 1 × Qwen Sparse Attention), each followed by a MoE of 512 experts (10 routed + 1 shared);
+>   hidden size 2560, 24 query / 2 KV heads; context 262,144 tokens.
+> - **The loader checks this geometry** (48 layers, 2560, 512 experts, 10 active, 24 / 2 heads —
+>   [`Qwen4ExpGuard`](include/strata/artifact/gguf_reader.hpp)) and refuses anything else: fine-tunes with the same
+>   shape run, other models and pruned variants (REAP etc.) do not.
+> - **Weights for DACAN:** [tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN)
+>   — our Q8_0 experts from the FP8 checkpoint, NVIDIA's NVFP4 experts repacked, the dense part, the n-gram table and
+>   the MTP layer (uploading). The [ISTA-DASLab GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+>   quants work too.
+> - Setup, measurements and what changed: **[README-2x2080Ti.md](README-2x2080Ti.md)**. Below is upstream Strata's README.
+
 <h1 align="center">Strata</h1>
 
 <p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>

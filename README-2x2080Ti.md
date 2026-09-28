@@ -14,6 +14,32 @@ prompt lookup and per-request sampling come from upstream. Checked against our v
 Our rig: 2× RTX 2080 Ti 22 GB (modded, NVLink bridge, PCIe 3.0 x16 each), 2× Xeon Ice Lake (AVX-512 VNNI/VBMI),
 251 GB DDR4-2666, Proxmox LXC, CUDA 13.0, driver 610, gcc 15.
 
+## The model
+
+DACAN runs **one model family: [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, architecture
+`qwen4exp` (Hugging Face `Qwen4ExpForConditionalGeneration`, `model_type: qwen4_exp`):
+
+| | |
+|---|---|
+| parameters | 125B, 6B activated per token; plus a 51B n-gram embedding (bigrams/trigrams at layer 2) and a 4B MTP layer |
+| layers | 48 = 12 × (3 × (Gated DeltaNet → MoE) → 1 × (Qwen Sparse Attention → MoE)) |
+| hidden size | 2560, gated residual over widened residual streams |
+| Gated DeltaNet | 48 V heads, 16 QK heads |
+| Qwen Sparse Attention | 24 Q heads, 2 KV heads, rotary dimension 64 |
+| MoE | 512 experts, 10 routed + 1 shared per token, expert width 640 |
+| context | 262,144 tokens natively |
+
+The loader refuses any other geometry (`Qwen4ExpGuard` in `include/strata/artifact/gguf_reader.hpp`: 48 layers, 2560,
+512 experts, 10 active, 24 / 2 heads). Fine-tunes with the same shape work; other models and pruned variants (REAP with
+288 / 320 experts and the like) do not.
+
+Weights packed for DACAN: **[tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN)**
+(uploading): Q8_0 experts we requantized from Qwen's FP8 checkpoint, NVIDIA's
+[NVFP4 experts](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) repacked, the dense part, the n-gram table and
+the MTP layer. Also usable: the [ISTA-DASLab GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+quants. Licenses: the model's [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE);
+the NVFP4 experts also NVIDIA's Open Model License.
+
 ## Speed
 
 Decode tokens/s through the OpenAI server on long coding answers (8–13K tokens), MTP drafts (`--spec 4`), 131K context:
