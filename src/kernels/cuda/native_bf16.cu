@@ -40,9 +40,13 @@ __device__ __forceinline__ float mmvf_warp_sum(float value) {
     return value;
 }
 
+// 28.09.2026: blockIdx.y = the token of a multi-token call (x and y advanced by their strides); every (row, token)
+// block does exactly the single call's arithmetic, so each output is bitwise the single call's.
 template <int BLOCK_SIZE>
 __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
-                                    float* __restrict__ y, int n_in) {
+                                    float* __restrict__ y, int n_in, long long x_stride = 0, long long y_stride = 0) {
+    x += blockIdx.y * x_stride;
+    y += blockIdx.y * y_stride;
     const int t = threadIdx.x;
     const uint16_t* row = w + (size_t) blockIdx.x * n_in;
     const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
@@ -87,17 +91,24 @@ int mmvf_block_size(int64_t n_in) {
 
 void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
                          int64_t n_in, int64_t n_out, void* stream) {
+    bf16_gemv_fp32_mmvf_multi(x, 0, w, y, 0, n_in, n_out, 1, stream);
+}
+
+void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t x_stride, const uint16_t* w, float* y, int64_t y_stride,
+                               int64_t n_in, int64_t n_out, int n_tok, void* stream) {
     if (n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
-        n_out <= 0 || n_out > std::numeric_limits<int>::max())
+        n_out <= 0 || n_out > std::numeric_limits<int>::max() || n_tok < 1 || n_tok > 65535)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: require positive even n_in and positive n_out <= INT_MAX");
     if (x == nullptr || w == nullptr || y == nullptr ||
         (reinterpret_cast<uintptr_t>(x) & 7u) != 0 ||
         (reinterpret_cast<uintptr_t>(w) & 3u) != 0 ||
-        (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
+        (reinterpret_cast<uintptr_t>(y) & 3u) != 0 ||
+        (n_tok > 1 && ((x_stride & 1) != 0)))         // every token's x stays 8-byte aligned
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: null or misaligned pointer");
     const cudaStream_t st = (cudaStream_t) stream;
+    const dim3 grid((unsigned) n_out, (unsigned) n_tok);
 #define STRATA_MMVF_CASE(N) case N: \
-    bf16_f32_mmvf_kernel<N><<<(unsigned) n_out, N, 0, st>>>(x, w, y, (int) n_in); break
+    bf16_f32_mmvf_kernel<N><<<grid, N, 0, st>>>(x, w, y, (int) n_in, (long long) x_stride, (long long) y_stride); break
     switch (mmvf_block_size(n_in)) {
         STRATA_MMVF_CASE(32);
         STRATA_MMVF_CASE(64);

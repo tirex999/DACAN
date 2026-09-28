@@ -136,6 +136,12 @@ __global__ void native_scalar_sigmoid_kernel(float* gate) {
     gate[0] = __fdividef(1.0f, 1.0f + __expf(-gate[0]));
 }
 
+// 28.09.2026: the same sigmoid for n gates in one launch (thread t does gate[t] exactly as above)
+__global__ void native_scalar_sigmoid_n_kernel(float* gate, int n) {
+    const int t = threadIdx.x;
+    if (t < n) gate[t] = __fdividef(1.0f, 1.0f + __expf(-gate[t]));
+}
+
 /// The MoE block's final combination.  See the header for the two readings it exists to pin.
 __global__ void moe_combine_kernel(const float* __restrict__ parts, const float* __restrict__ weights,
                                    const float* __restrict__ shared, float* __restrict__ y, int n_embd,
@@ -176,13 +182,14 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     native_swiglu_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate, up, gate, n);
     native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
-    for (int t = 0; t < n_tok; ++t) {
-        if (native_bf16) {
-            bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
-            native_scalar_sigmoid_kernel<<<1, 1, 0, cs>>>(g + t);
-        } else {
+    if (native_bf16) {
+        // 28.09.2026: the window's gate dots in one launch and their sigmoids in one (were two launches per token);
+        // every value bitwise as before
+        bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, (int) n_tok, stream);
+        native_scalar_sigmoid_n_kernel<<<1, 32, 0, cs>>>(g, (int) n_tok);
+    } else {
+        for (int t = 0; t < n_tok; ++t)
             scalar_gate_kernel<<<1, 256, 0, cs>>>(x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
-        }
     }
     scale_rows_kernel<<<dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok), THREADS, 0, cs>>>(
         out, g, (int) n_embd);

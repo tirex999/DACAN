@@ -45,4 +45,10 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
 void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
                          int64_t n_in, int64_t n_out, void* stream);
 
+/// 28.09.2026: the same for `n_tok` tokens in ONE launch (token t reads x + t * x_stride, writes y + t * y_stride,
+/// strides in floats; x_stride even).  Each output is bitwise the single call's - one block per (row, token), same
+/// arithmetic - but a verify window's per-token loops of tiny projections become one launch instead of T.
+void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t x_stride, const uint16_t* w, float* y, int64_t y_stride,
+                               int64_t n_in, int64_t n_out, int n_tok, void* stream);
+
 }  // namespace strata::kernels
