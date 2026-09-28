@@ -1467,8 +1467,16 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "strata generate: experimental native Q5_K head, %llu bytes\n",
-                     (unsigned long long) native_head.weight_bytes());
+        // 28.09.2026: the head's real type (the line said Q5_K for any file; a Q8_0 head read as Q5_K in the log)
+        const int ht = native_head.type();
+        const char* hn = ht == 8 ? "Q8_0" : ht == 12 ? "Q4_K" : ht == 13 ? "Q5_K" : ht == 14 ? "Q6_K" :
+                         ht == 18 ? "IQ3_XXS" : ht == 20 ? "IQ4_NL" : ht == 21 ? "IQ3_S" : ht == 23 ? "IQ4_XS" : nullptr;
+        if (hn != nullptr)
+            std::fprintf(stderr, "strata generate: experimental native %s head, %llu bytes\n", hn,
+                         (unsigned long long) native_head.weight_bytes());
+        else
+            std::fprintf(stderr, "strata generate: experimental native head (ggml type %d), %llu bytes\n", ht,
+                         (unsigned long long) native_head.weight_bytes());
     }
     std::vector<float> logits((size_t) n_vocab);
     float* d_logits = nullptr;
@@ -2635,6 +2643,22 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata trace: %s %lld %lld\n", what, a, b);
             std::fflush(stderr);
         };
+        // 28.09.2026 (DACAN): every verify window (and the coprocessor card's side of it) captured now, before the
+        // first request - see Verifier::precapture; the free VRAM below then counts their memory too
+        if (!ver.precapture(err)) {
+            std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+            return 1;
+        }
+        if (want_helper && !helper_reserve_only) {   // 28.09.2026: the coprocessor card's headroom, which was unlogged
+            int cur = 0;
+            cudaGetDevice(&cur);
+            size_t f2 = 0, t2 = 0;
+            cudaSetDevice(o.second_card);
+            cudaMemGetInfo(&f2, &t2);
+            cudaSetDevice(cur);
+            std::fprintf(stderr, "strata serve: %lld MiB of VRAM free on the coprocessor card (device %d)\n",
+                         (long long) (f2 >> 20), o.second_card);
+        }
         {
             // what is left once everything is allocated: under WDDM a GPU filled to the brim does not fail, it pages -
             // and a page-in while the verify graph spins on a host flag stalls the request for good
@@ -3642,6 +3666,10 @@ int main(int argc, char** argv) {
             vsp.seed = o.seed;
             vsp.counter = 0;
             ver.set_sampling(vsp);
+        }
+        if (!ver.precapture(err)) {   // 28.09.2026 (DACAN): all windows now, none in the middle of an answer
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
         }
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);

@@ -213,6 +213,9 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
+                    # 28.09.2026 (DACAN): into the log too - mid-stream the error reached no one (the client had
+                    # already got its 200) and the log showed only "done ... (length)"
+                    print(f"[strata] engine error: {line[4:].strip()}", flush=True)
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
@@ -224,6 +227,8 @@ class StrataEngine:
                         pass
                 while True:
                     line = self.lines.get()
+                    if line is not None and line.startswith("ERR"):
+                        print(f"[strata] engine error: {line[4:].strip()}", flush=True)
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):

@@ -1125,6 +1125,17 @@ bool Verifier::capture(int T, std::string& err) {
     return true;
 }
 
+// 28.09.2026 (DACAN): every window size and the commit, captured before the first request.  run() captured a window
+// the first time it was needed, and the 5-token window was first needed 12 183 tokens into an answer (hamsters,
+// xhigh): both captures reported no error, and the engine stopped right after them - the answer ended with an error
+// and the engine was left without its session.  Capturing here, while neither card is running anything, keeps
+// captures out of the answers.
+bool Verifier::precapture(std::string& err) {
+    for (int T = 1; T <= max_t_; ++T)
+        if (!capture(T, err)) return false;
+    return capture_commit(err);
+}
+
 bool Verifier::capture_commit(std::string& err) {
     if (commit_exec_ != nullptr) return true;
     using namespace strata::kernels;
