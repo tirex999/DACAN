@@ -1,4 +1,4 @@
-// serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
+// serve/web/app.js - the DACAN web app (from the Strata one): Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
 "use strict";
 
@@ -106,25 +106,54 @@ async function loadHealth() {
 }
 
 // ------------------------------------------------------------------ Monitor
+// 28.09.2026 (DACAN): the machine-wide cards here; every GPU and every CPU socket gets its own card below them
 const METRICS = [
   {key: "speed", label: "Speed", icon: "gauge", unit: "tok/s", series: "tok_s"},
-  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
-  {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
-  {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
-  {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
-  {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
-  {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
+  {key: "cpu", label: "CPU, all sockets", icon: "cpu", unit: "%", series: "cpu", max: 100},
+  {key: "vram", label: "VRAM, all cards", icon: "layers", unit: "GB", series: "gpu_mem_used"},
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
 ];
+const sparkSvg = (id, tone) => `<svg class="st-metric__spark" id="${id}" viewBox="0 0 100 32" preserveAspectRatio="none"${tone ? ` data-tone="${tone}"` : ""}>
+      <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
+      stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>`;
 $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
     <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
     <span class="st-metric__value" id="mv-${m.key}">–</span>
     <span class="st-metric__sub" id="ms-${m.key}"></span>
-    <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
-      <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
-      stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>
+    ${sparkSvg(`sp-${m.key}`, m.tone)}
   </div></div>`).join("");
+
+// a card per GPU (load, VRAM, temperature, power, PCIe) and per CPU socket (load, the RAM of its NUMA node)
+let devicesKey = "";
+function buildDevices(st) {
+  const gpus = st.gpus || [], sockets = st.sockets || [];
+  const key = `${gpus.map((g) => g.bus).join(",")}|${sockets.map((s) => s.node).join(",")}`;
+  if (key === devicesKey) return;
+  devicesKey = key;
+  const box = $("devices");
+  box.hidden = !gpus.length && !sockets.length;
+  const row = (id, label) => `<dt>${esc(label)}</dt><dd id="${id}">–</dd>`;
+  box.innerHTML = gpus.map((g, i) => `
+    <div class="st-card dev-card" data-kind="gpu">
+      <div class="dev-card__head">${icon("gpu", "st-icon st-icon--sm")}<span>GPU ${i}</span>
+        <span class="dev-card__tag">${g.numa != null ? `NUMA ${g.numa} · ` : ""}${esc((g.bus || "").replace(/^0000:/, ""))}</span></div>
+      <div class="dev-card__name">${esc(g.name || "GPU")}</div>
+      <div class="dev-card__value"><span class="st-metric__value" id="dv-gpu${i}">–</span><span class="muted small">load</span></div>
+      ${sparkSvg(`sp-gpu${i}`)}
+      <dl class="dev-card__rows">${row(`dv-gpu${i}-mem`, "VRAM")}${row(`dv-gpu${i}-temp`, "Temperature")}
+        ${row(`dv-gpu${i}-power`, "Power")}${row(`dv-gpu${i}-pcie`, "PCIe")}</dl>
+    </div>`).join("") + sockets.map((s, i) => `
+    <div class="st-card dev-card" data-kind="cpu">
+      <div class="dev-card__head">${icon("cpu", "st-icon st-icon--sm")}<span>CPU socket ${i}</span>
+        <span class="dev-card__tag">NUMA ${s.node} · ${s.threads} threads</span></div>
+      <div class="dev-card__name">${esc(st.cpu_name || "CPU")}</div>
+      <div class="dev-card__value"><span class="st-metric__value" id="dv-cpu${i}">–</span><span class="muted small">load</span></div>
+      ${sparkSvg(`sp-cpu${i}`, "info")}
+      <dl class="dev-card__rows">${row(`dv-cpu${i}-ram`, "RAM of this node")}${row(`dv-cpu${i}-gpu`, "GPU on this node")}</dl>
+    </div>`).join("");
+}
+function setText(id, text) { const el = $(id); if (el) el.textContent = text == null || text === "" ? "–" : text; }
 
 function spark(id, values, max) {
   const svg = $(id);
@@ -211,26 +240,41 @@ function renderMonitor(live, hw, st, eng, h, last, requests) {
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
 
-  // the eight cards
+  // the machine-wide cards
+  const gpus = hw.gpus || [], sockets = hw.sockets || [], sg = st.gpus || [];
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
   setMetric("speed", speed == null ? null : fmt(speed, 1), "tok/s", live.state === "generating" ? "now" : last ? "last request" : "");
   spark("sp-speed", h.tok_s);
-  setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%", st.gpu_name || "");
-  spark("sp-gpu", h.gpu_util, 100);
-  setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
-            eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : "");
-  spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
-  setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C", "");
-  spark("sp-temp", h.gpu_temp, 90);
-  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
-  spark("sp-power", h.gpu_power, hw.gpu_power_limit);
-  const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
-  setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
-            hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
-            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
-  spark("sp-pcie", h.gpu_pcie_rx_mb);
-  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
+  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%",
+            `${sockets.length > 1 ? `${sockets.length} sockets · ` : ""}${st.threads ? `${st.threads} threads` : ""}`);
   spark("sp-cpu", h.cpu, 100);
+  const memUsed = gpus.length ? gpus.reduce((a, g) => a + (g.mem_used || 0), 0) : hw.gpu_mem_used;
+  const memTotal = gpus.length ? gpus.reduce((a, g) => a + (g.mem_total || 0), 0) : hw.gpu_mem_total;
+  setMetric("vram", memUsed == null ? null : gb(memUsed), memTotal ? `/ ${gb(memTotal, 0)} GB` : "GB",
+            `${gpus.length > 1 ? `${gpus.length} cards · ` : ""}${eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached on the main card` : ""}`);
+  spark("sp-vram", gpus.length > 1 && h.gpu0_mem_used && h.gpu1_mem_used
+        ? h.gpu0_mem_used.map((v, i) => (v || 0) + ((h.gpu1_mem_used || [])[i] || 0)) : h.gpu_mem_used, memTotal);
+
+  // a card per GPU and per socket
+  buildDevices(st);
+  gpus.forEach((g, i) => {
+    setText(`dv-gpu${i}`, g.util == null ? null : `${fmt(g.util)}%`);
+    spark(`sp-gpu${i}`, h[`gpu${i}_util`], 100);
+    setText(`dv-gpu${i}-mem`, g.mem_total ? `${gb(g.mem_used)} / ${gb(g.mem_total, 0)} GB` : null);
+    setText(`dv-gpu${i}-temp`, g.temp == null ? null : `${fmt(g.temp)} °C`);
+    const t = $(`dv-gpu${i}-temp`); if (t) t.dataset.hot = g.temp >= 80 ? "1" : "";
+    setText(`dv-gpu${i}-power`, g.power == null ? null : `${fmt(g.power)} W${g.power_limit ? ` of ${fmt(g.power_limit)}` : ""}`);
+    const gen = g.pcie_gen_max || g.pcie_gen;
+    setText(`dv-gpu${i}-pcie`, gen ? `Gen${gen} x${g.pcie_width || "?"}${g.pcie_rx_mb == null ? "" :
+            ` · ↓${fmt(g.pcie_rx_mb, g.pcie_rx_mb < 10 ? 1 : 0)} ↑${fmt(g.pcie_tx_mb || 0, (g.pcie_tx_mb || 0) < 10 ? 1 : 0)} MB/s`}` : null);
+  });
+  sockets.forEach((s, i) => {
+    setText(`dv-cpu${i}`, s.cpu == null ? null : `${fmt(s.cpu)}%`);
+    spark(`sp-cpu${i}`, h[`socket${i}_cpu`], 100);
+    setText(`dv-cpu${i}-ram`, s.ram_total ? `${gb(s.ram_used || 0)} / ${gb(s.ram_total, 0)} GB` : null);
+    const near = sg.map((g, j) => (g.numa === s.node ? `GPU ${j}` : null)).filter(Boolean);
+    setText(`dv-cpu${i}-gpu`, near.length ? near.join(", ") : "none");
+  });
   if (hw.disk_read_mb == null) {
     setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
   } else {
@@ -257,8 +301,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests) {
   const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : 0;
   $("ram-bar").style.width = `${ramPct}%`;
   if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
-  $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
-  $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
+  const temps = gpus.map((g) => g.temp).filter((x) => x != null);
+  const hot = temps.length ? Math.max(...temps) : hw.gpu_temp;
+  const hotIdx = temps.length ? gpus.findIndex((g) => g.temp === hot) : -1;
+  $("temp-text").textContent = hot == null ? "–" : `${fmt(hot)} °C${gpus.length > 1 && hotIdx >= 0 ? ` · GPU ${hotIdx}` : ""}`;
+  $("temp-bar").style.width = hot == null ? "0%" : `${Math.min(100, hot)}%`;
 
   // recent requests
   const body = $("req-body");
@@ -295,7 +342,7 @@ function renderAbout(eng, hw, st) {
   const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
   facts($("facts-engine"), [
     ["Model", eng.model],
-    ["Engine", eng.version ? `v${eng.version}` : "built from source"],
+    ["Engine", `DACAN (fork of Strata${eng.version ? ` v${eng.version}` : " 0.1.9"})`],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
@@ -303,9 +350,13 @@ function renderAbout(eng, hw, st) {
     ["Images", eng.images ? "on" : "off"],
     ["Experimental speed projection", projectionText(eng.cvec)],
   ]);
+  const sg = st.gpus || [], hg = hw.gpus || [], ss = st.sockets || [], hs = hw.sockets || [];
   facts($("facts-hw"), [
-    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : "not readable (NVML)"],
-    ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
+    ...(sg.length ? sg.map((g, i) => [`GPU ${i}`, `${g.name || "GPU"}${hg[i] && hg[i].mem_total ? `, ${gb(hg[i].mem_total, 0)} GB` : ""}` +
+                                      `${g.bus ? ` · ${g.bus}` : ""}${g.numa != null ? ` · NUMA ${g.numa}` : ""}`])
+               : [["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : "not readable (NVML)"]]),
+    ["CPU", st.cpu_name ? `${ss.length > 1 ? `${ss.length} × ` : ""}${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
+    ...ss.map((s, i) => [`Socket ${i}`, `NUMA ${s.node} · ${s.threads} threads${hs[i] && hs[i].ram_total ? ` · ${gb(hs[i].ram_total, 0)} GB RAM` : ""}`]),
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
   ]);
   const base = location.origin;
@@ -610,7 +661,7 @@ $("export-btn").onclick = () => {
     `## ${health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${m.text || m.error || ""}\n`).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([md], {type: "text/markdown"}));
-  a.download = `strata-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
+  a.download = `dacan-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 };
