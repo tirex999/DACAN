@@ -1044,6 +1044,32 @@ int main(int argc, char** argv) {
         } else {
             const int hc = nodes[(size_t) host_node][0];
             nodes[(size_t) host_node].erase(nodes[(size_t) host_node].begin());
+            // 28.09.2026: with STRATA_SMT=1 (every logical CPU a worker) the host loop's SMT sibling stays free too -
+            // a worker there would share the core with the loop that spins on the rings
+            if (const char* smt = std::getenv("STRATA_SMT"); smt != nullptr && smt[0] == '1') {
+                char path[128];
+                std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", hc);
+                if (FILE* f = std::fopen(path, "r")) {
+                    char buf[128] = {};
+                    if (std::fgets(buf, (int) sizeof buf, f) != nullptr) {
+                        std::vector<int> sib;
+                        for (char* p = buf; *p != 0;) {
+                            char* end = nullptr;
+                            const long a = std::strtol(p, &end, 10);
+                            if (end == p) { ++p; continue; }
+                            long b = a;
+                            p = end;
+                            if (*p == '-') { b = std::strtol(p + 1, &end, 10); p = end; }
+                            for (long c = a; c <= b; ++c) sib.push_back((int) c);
+                        }
+                        auto& hn = nodes[(size_t) host_node];
+                        hn.erase(std::remove_if(hn.begin(), hn.end(), [&](int c) {
+                                     return std::find(sib.begin(), sib.end(), c) != sib.end();
+                                 }), hn.end());
+                    }
+                    std::fclose(f);
+                }
+            }
             if (const char* w = std::getenv("STRATA_NUMA_WORKERS")) {   // "a,b": at most a on node 0, b on node 1
                 std::string s(w);
                 size_t n = 0, at = 0;
@@ -2201,6 +2227,14 @@ int main(int argc, char** argv) {
     strata::core::ExpertCache xcache2;
     strata::core::SecondCard card2;
     bool card2_peer = false;   // 28.09.2026: the second card may write into the main card's memory (NVLink)
+    // 28.09.2026: STRATA_HELPER=1 - the second card also computes part of every GDN layer (Verifier::enable_helper);
+    // its copies of those weights come off its expert cache
+    const strata::core::Verifier::HelperParts helper_parts = strata::core::Verifier::helper_parts_env();
+    const bool want_helper = o.second_card >= 0 && helper_parts.any();
+    // 28.09.2026: STRATA_HELPER_RESERVE_ONLY=1 - the control for the helper: the second card's cache sized exactly as
+    // with it (the same experts there, so the same CPU / card rounding), the helper itself not enabled
+    const bool helper_reserve_only = std::getenv("STRATA_HELPER_RESERVE_ONLY") != nullptr &&
+                                     std::getenv("STRATA_HELPER_RESERVE_ONLY")[0] == '1';
     std::vector<int32_t> host_res2;
     if (o.second_card >= 0) {
         if (host_res.empty() || srcp == nullptr) {
@@ -2259,7 +2293,9 @@ int main(int argc, char** argv) {
                                  (uint64_t) strata::kernels::cpu::MAXT * (g.n_embd / 32) * 36 +
                                  (uint64_t) strata::kernels::native_expert_scratch_bytes(cap, n_ff) +
                                  (uint64_t) cap * g.n_embd * 4 + (64u << 10);
-        const uint64_t reserve = ((uint64_t) o.second_card_reserve_mib << 20) + buffers;
+        const uint64_t reserve = ((uint64_t) o.second_card_reserve_mib << 20) + buffers +
+                                 (want_helper ? strata::core::Verifier::helper_bytes(wt, g, native_head.loaded() ? &native_head : nullptr,
+                                                                                   o.spec, helper_parts) : 0);
         const uint64_t budget = free_b > reserve ? free_b - reserve : 0;
         std::vector<int64_t> sizes;
         std::vector<int32_t> chosen;
@@ -2315,7 +2351,8 @@ int main(int argc, char** argv) {
             cudaMalloc(&card2.scratch, strata::kernels::native_expert_scratch_bytes(cap, n_ff)) != cudaSuccess ||
             cudaMalloc((void**) &card2.out, (size_t) cap * g.n_embd * 4) != cudaSuccess ||
             cudaMalloc((void**) &card2.d_plan, (size_t) card2.plan_i32 * 4) != cudaSuccess ||
-            cudaHostAlloc((void**) &card2.h_plan, (size_t) card2.plan_i32 * 4, cudaHostAllocPortable) != cudaSuccess) {
+            cudaHostAlloc((void**) &card2.h_plan, (size_t) card2.plan_i32 * 4, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &card2.m_plan, card2.h_plan, 0) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the second card's buffers could not be allocated\n");
             return 1;
         }
@@ -2446,6 +2483,11 @@ int main(int argc, char** argv) {
         }
         mem_mark("the verifier and the drafter's binding");
         if (card2_peer) { card2.peer_rows = ver.card2_rows(); card2.host_rows = ver.host_rows(); }   // 28.09.2026
+        if (want_helper && !helper_reserve_only) ver.set_card2(&card2);
+        if (want_helper && !helper_reserve_only && !ver.enable_helper(o.second_card, helper_parts, err)) {   // 28.09.2026: the coprocessor card
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
         ver.set_split(o.spec_split);
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : o.pcie_mode == "kernel" ? 2
                           : native_pack ? 0 : 2);   // auto: DMA for the native packs, the copy kernel for Q2_0
@@ -3092,6 +3134,11 @@ int main(int argc, char** argv) {
                 ++rounds;
                 const bool drafted = eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+                if (!ver.commit_finish(err)) {   // 28.09.2026: the commit ran beside the draft (STRATA_COMMIT_OVERLAP)
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
@@ -3572,6 +3619,11 @@ int main(int argc, char** argv) {
         }
         mem_mark("the verifier and the drafter's binding");
         if (card2_peer) { card2.peer_rows = ver.card2_rows(); card2.host_rows = ver.host_rows(); }   // 28.09.2026
+        if (want_helper && !helper_reserve_only) ver.set_card2(&card2);
+        if (want_helper && !helper_reserve_only && !ver.enable_helper(o.second_card, helper_parts, err)) {   // 28.09.2026: the coprocessor card
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
         ver.set_split(o.spec_split);
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : o.pcie_mode == "kernel" ? 2
                           : native_pack ? 0 : 2);   // auto: DMA for the native packs, the copy kernel for Q2_0
@@ -3771,11 +3823,17 @@ int main(int argc, char** argv) {
             }
             if (eos) {
                 if (adapt_thr.joinable()) adapt_thr.join();
+                if (!ver.commit_finish(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+            if (!ver.commit_finish(err)) {   // 28.09.2026: the commit ran beside the draft (STRATA_COMMIT_OVERLAP)
+                if (adapt_thr.joinable()) adapt_thr.join();
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {

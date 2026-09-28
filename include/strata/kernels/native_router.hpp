@@ -14,4 +14,7 @@ bool native_router_enabled();
 // four-byte aligned and outputs disjoint from each other and the input.
 // Requires a nonnull ordered CUDA stream. No allocation or synchronization.
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
+// 28.09.2026: the same for `n_tok` tokens in one launch (token t: logits + 512 t, ids + 10 t, weights + 10 t), each
+// token's result bitwise the single-token call's.
+void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
 }

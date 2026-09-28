@@ -981,6 +981,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 }
 
 namespace {
+// 28.09.2026: kGatherParts blocks per row (the rows usually go over NVLink into the main card, where one block per
+// row left most of the link idle) and no per-thread system fence: whoever reads the rows next waits for this kernel
+// to COMPLETE first (an event on the host, or the coprocessor graph's raise_flag64, which fences) - ~20 us a layer
+// on the second card before.
+constexpr int kGatherParts = 4;
 __global__ void gather_rows_kernel(const float* __restrict__ src, const int32_t* __restrict__ ent_dst,
                                    const int32_t* __restrict__ n_entries, int64_t n_embd, float* __restrict__ out) {
     const int e = blockIdx.x;
@@ -988,15 +993,16 @@ __global__ void gather_rows_kernel(const float* __restrict__ src, const int32_t*
     const size_t row = (size_t) ent_dst[e] * (size_t) n_embd;
     const float4* s = (const float4*) (src + row);
     float4* o = (float4*) (out + row);
-    for (int64_t i = threadIdx.x; i < n_embd / 4; i += blockDim.x) o[i] = s[i];
-    __threadfence_system();
+    const int64_t n4 = n_embd / 4, i0 = n4 * blockIdx.y / kGatherParts, i1 = n4 * (blockIdx.y + 1) / kGatherParts;
+    for (int64_t i = i0 + threadIdx.x; i < i1; i += blockDim.x) o[i] = s[i];
 }
 }  // namespace
 
 void gather_rows(const float* src, const int32_t* ent_dst, const int32_t* n_entries, int64_t cap_entries,
                  int64_t n_embd, float* out, void* stream) {
     if (cap_entries <= 0) return;
-    gather_rows_kernel<<<(unsigned) cap_entries, 256, 0, (cudaStream_t) stream>>>(src, ent_dst, n_entries, n_embd, out);
+    gather_rows_kernel<<<dim3((unsigned) cap_entries, kGatherParts), 256, 0, (cudaStream_t) stream>>>(src, ent_dst,
+                                                                                                    n_entries, n_embd, out);
     check("gather_rows");
 }
 

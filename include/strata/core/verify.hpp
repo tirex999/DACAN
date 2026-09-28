@@ -34,6 +34,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace strata::core {
 
@@ -81,6 +82,10 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// 28.09.2026 (STRATA_COMMIT_OVERLAP=1): `commit` only LAUNCHES the commit graph, so the drafter (its own stream,
+    /// its own buffers: it reads the window's residuals, which the commit does not touch) runs beside it; this waits
+    /// for it.  Call before anything else reads the session's GDN / indexer state; `run` calls it too.
+    bool commit_finish(std::string& err);
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
@@ -105,7 +110,37 @@ public:
     /// groups out of the captured graph.  Set before the first `run`.
     void set_pcie_share(bool on) { pcie_share_ = on; }
 
+    /// 28.09.2026: THE SECOND CARD AS THE MAIN CARD'S COPROCESSOR (STRATA_HELPER=1).  Before the doorbell every GDN
+    /// layer runs qkv -> conv -> alpha/beta -> z -> the recurrence on the main card, one after another, while the
+    /// second card waits for experts most of the round.  alpha/beta and z depend only on the layer's input, so the
+    /// second card computes them - with its own copy of their weights, from the input it pulls over NVLink - while
+    /// the main card runs qkv and the conv, and writes them straight into the main card's buffers.  Same kernels on
+    /// the same inputs: the output is bitwise the single-card one.  Each card replays its own graph; they meet on
+    /// device-memory flags (`raise_flag64` / `wait_flag64`).  Call after `init`, before the first `run`; needs peer
+    /// access both ways.
+    ///
+    /// The parts it takes (STRATA_HELPER = "1" for z, or a list of letters): z - alpha/beta and z of the GDN layers;
+    /// q - the QSA layers' q+gate projection (while the main card runs k, v, their norms and the cache appends);
+    /// h - the second half of the head's rows, beside the main card's first half; o - the second half of the rows
+    /// of every layer's output projection (ssm_out / attn_output); e - the card's share of the experts from its own
+    /// graph (the host writes the plan and raises a flag instead of issuing and waiting; needs `set_card2`).
+    /// E.g. STRATA_HELPER=zqhoe.
+    struct HelperParts {
+        bool z = false, q = false, head = false, o = false, e = false;
+        bool any() const { return z || q || head || o || e; }
+    };
+    /// The second card's expert executor, for part "e".  Before `enable_helper`.
+    void set_card2(SecondCard* c) { card2_ = c; }
+    static HelperParts helper_parts_env();
+    bool enable_helper(int device, HelperParts parts, std::string& err);
+    /// What `enable_helper` allocates on the second card (its copies of the weights and its inbox), so the card's
+    /// expert cache can be sized around it.
+    static uint64_t helper_bytes(const WeightTable& wt, const ModelGeometry& g, const NativeHead* head, int max_t,
+                                 HelperParts parts);
+
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_hlaunch = 0;   ///< 28.09.2026: host time launching the second card's graph
+    double ms_commit_wait = 0;   ///< 28.09.2026: time commit_finish waited (the commit not hidden behind the draft)
     double ms_launch = 0;   ///< 26.09.2026: time the window's cudaGraphLaunch took (on whichever thread issued it)
     int64_t windows = 0;
 
@@ -139,6 +174,43 @@ private:
     int hist_len_ = 0;
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
+    bool record_helper(int T, std::string& err);
+
+    // 28.09.2026: the coprocessor card (see enable_helper)
+    struct HelperLayer {
+        const void* wg = nullptr;   // GDN: attn_gate (z), native form
+        int wg_type = -1;
+        const uint16_t *wa = nullptr, *wb = nullptr;
+        const float *wdt = nullptr, *wsa = nullptr;
+        const void* wq = nullptr;   // QSA: attn_q (q and its gate), native form
+        int wq_type = -1;
+        const void* wo = nullptr;   // rows [n_embd / 2, n_embd) of ssm_out / attn_output, native form
+        int wo_type = -1;
+    };
+    bool commit_overlap_ = false;   // 28.09.2026: STRATA_COMMIT_OVERLAP=1
+    bool commit_pending_ = false;
+    bool helper_ = false;
+    HelperParts hp_;
+    SecondCard* card2_ = nullptr;                  // part "e": its plan block, buffers and cache
+    uint32_t* h_flagC_ = nullptr; uint32_t* m_flagC_ = nullptr;   // mapped: the second card's plan is in place
+    static void publish_plan2(void* ctx);
+    const void* hhead_w_ = nullptr;                // on the second card: the head's rows [hhead_r0_, n_vocab)
+    int64_t hhead_r0_ = 0;
+    int hdev_ = -1;
+    cudaStream_t hs_ = nullptr;
+    void* harena_ = nullptr;                       // on the second card: weights, inbox, flag, epoch
+    std::vector<HelperLayer> hl_;                  // per layer (GDN layers only)
+    uint8_t* hin_xq_ = nullptr;                    // inbox on the second card: the layer's q8_1 input
+    float* hin_x_ = nullptr;                       //   and its float input
+    unsigned long long* hflag2_ = nullptr;         // on the second card, raised by the main card: inputs ready
+    uint32_t* epoch2_ = nullptr;                   // on the second card: this window's number
+    void* hmain_ = nullptr;                        // on the main card: hflag1_ and epoch1_
+    unsigned long long* hflag1_ = nullptr;         // on the main card, raised by the second card: outputs in place
+    uint32_t* epoch1_ = nullptr;
+    uint32_t* h_epoch_ = nullptr; uint32_t* m_epoch_ = nullptr;   // mapped: the window's number
+    uint32_t* h_herr_ = nullptr;  uint32_t* m_herr_ = nullptr;    // mapped: a step a flag wait gave up at
+    uint32_t epoch_ = 0;
+    cudaGraphExec_t hexec_[9] = {};
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

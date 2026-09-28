@@ -490,8 +490,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
-        // 26.09.2026: the second card's share, issued now so it runs while the CPU computes its own
-        if (g2 > 0) {
+        // 28.09.2026: the second card's share from its own graph - the plan block written, the flag raised, every
+        // layer (an empty plan too: the graph waits for each); only for the verify window's rows (c2_peer)
+        if (card != nullptr && card->in_graph && c2_peer && rows_planned) {
+            c2_start[g2] = e2;
+            c2_counts[0] = g2;
+            c2_counts[1] = e2;
+            c2_counts[2] = 0;
+            c2_counts[3] = 0;
+            card->experts += g2;
+            card->entries += e2;
+            if (g2 > 0) ++card->launches;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (P.publish2) P.publish2(P.ctx);
+        } else if (g2 > 0) {   // 26.09.2026: the second card's share, issued now so it runs while the CPU computes its own
             c2_start[g2] = e2;
             c2_counts[0] = g2;
             c2_counts[1] = e2;

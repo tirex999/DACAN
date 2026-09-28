@@ -19,6 +19,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
@@ -103,6 +104,21 @@ Verifier::~Verifier() {
         launch_thr_.join();
     }
     if (cs_) cudaStreamSynchronize(cs_);
+    if (hs_) {   // 28.09.2026: the coprocessor card's graph, stream and buffers
+        int cur = 0;
+        cudaGetDevice(&cur);
+        cudaSetDevice(hdev_);
+        cudaStreamSynchronize(hs_);
+        for (auto& e : hexec_)
+            if (e) cudaGraphExecDestroy(e);
+        cudaStreamDestroy(hs_);
+        if (harena_) cudaFree(harena_);
+        cudaSetDevice(cur);
+    }
+    if (hmain_) cudaFree(hmain_);
+    if (h_epoch_) cudaFreeHost(h_epoch_);
+    if (h_herr_) cudaFreeHost(h_herr_);
+    if (h_flagC_) cudaFreeHost(h_flagC_);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
@@ -262,6 +278,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     {
+        const char* ov = std::getenv("STRATA_COMMIT_OVERLAP");
+        commit_overlap_ = ov != nullptr && ov[0] == '1';
+    }
+    {
         async_launch_ = std::getenv("STRATA_ASYNC_LAUNCH") != nullptr && std::string(std::getenv("STRATA_ASYNC_LAUNCH")) != "0";
         cudaGetDevice(&launch_device_);
         if (async_launch_) launch_thr_ = std::thread([this] { launcher_main(); });
@@ -291,6 +311,319 @@ void Verifier::launcher_main() {
 }
 
 const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
+
+// ================================ 28.09.2026: THE COPROCESSOR CARD ================================
+namespace {
+uint64_t halign(uint64_t b) { return (b + 255) / 256 * 256; }
+constexpr uint32_t kHeadStep = 1023;   // the head's flag step, after every layer's ((l * G + grp) * 3 + 3 <= 291)
+// what the second card holds of GDN layer l (z's projection, alpha/beta's bf16 rows, bias and A) or of QSA layer l
+// (q's projection); ok = false when a weight it needs is missing or not in the form the kernels read
+struct HelperSizes {
+    uint64_t wg = 0, wab = 0, vec = 0, wq = 0, wo = 0, wo_off = 0;
+    bool ok = false;
+};
+// the widest input the second card pulls: n_embd, or an output projection's (value dim / heads x head dim)
+int helper_max_in(const ModelGeometry& g) {
+    return (int) std::max<int64_t>(g.n_embd, std::max<int64_t>(g.ssm_value_dim, g.n_head * g.head_dim));
+}
+HelperSizes helper_sizes(const WeightTable& wt, const ModelGeometry& g, int64_t l, Verifier::HelperParts parts,
+                         const WeightRef** w) {
+    HelperSizes s;
+    const LayerView v(wt, l);
+    for (int i = 0; i < 7; ++i) w[i] = nullptr;
+    if (parts.o) {   // the output projection's second half of rows: n_out = n_embd, n_in = its input width
+        const bool qsa = is_qsa_layer(g, l);
+        w[6] = v.get(qsa ? "attn_output.weight" : "ssm_out.weight");
+        if (w[6] == nullptr || w[6]->native_data == nullptr) return s;
+        const int n_in = (int) (qsa ? g.n_head * g.head_dim : g.ssm_value_dim);
+        const int r0 = (int) (g.n_embd / 2);
+        s.wo = strata::kernels::native_mmvq_weight_bytes(w[6]->native_type, n_in, (int) g.n_embd - r0);
+        s.wo_off = strata::kernels::native_mmvq_weight_bytes(w[6]->native_type, n_in, r0);
+    }
+    if (!is_qsa_layer(g, l)) {
+        if (!parts.z) { s.ok = true; return s; }
+        w[0] = v.get("attn_gate.weight"); w[1] = v.get("ssm_alpha.weight"); w[2] = v.get("ssm_beta.weight");
+        w[3] = v.get("ssm_dt.bias"); w[4] = v.get("ssm_a");
+        for (int i = 0; i < 5; ++i)
+            if (w[i] == nullptr) return s;
+        if (w[0]->native_data == nullptr || w[1]->data == nullptr || w[2]->data == nullptr || w[3]->data == nullptr ||
+            w[4]->data == nullptr)
+            return s;
+        s.wg = strata::kernels::native_mmvq_weight_bytes(w[0]->native_type, (int) g.n_embd, (int) g.ssm_value_dim);
+        s.wab = (uint64_t) g.ssm_v_heads * (uint64_t) g.n_embd * 2;   // what gdn_ab_multi reads of each
+        s.vec = (uint64_t) g.ssm_v_heads * 4;
+    } else {
+        if (!parts.q) { s.ok = true; return s; }
+        w[5] = v.get("attn_q.weight");
+        if (w[5] == nullptr || w[5]->native_data == nullptr) return s;
+        s.wq = strata::kernels::native_mmvq_weight_bytes(w[5]->native_type, (int) g.n_embd,
+                                                         (int) (g.n_head * 2 * g.head_dim));
+    }
+    s.ok = true;
+    return s;
+}
+uint64_t helper_head_bytes(const NativeHead* head, const ModelGeometry& g, int64_t n_vocab, int64_t* r0) {
+    if (head == nullptr || !head->loaded() || n_vocab < 2) return 0;
+    *r0 = n_vocab / 2;
+    return strata::kernels::native_mmvq_weight_bytes(head->type(), (int) g.n_embd, (int) (n_vocab - *r0));
+}
+}  // namespace
+
+Verifier::HelperParts Verifier::helper_parts_env() {
+    HelperParts p;
+    const char* e = std::getenv("STRATA_HELPER");
+    if (e == nullptr) return p;
+    const std::string s(e);
+    p.z = s == "1" || s.find('z') != std::string::npos;
+    p.q = s.find('q') != std::string::npos;
+    p.head = s.find('h') != std::string::npos;
+    p.o = s.find('o') != std::string::npos;
+    p.e = s.find('e') != std::string::npos;
+    return p;
+}
+
+uint64_t Verifier::helper_bytes(const WeightTable& wt, const ModelGeometry& g, const NativeHead* head, int max_t,
+                                HelperParts parts) {
+    if (!parts.any()) return 0;
+    uint64_t total = halign(strata::kernels::native_q8_1_bytes(helper_max_in(g), max_t)) +
+                     halign((uint64_t) max_t * (uint64_t) g.n_embd * 4) + 2 * 256;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        const WeightRef* w[7];
+        const HelperSizes s = helper_sizes(wt, g, l, parts, w);
+        if (!s.ok) return 0;   // enable_helper says why
+        total += (s.wg ? halign(s.wg) + 2 * halign(s.wab) + 2 * halign(s.vec) : 0) + (s.wq ? halign(s.wq) : 0) +
+                 (s.wo ? halign(s.wo) : 0);
+    }
+    if (parts.head) {
+        const WeightRef* wo = wt.find("output.weight");
+        int64_t r0 = 0;
+        const uint64_t hb = helper_head_bytes(head, g, wo ? wo->ne1 : 0, &r0);
+        if (hb == 0) return 0;
+        total += halign(hb);
+    }
+    return total;
+}
+
+bool Verifier::enable_helper(int device, HelperParts parts, std::string& err) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const int main = launch_device_;
+    if (!parts.any()) { err = "helper: no part chosen"; return false; }
+    // 28.09.2026: with the helper's graph spinning on the second card, host-issued expert work there can queue behind
+    // its flag waits (the z-only run hung at a layer's flag): the card's experts then always come from its graph
+    if (card2_ != nullptr && !parts.e) {
+        parts.e = true;
+        std::fprintf(stderr, "strata verify: coprocessor part e turned on (the second card holds experts)\n");
+    }
+    if (device == main || device < 0) { err = "helper: the coprocessor must be another card"; return false; }
+    int can01 = 0, can10 = 0;
+    cudaDeviceCanAccessPeer(&can01, main, device);
+    cudaDeviceCanAccessPeer(&can10, device, main);
+    if (!can01 || !can10) { err = "helper: the two cards have no peer access to each other"; return false; }
+    const uint64_t need = helper_bytes(*wt_, g, head_, max_t_, parts);
+    if (need == 0) {
+        err = "helper: a weight it would take is missing or not native (z / alpha / beta, q, or the native head)";
+        return false;
+    }
+    // the main card's side: its flag and epoch, and the mapped epoch / error words both cards read
+    if (cudaMalloc(&hmain_, 512) != cudaSuccess) { err = "helper: main-card flag allocation failed"; return false; }
+    cudaMemset(hmain_, 0, 512);
+    hflag1_ = (unsigned long long*) hmain_;
+    epoch1_ = (uint32_t*) ((uint8_t*) hmain_ + 256);
+    if (!mapped(64, (void**) &h_epoch_, (void**) &m_epoch_) || !mapped(64, (void**) &h_herr_, (void**) &m_herr_)) {
+        err = "helper: mapped epoch allocation failed";
+        return false;
+    }
+    {
+        const cudaError_t pe = cudaDeviceEnablePeerAccess(device, 0);   // main -> second: its flag
+        if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) {
+            err = std::string("helper: peer access main -> second card: ") + cudaGetErrorString(pe);
+            return false;
+        }
+        (void) cudaGetLastError();
+    }
+    if (cudaSetDevice(device) != cudaSuccess) { err = "helper: cannot select the second card"; return false; }
+    auto back = [&](bool ok) { cudaSetDevice(main); return ok; };
+    {
+        const cudaError_t pe = cudaDeviceEnablePeerAccess(main, 0);     // second -> main: inputs, outputs, flag
+        if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) {
+            err = std::string("helper: peer access second card -> main: ") + cudaGetErrorString(pe);
+            return back(false);
+        }
+        (void) cudaGetLastError();
+    }
+    if (cudaMalloc(&harena_, need) != cudaSuccess) {
+        err = "helper: " + std::to_string(need >> 20) + " MiB on the second card do not fit";
+        return back(false);
+    }
+    uint8_t* p = (uint8_t*) harena_;
+    auto take = [&](uint64_t b) { uint8_t* q = p; p += halign(b); return q; };
+    hin_xq_ = take(native_q8_1_bytes(helper_max_in(g), max_t_));
+    hin_x_ = (float*) take((uint64_t) max_t_ * (uint64_t) g.n_embd * 4);
+    hflag2_ = (unsigned long long*) take(256);
+    epoch2_ = (uint32_t*) take(256);
+    cudaMemset(hflag2_, 0, 512);
+    auto copy_in = [&](uint64_t bytes, const void* src, const char* what, int64_t l) -> const void* {
+        uint8_t* dst = take(bytes);
+        if (cudaMemcpyPeer(dst, device, src, main, bytes) != cudaSuccess) {
+            err = std::string("helper: copying ") + what + " (layer " + std::to_string(l) + ") to the second card failed";
+            return nullptr;
+        }
+        return dst;
+    };
+    hl_.assign((size_t) g.n_layers, HelperLayer{});
+    const Clock::time_point t0 = Clock::now();
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        const WeightRef* w[7];
+        const HelperSizes s = helper_sizes(*wt_, g, l, parts, w);
+        HelperLayer& h = hl_[(size_t) l];
+        if (s.wo) {
+            h.wo_type = w[6]->native_type;
+            if (!(h.wo = copy_in(s.wo, (const uint8_t*) w[6]->native_data + s.wo_off, "the output projection", l)))
+                return back(false);
+        }
+        if (s.wg) {
+            h.wg_type = w[0]->native_type;
+            if (!(h.wg = copy_in(s.wg, w[0]->native_data, "z", l)) ||
+                !(h.wa = (const uint16_t*) copy_in(s.wab, w[1]->data, "alpha", l)) ||
+                !(h.wb = (const uint16_t*) copy_in(s.wab, w[2]->data, "beta", l)) ||
+                !(h.wdt = (const float*) copy_in(s.vec, w[3]->data, "dt", l)) ||
+                !(h.wsa = (const float*) copy_in(s.vec, w[4]->data, "A", l)))
+                return back(false);
+        }
+        if (s.wq) {
+            h.wq_type = w[5]->native_type;
+            if (!(h.wq = copy_in(s.wq, w[5]->native_data, "q", l))) return back(false);
+        }
+    }
+    if (parts.head) {
+        const uint64_t hb = helper_head_bytes(head_, g, n_vocab_, &hhead_r0_);
+        const size_t row = native_mmvq_weight_bytes(head_->type(), (int) g.n_embd, 1);
+        if (!(hhead_w_ = copy_in(hb, (const uint8_t*) head_->weights() + (size_t) hhead_r0_ * row, "the head", -1)))
+            return back(false);
+    }
+    if (parts.e) {
+        if (card2_ == nullptr || card2_->device != device || card2_->m_plan == nullptr || card2_->d_plan == nullptr ||
+            card2_->peer_rows == nullptr || split_) {
+            err = "helper: part e needs the second card's expert executor with a mapped plan block and peer rows (and "
+                  "no split window)";
+            return back(false);
+        }
+        if (!mapped(64, (void**) &h_flagC_, (void**) &m_flagC_)) { err = "helper: mapped flag allocation failed"; return back(false); }
+        card2_->in_graph = true;
+        sink_.publish2 = &Verifier::publish_plan2;
+    }
+    int least = 0, greatest = 0;
+    cudaDeviceGetStreamPriorityRange(&least, &greatest);
+    if (cudaStreamCreateWithPriority(&hs_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        err = "helper: the second card's stream could not be created";
+        return back(false);
+    }
+    hdev_ = device;
+    hp_ = parts;
+    helper_ = true;
+    std::fprintf(stderr, "strata verify: coprocessor card %d takes%s%s%s%s - %.1f MiB of weights copied in %.0f ms\n",
+                 device, parts.z ? " z+alpha/beta (GDN)" : "", parts.q ? " q (QSA)" : "",
+                 parts.o ? " half of each output projection" : "", parts.head ? " the head's second half" : "",
+                 (double) need / 1048576.0, ms_since(t0));
+    if (parts.e)
+        std::fprintf(stderr, "strata verify: coprocessor card %d runs its expert share from its own graph (no host issue "
+                             "or wait)\n", device);
+    return back(true);
+}
+
+// The second card's side of a window, in the main card's order: for every (layer, group) it helps with, wait for
+// the input, pull it over NVLink, compute into the main card's buffers, raise the main card's flag; then the head.
+bool Verifier::record_helper(int T, std::string& err) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const int64_t N = g.n_embd, ZV = g.ssm_value_dim, HV = g.ssm_v_heads, MT = max_t_;
+    const int64_t NH = g.n_head, HD = g.head_dim;
+    const int G = (split_ && T >= 2) ? 2 : 1;
+    const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    copy_i32_from_mapped((int32_t*) epoch2_, (const int32_t*) m_epoch_, 1, hs_);
+    const int64_t K = ss_->k;
+    std::vector<int64_t> gdn_idx((size_t) g.n_layers, -1);
+    for (int64_t l = 0, gi = 0; l < g.n_layers; ++l)
+        if (!is_qsa_layer(g, l)) gdn_idx[(size_t) l] = gi++;
+    // steps: (l * G + grp) * 3 + 1 the in-projection part, + 2 the output projection, + 3 the experts
+    auto pre_parts = [&](int64_t l, int grp) {
+        const bool qsa = is_qsa_layer(g, l);
+        const HelperLayer& h = hl_[(size_t) l];
+        const int64_t gi = gdn_idx[(size_t) l];
+        {
+            {
+                const int tb = tb_[grp], n = te_[grp] - tb;
+                const uint32_t step = (uint32_t) ((l * G + grp) * 3 + 1);
+                if ((!qsa && hp_.z) || (qsa && hp_.q)) {
+                    wait_flag64(hflag2_, epoch2_, step, m_herr_, hs_);
+                    copy_from_mapped((float*) hin_xq_, (const float*) xq_, (int64_t) native_q8_1_bytes((int) N, n) / 4, hs_);
+                    if (!qsa) {
+                        copy_from_mapped(hin_x_, mixed_ + tb * N, (int64_t) n * N, hs_);
+                        gdn_ab_multi(hin_x_, h.wa, h.wb, h.wdt, h.wsa, gate_L_ + (size_t) (gi * MT + tb) * HV,
+                                     beta_L_ + (size_t) (gi * MT + tb) * HV, (int) N, (int) HV, n, hs_);
+                        native_mmvq(h.wg_type, h.wg, hin_xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, hs_);
+                    } else {
+                        native_mmvq(h.wq_type, h.wq, hin_xq_, qfull_ + (size_t) tb * NH * 2 * HD, (int) N,
+                                    (int) (NH * 2 * HD), n, hs_);
+                    }
+                    raise_flag64(hflag1_, epoch2_, step, hs_);
+                }
+                if (hp_.o) {   // rows [N/2, N) of the output projection into bo_, from the quantized y / attention
+                    const int n_in = (int) (qsa ? NH * HD : ZV), r0 = (int) (N / 2);
+                    wait_flag64(hflag2_, epoch2_, step + 1, m_herr_, hs_);
+                    copy_from_mapped((float*) hin_xq_, (const float*) xq_, (int64_t) native_q8_1_bytes(n_in, n) / 4, hs_);
+                    native_mmvq_ld(h.wo_type, h.wo, hin_xq_, bo_ + tb * N + r0, (int) N, n_in, (int) N - r0, n, hs_);
+                    raise_flag64(hflag1_, epoch2_, step + 1, hs_);
+                }
+            }
+        }
+    };
+    // part e: this layer's share of the experts - the plan the host published (mapped), the activations pulled from
+    // the main card, the grouped kernels on this card's slots, the rows into the main card's rows2_
+    auto experts = [&](int64_t l, int grp) {
+        const int tb = tb_[grp], n = te_[grp] - tb;
+        SecondCard& c = *card2_;
+        const int64_t cap = c.cap, ptr_off = (4 + (cap + 1) + 2 * cap + 1) & ~1ll;
+        const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
+        NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        L.scaled = f.scaled ? 1 : 0;
+        L.scale_off = f.scale_off;
+        L.bytes = f.bytes;
+        const int32_t* counts = c.d_plan;
+        const int32_t* start = counts + 4;
+        const int32_t* dst = start + cap + 1;
+        const int32_t* tok = dst + cap;
+        const unsigned long long* ptr = (const unsigned long long*) (c.d_plan + ptr_off);
+        wait_flag_ge(m_flagC_, (uint32_t) (l * G + grp + 1), hs_);
+        copy_i32_from_mapped(c.d_plan, c.m_plan, c.plan_i32, hs_);
+        copy_from_mapped(c.x, mixed_ + tb * N, (int64_t) n * N, hs_);
+        quantize_q8_1_rows(c.x, n, N, c.xq, hs_);
+        native_expert_grouped(L, ptr, start, counts, dst, tok, cap, cap, c.xq, c.scratch, c.out, hs_);
+        gather_rows(c.out, dst, counts + 1, cap, N, rows2_ + (size_t) tb * K * N, hs_);
+        raise_flag64(hflag1_, epoch2_, (uint32_t) ((l * G + grp) * 3 + 3), hs_);
+    };
+    try {
+        for (int grp = 0; grp < G; ++grp) pre_parts(0, grp);
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int grp = 0; grp < G; ++grp) {
+                if (hp_.e) experts(l, grp);
+                if (l + 1 < g.n_layers) pre_parts(l + 1, grp);
+            }
+        if (hp_.head) {
+            wait_flag64(hflag2_, epoch2_, kHeadStep, m_herr_, hs_);
+            copy_from_mapped((float*) hin_xq_, (const float*) xq_, (int64_t) native_q8_1_bytes((int) N, T) / 4, hs_);
+            native_mmvq_ld(head_->type(), hhead_w_, hin_xq_, head_logits_ + hhead_r0_, (int) n_vocab_, (int) N,
+                           (int) (n_vocab_ - hhead_r0_), T, hs_);
+            raise_flag64(hflag1_, epoch2_, kHeadStep, hs_);
+        }
+    } catch (const std::exception& e) {
+        err = std::string("helper: ") + e.what();
+        return false;
+    }
+    return true;
+}
 
 // ================================ THE WINDOW, AS CAPTURED ================================
 //
@@ -323,6 +656,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     groups_[T] = G;
 
     // ---- the window's inputs, from mapped staging
+    if (helper_) copy_i32_from_mapped((int32_t*) epoch1_, (const int32_t*) m_epoch_, 1, cs);   // 28.09.2026
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * NH, cs);
@@ -427,17 +761,33 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                // 28.09.2026: with the coprocessor card, alpha/beta and z are computed there while this card runs
+                // qkv and the conv (see enable_helper); xq_ and xm stay untouched until its flag is back
+                const uint32_t hstep = (uint32_t) ((l * G + grp) * 3 + 1);   // the output projection's: hstep + 1
+                const bool hz = helper_ && hp_.z;
+                if (hz) raise_flag64(hflag2_, epoch1_, hstep, cs);
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
-                gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                             (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
-                             n, cs);
-                native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
+                if (hz) {
+                    wait_flag64(hflag1_, epoch1_, hstep, m_herr_, cs);
+                } else {
+                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
+                                 (int) HV, n, cs);
+                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
+                }
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, nullptr, cs, tb);
                 native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
-                native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                if (helper_ && hp_.o) {   // 28.09.2026: rows [N/2, N) on the coprocessor card
+                    raise_flag64(hflag2_, epoch1_, hstep + 1, cs);
+                    native_mmvq_ld(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) N, (int) ZV,
+                                   (int) (N / 2), n, cs);
+                    wait_flag64(hflag1_, epoch1_, hstep + 1, m_herr_, cs);
+                } else {
+                    native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
+                }
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -459,6 +809,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 };
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                // 28.09.2026: with the coprocessor card (part q), q+gate is computed there while this card runs the
+                // indexer key, k, v, their norms and the cache appends; xq_ is not rewritten before its flag is back
+                const uint32_t hstep = (uint32_t) ((l * G + grp) * 3 + 1);   // the output projection's: hstep + 1
+                const bool hq = helper_ && hp_.q;
+                if (hq) raise_flag64(hflag2_, epoch1_, hstep, cs);
                 // 28.09.2026: one launch for the group's tokens (was one per token), each row bitwise as before
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, (int) N,
                                           (int) ID, n, cs);
@@ -487,8 +842,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
                                               (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                               (float) qsa_freq_base(), cs);
-                native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
-                            n, cs);
+                if (hq)
+                    wait_flag64(hflag1_, epoch1_, hstep, m_herr_, cs);
+                else
+                    native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                                (int) (NH * 2 * HD), n, cs);
                 for (int t = tb; t < te; ++t) {
                     float* qc = qcur_ + t * NH * HD;
                     if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4,
@@ -522,7 +880,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
                 }
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
-                native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
+                if (helper_ && hp_.o) {   // 28.09.2026: rows [N/2, N) on the coprocessor card
+                    raise_flag64(hflag2_, epoch1_, hstep + 1, cs);
+                    native_mmvq_ld(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) N, (int) (NH * HD),
+                                   (int) (N / 2), n, cs);
+                    wait_flag64(hflag1_, epoch1_, hstep + 1, m_herr_, cs);
+                } else {
+                    native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
+                }
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
@@ -536,8 +901,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }
             bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, (int) N,
                                       (int) NE, n, cs);
-            try {
-                for (int t = tb; t < te; ++t) native_router_top10(logits_ + t * NE, ids_ + t * K, w_ + t * K, cs);
+            try {   // 28.09.2026: the group's tokens in one launch (a block per token, each bitwise as before)
+                native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) {
                 err = v.name("router") + ": " + e.what();
                 return false;
@@ -627,16 +992,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr2, p_start2, p_counts + 2);
         }
         wait_flag_ge(m_flag_, ring, cs);                       // the CPU's share is in the mapped rows
+        if (helper_ && hp_.e)                                  // 28.09.2026: the second card's rows are in rows2_
+            wait_flag64(hflag1_, epoch1_, (uint32_t) ((l * G + grp) * 3 + 3), m_herr_, cs);
         // 28.09.2026 (the cards over NVLink, step A): only the CPU's rows cross PCIe from mapped memory (was every row
         // of the group, ~0.5 MB a layer, mostly the zeros of the GPU's own rows); the second card's rows came over
         // NVLink into rows2_; the rest are zero here, and moe_hit_add adds this card's hits into them
         assemble_rows(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, rows2_ + (size_t) tb * K * N,
                       pl + rowsrc_off_, p_counts + 3, (int64_t) n * K, N, cs);
         moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
-        for (int t = tb; t < te; ++t) {
-            MoEBuffers mb = ss.moe;
-            mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
-            if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
+        if (native_moe_combine_enabled()) {   // 28.09.2026: the group's tokens in one launch, each row bitwise as before
+            try {
+                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+            } catch (const std::exception& e) {
+                err = "verify layer " + std::to_string(l) + " combine: " + e.what();
+                return false;
+            }
+        } else {
+            for (int t = tb; t < te; ++t) {
+                MoEBuffers mb = ss.moe;
+                mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
+                if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
+            }
         }
         if (l == g.n_layers - 1) {
             for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
@@ -673,7 +1049,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
-                native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
+                if (helper_ && hp_.head) {   // 28.09.2026: the second half of the rows on the coprocessor card
+                    raise_flag64(hflag2_, epoch1_, kHeadStep, cs);
+                    native_mmvq_ld(head_->type(), head_->weights(), xq_, head_logits_, (int) n_vocab_, (int) N,
+                                   (int) hhead_r0_, T, cs);
+                    wait_flag64(hflag1_, epoch1_, kHeadStep, m_herr_, cs);
+                } else {
+                    native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
+                }
             } catch (const std::exception& e) {
                 err = std::string("verify head: ") + e.what();
                 return false;
@@ -719,6 +1102,26 @@ bool Verifier::capture(int T, std::string& err) {
     const cudaError_t us = cudaStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
                  cudaGetErrorString(ue), cudaGetErrorString(us));
+    if (helper_ && hexec_[T] == nullptr) {   // 28.09.2026: the coprocessor card's side of the same window
+        cudaSetDevice(hdev_);
+        cudaGraph_t hg = nullptr;
+        std::string herr;
+        bool hok = cudaStreamBeginCapture(hs_, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+        if (hok) {
+            hok = record_helper(T, herr);
+            const cudaError_t hce = cudaStreamEndCapture(hs_, &hg);
+            hok = hok && hce == cudaSuccess && cudaGraphInstantiate(&hexec_[T], hg, 0) == cudaSuccess &&
+                  cudaGraphUpload(hexec_[T], hs_) == cudaSuccess && cudaStreamSynchronize(hs_) == cudaSuccess;
+            if (hg) cudaGraphDestroy(hg);
+        }
+        cudaSetDevice(launch_device_);
+        if (!hok) {
+            err = "verify: the coprocessor card's graph: " + (herr.empty() ? std::string("capture failed") : herr);
+            if (exec_[T]) { cudaGraphExecDestroy(exec_[T]); exec_[T] = nullptr; }
+            return false;
+        }
+        std::fprintf(stderr, "strata verify: captured the coprocessor card's side of the %d-token window\n", T);
+    }
     return true;
 }
 
@@ -791,6 +1194,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                    std::string& err) {
     using namespace strata::kernels;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    if (!commit_finish(err)) return false;   // 28.09.2026: the last window's commit, if it was left running
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[0].max_cells) { err = "verify: the window runs past the context"; return false; }
@@ -817,6 +1221,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (helper_) {   // 28.09.2026: this window's number for both cards' flags
+        *(volatile uint32_t*) h_epoch_ = ++epoch_;
+        *(volatile uint32_t*) h_herr_ = 0;
+        if (h_flagC_) *(volatile uint32_t*) h_flagC_ = 0;
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -825,6 +1234,15 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     VDBG("staged; launching\n");
     // 26.09.2026: the launch goes to `launch_thr_` (see the header); `issued` says whether it has returned, and
     // until it has, an idle stream means "not submitted yet", not "finished" - the watchdog below waits for it.
+    // 28.09.2026: the coprocessor card's graph first - it is small, and its first node waits on the main card anyway
+    if (helper_) {
+        const Clock::time_point th = Clock::now();
+        cudaSetDevice(hdev_);
+        const cudaError_t he = cudaGraphLaunch(hexec_[T], hs_);
+        cudaSetDevice(launch_device_);
+        if (he != cudaSuccess) { err = std::string("verify: coprocessor launch: ") + cudaGetErrorString(he); return false; }
+        ms_hlaunch += ms_since(th);
+    }
     bool issued = false;
     auto check_issued = [&]() -> bool {
         if (issued) return true;
@@ -906,6 +1324,15 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
+        if (h_flagC_ != nullptr && *(volatile uint32_t*) h_flagC_ != want) {   // 28.09.2026: nor the second card's
+            card2_->h_plan[0] = 0;
+            card2_->h_plan[1] = 0;
+            card2_->h_plan[2] = 0;
+            card2_->h_plan[3] = 0;
+            card2_->h_plan[4] = 0;                      // start[0]
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile uint32_t*) h_flagC_ = want;
+        }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
@@ -920,6 +1347,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    if (helper_) {
+        const cudaError_t hse = cudaStreamSynchronize(hs_);
+        if (hse != cudaSuccess) { err = std::string("verify: coprocessor: ") + cudaGetErrorString(hse); return false; }
+        if (*(volatile uint32_t*) h_herr_ != 0) {
+            err = "verify: a flag between the cards never came (step " + std::to_string(*(volatile uint32_t*) h_herr_) + ")";
+            return false;
+        }
+    }
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
@@ -990,6 +1425,12 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
 }
 
+void Verifier::publish_plan2(void* ctx) {
+    Verifier* v = (Verifier*) ctx;
+    _mm_sfence();
+    *(volatile uint32_t*) v->h_flagC_ = v->cur_layer_ + 1;
+}
+
 void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
     _mm_sfence();
@@ -1005,13 +1446,28 @@ bool Verifier::commit(int n_keep, std::string& err) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
-    for (int t = 0; t < n_keep; ++t) {
+    for (int t = 0; t < n_keep; ++t) {   // host state only: nothing on the device waits for it
         ss_->ple_prev[0] = ss_->ple_prev[1];
         ss_->ple_prev[1] = last_tokens_[t];
     }
+    if (commit_overlap_) {   // 28.09.2026: the drafter runs beside it; commit_finish waits
+        commit_pending_ = true;
+        ms_commit += ms_since(t0);
+        return true;
+    }
+    const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     ms_commit += ms_since(t0);
+    return true;
+}
+
+bool Verifier::commit_finish(std::string& err) {
+    if (!commit_pending_) return true;
+    const Clock::time_point t0 = Clock::now();
+    commit_pending_ = false;
+    const cudaError_t se = cudaStreamSynchronize(cs_);
+    ms_commit_wait += ms_since(t0);
+    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     return true;
 }
 

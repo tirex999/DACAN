@@ -4,6 +4,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/nvfp4_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include "ggml.h"
@@ -95,6 +96,24 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         std::memcpy(&sg, blob + f.scale_off, 4);
         std::memcpy(&su, blob + f.scale_off + 4, 4);
     }
+    // 28.09.2026: NVFP4 on AVX-512 VNNI, a row's codes decoded once for all tokens, every dot bitwise ggml's
+    static const bool nv512 = nvfp4_avx512_ok() && std::getenv("STRATA_NO_NVFP4_512") == nullptr;
+    if (nv512 && f.gu_type == (int) GGML_TYPE_NVFP4 && nt <= 8 && n <= kNvfp4MaxN) {
+        thread_local Nvfp4Act prep[8];
+        const Nvfp4Act* pa[8];
+        for (int t = 0; t < nt; ++t) { nvfp4_prepare(act[t], n, &prep[t]); pa[t] = &prep[t]; }
+        for (int r = r0; r < r1; ++r) {
+            float gv[8], uv[8];
+            nvfp4_dots2(blob + (size_t) r * f.gu_row, blob + f.up_off + (size_t) r * f.gu_row, n, pa, nt, gv, uv);
+            for (int t = 0; t < nt; ++t) {
+                float g = gv[t], u = uv[t];
+                g *= sg;
+                u *= su;
+                ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            }
+        }
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
@@ -115,6 +134,18 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     const int n = (int) f.n_ff;
     float sd = 1.f;
     if (f.scaled) std::memcpy(&sd, blob + f.scale_off + 8, 4);   // s_down (NVFP4)
+    static const bool nv512 = nvfp4_avx512_ok() && std::getenv("STRATA_NO_NVFP4_512") == nullptr;
+    if (nv512 && f.d_type == (int) GGML_TYPE_NVFP4 && nt <= 8 && n <= kNvfp4MaxN) {   // 28.09.2026, see native_gu_rows
+        thread_local Nvfp4Act prep[8];
+        const Nvfp4Act* pa[8];
+        for (int t = 0; t < nt; ++t) { nvfp4_prepare(hq[t], n, &prep[t]); pa[t] = &prep[t]; }
+        for (int r = r0; r < r1; ++r) {
+            float sv[8];
+            nvfp4_dots(blob + f.down_off + (size_t) r * f.d_row, n, pa, nt, sv);
+            for (int t = 0; t < nt; ++t) out[t][r] = sv[t] * sd;
+        }
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
         for (int t = 0; t < nt; ++t) {

@@ -26,7 +26,9 @@ Decode tokens/s through the OpenAI server on long coding answers (8–13K tokens
 Direct measurements on `main` (NVFP4 experts, greedy, one short prompt, 512 tokens, `--numa`, both cards; every step
 below leaves the output identical token for token): 65.97 tok/s after the port to v0.1.9 → 67.24 with the second
 card's rows over peer access → 69.11 with one weight read per expert group → 69.88 with the window's per-token
-small launches batched. Q8_0 experts made from the FP8 checkpoint: 64.4 tok/s (the arena is 128 GB and fewer experts
+small launches batched. With the second card as the main card's coprocessor (below): 73.07 → 79.49 tok/s against a
+control with the same experts on each executor, identical token for token (+8.8 %; 69.82 → 73.56 at ~24K tokens of
+context). Q8_0 experts made from the FP8 checkpoint: 64.4 tok/s (the arena is 128 GB and fewer experts
 fit on the cards), and the MTP drafts are accepted more often (0.733 vs 0.663). Long prompts, NVFP4: 65.8 tok/s at ~24K tokens of context, 52.8 at ~97K; prefill 310–330 tok/s.
 
 The sm_75 port alone, on one card and one socket: 25–39 tok/s on the same tasks. A direct single-prompt measurement of our 4-bit quant
@@ -52,6 +54,9 @@ bit. Full tables, scene screenshots and llama.cpp comparisons (in Russian):
 | **Q8_0 experts from the FP8 checkpoint.** `vec_dot_q8_0_q8_1` on the GPU, ggml on the CPU; `tools/q8_experts.py` requantizes Qwen's FP8 (128×128 block scales) the way `quantize_row_q8_0_ref` does: 0.55–0.59 % from the FP8 weights, NVFP4 is 9.8 % | `iq_kernels.cu`, `tools/q8_experts.py` | `native_experts.txt` v3 |
 | **Second card's rows over peer access.** The layer plan says where each row of the window's expert parts comes from; the main card pulls only the CPU's rows from mapped memory (was every row, ~0.5 MB a layer, mostly zeros) and the second card writes its rows straight into the main card's memory (NVLink here) | `verify.*`, `expert_source.*`, `elementwise.cu`, `generate.cpp` | `STRATA_CARD2_NVLINK=0` |
 | **Batched per-token launches.** The verify window ran its tiny projections once per token - router, shared-expert gate and its sigmoid, the f32→bf16 copy (and the QSA indexer's k and q in those 12 layers), plus the MTP router; now one launch for the window each (`bf16_gemv_fp32_mmvf_multi`, a block per row and token), every output bitwise as before | `native_bf16.cu`, `verify.cpp`, `shared_expert.cu`, `mtp.cpp` | — |
+| **The second card as a coprocessor of every layer.** Each card replays its own CUDA graph of the verify window; they meet on flags in device memory (`(epoch << 10) \| step`, a 5 s timeout), the second card pulls the layer's input over NVLink and writes its outputs into the main card's buffers: GDN alpha/beta and z (`z`), QSA q+gate (`q`), the second half of the head's rows (`h`) and its expert share from its own graph - the host only writes the plan to mapped memory and raises a flag (`e`). Same kernels on the same inputs: bitwise a control with the same experts on the second card (`STRATA_HELPER_RESERVE_ONLY=1`). 1.3 GB of the second card's VRAM for weight copies. `docs/TWO_DOMAINS.md` has the plan | `verify.*`, `verify_kernels.*`, `expert_source.*`, `native_mmvq.*`, `generate.cpp` | `STRATA_HELPER=1` (or letters `zqhe`, `o` = half the output projections, slower), `STRATA_COMMIT_OVERLAP=1` |
+| **NVFP4 experts on AVX-512 VNNI.** ggml-cpu has NVFP4 × Q8_0 in AVX2 only and unpacks a weight row again for every token; here a row is unpacked once for all the window's tokens and each token is one `VPDPBUSD` a block, the float part in ggml's exact operation order: bitwise ggml (0 of 13 608 differ), 1.3× / 1.9× / 2.5× / 2.7× a core on 1 / 2 / 3 / 4 tokens | `nvfp4_avx512.*`, `native_expert.cpp`, `nvfp4_parity.cpp` | `STRATA_NO_NVFP4_512=1` |
+| Pool: a static row schedule per worker group (was work stealing by atomics across both sockets; `pool_bench` 51 → 35 µs a layer, no gain in the engine yet); router and expert combine for all the window's tokens in one launch each | `pool.*`, `pool_bench.cpp`, `native_router.cu`, `native_moe.cu` | `STRATA_POOL_V1=1` |
 | **One weight read per expert group.** An expert is routed from ~1.3 of a window's tokens; for NVFP4 and Q8_0 a group of 2+ entries unpacks each weight once for all of them (bitwise the per-entry result); UE4M3 scales without `ldexpf` | `iq_kernels.cu`, `native_grouped_bench.cpp` | — |
 
 ## Build
@@ -112,7 +117,10 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
 - **RAM.** With `--numa` the n-gram table is locked in RAM: arena (61 GiB for 4-bit experts, 63 GiB NVFP4, 40 GiB ISTA
   IQ3_XXS) plus table (51 GiB Q8_0, 27 GiB IQ4_NL). `STRATA_PLE_LOCK=0` leaves the table in the page cache.
 - **Spinning pool.** During generation the workers occupy every physical core. Anything else on those cores (a build,
-  git, a VM) stalls the whole layer barrier: keep other work on the SMT siblings or wait.
+  git, a VM) stalls the whole layer barrier - and so does heavy work on their SMT siblings (a compile there cost us
+  several tok/s): keep measurements and builds apart.
+- **SMT.** One worker per logical CPU (`STRATA_SMT=1`, 126 workers) is slower: 76.5 vs 78.3 tok/s, `pool_bench` 59.6
+  vs 35.1 µs a layer - the experts are bound by the cores' vector units, not by the number of threads.
 - **Main card heat.** With both sockets feeding it, the main card runs at 100 % and reaches 84 °C, where the driver
   lowers clocks (1545 of 2100 MHz). Long answers suffer most; it needs airflow.
 - Measured and left as they are: `STRATA_ASYNC_LAUNCH=1` (graph launched from its own thread) — no gain;
@@ -121,8 +129,8 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
 - A Q8_0 output head needs `--vram-reserve-mib 1024`.
 - Tried and left off: huge pages for the arena, draft window 6, graph launch from a separate thread,
   `--second-card-dup` (+2.5 % with more misses).
-- The second card computes experts only; the dense part of every layer runs on the main card, so the second card sits
-  at 10–15 %. Tensor-parallel dense layers over NVLink are on the list.
+- Without `STRATA_HELPER` the second card computes experts only and sits at 10–15 %; with it, ~35 % of the round.
+  Tensor parallel by heads over NVLink is next (`docs/TWO_DOMAINS.md`).
 - One request at a time. The conversation cache (upstream v0.1.3+, `--prompt-cache`, 6 checkpoints by default) keeps
   the next turn of a conversation from re-reading the whole context; `turing-v0.1.2` has no cache.
 - A GPU-computed expert gives slightly different tokens than a CPU one (different activation quantization, both from

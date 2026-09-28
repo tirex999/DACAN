@@ -84,6 +84,9 @@ struct GpuPlanSink {
     int64_t staging_cap = 0;
     int64_t cap = 0;
     void (*publish)(void* ctx) = nullptr;
+    /// 28.09.2026: the second card's plan block for this layer is written (its own graph takes it from there, see
+    /// `SecondCard::in_graph`).  Called for every layer of a window, with an empty plan when the card has no share.
+    void (*publish2)(void* ctx) = nullptr;
     /// Starts the DMA copies of `n` host blobs (pinned) into staging slots 0..n-1 and signals the GPU when they land.
     void (*fetch)(void* ctx, const uint8_t* const* src, int n, size_t bytes) = nullptr;
     void* ctx = nullptr;
@@ -128,6 +131,11 @@ struct SecondCard {
     /// place there is its offset from `host_rows` (the verifier's `y_miss`).  Needs peer access card -> main card.
     float* peer_rows = nullptr;
     const float* host_rows = nullptr;
+    /// 28.09.2026 (the second card's experts from its own graph, Verifier part "e"): the host writes the plan block
+    /// (`h_plan`, mapped; `m_plan` its device alias) and calls the plan sink's `publish2` - no API call, no wait; the
+    /// card's graph copies the plan, pulls the activations over NVLink and writes the rows into `peer_rows`.
+    bool in_graph = false;
+    int32_t* m_plan = nullptr;
 };
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).

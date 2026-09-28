@@ -433,6 +433,38 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     check("wait_flag_ge");
 }
 
+namespace {
+__global__ void raise_flag64_kernel(unsigned long long* flag, const uint32_t* epoch, uint32_t step) {
+    __threadfence_system();
+    *(volatile unsigned long long*) flag = ((unsigned long long) *epoch << 10) | step;
+    __threadfence_system();
+}
+__global__ void wait_flag64_kernel(const volatile unsigned long long* flag, const uint32_t* epoch, uint32_t step,
+                                   volatile uint32_t* err) {
+    const unsigned long long want = ((unsigned long long) *epoch << 10) | step;
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    while (*flag < want) {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (t - t0 > 5000000000ull) {   // the other card's graph is gone: let the host fail the window
+            *err = step;
+            break;
+        }
+    }
+    __threadfence_system();
+}
+}  // namespace
+
+void raise_flag64(unsigned long long* flag, const uint32_t* epoch, uint32_t step, void* stream) {
+    raise_flag64_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, epoch, step);
+    check("raise_flag64");
+}
+
+void wait_flag64(const unsigned long long* flag, const uint32_t* epoch, uint32_t step, uint32_t* err, void* stream) {
+    wait_flag64_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, epoch, step, err);
+    check("wait_flag64");
+}
+
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
                           int n_tok, int64_t n, int code_bits, int code_bias, int group_elems, uint64_t row_codes,
                           uint64_t row_groups, float* out, void* stream) {

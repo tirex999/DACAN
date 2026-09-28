@@ -182,6 +182,17 @@ private:
     void drain_numa(int group);
     /// 27.09.2026: the tasks of a native row phase for `nb` experts; with groups it also sets their shares.
     int native_tasks(int mode, int nb);
+    /// 28.09.2026: THE STATIC SCHEDULE of the native row phases (modes 7 = gate/up, 8 = down).  The claiming
+    /// schedule costs every thread about six LOCKED operations per phase on three lines shared by both sockets
+    /// (`parked_`, `woke_`, one `done_` per task) - two phases a layer, ~60 threads: hundreds of cross-socket
+    /// cache-line transfers per layer for ~25 us of arithmetic.  Here a thread's rows are fixed by its place in
+    /// its group (its node's rows of every expert, cut in equal ranges), and it reports once per phase on its
+    /// group's own line; the host waits for the group counts.  Same rows, same kernels: bitwise the same.
+    void run_static(int mode, int nb);
+    void static_slice(int id);
+    bool static_ = true;                    // STRATA_POOL_V1=1 -> the claiming schedule
+    int snb_ = 0;                           // experts of the current static phase
+    std::vector<int> gidx_;                 // worker i's place in its group; the host is its group's last
 
     int n_ = 0;
     bool host_works_ = true;
@@ -195,6 +206,10 @@ private:
     GroupHead ghead_[kMaxGroups];   // each group's claim counter, on its own line
     int gtasks_[kMaxGroups] = {};
     int64_t grows_[kMaxGroups] = {};
+    // 28.09.2026: the static schedule's completion counts (see run_static)
+    struct alignas(64) GroupDone { std::atomic<uint32_t> v{0}; };
+    GroupDone gdone_[kMaxGroups];           // threads of group g done with a static phase, cumulative
+    uint32_t gtarget_[kMaxGroups] = {};
     // 27.09.2026: workers that have left the park for the current epoch.  A phase ends only when all of them have
     // (and re-parked), so no worker can wake into a phase that is over while the host rewrites the next one's state.
     alignas(64) std::atomic<uint32_t> woke_{0};

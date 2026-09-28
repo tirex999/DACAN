@@ -509,15 +509,24 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp)
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
+                                            src/kernels/cpu/nvfp4_avx512.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
-    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   else()
-    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
+    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
+  # 28.09.2026: the AVX-512 NVFP4 rows against ggml-cpu's own dot, bit for bit, and their speed on one core
+  add_executable(nvfp4_parity src/kernels/cpu/nvfp4_parity.cpp)
+  target_include_directories(nvfp4_parity PRIVATE third_party/ggml)
+  target_link_libraries(nvfp4_parity PRIVATE strata_kernels_cpu)
+  # 28.09.2026: one layer's CPU experts through the engine's NUMA pool, against one thread's time for the same work
+  add_executable(pool_bench src/kernels/cpu/pool_bench.cpp)
+  target_include_directories(pool_bench PRIVATE third_party/ggml)
+  target_link_libraries(pool_bench PRIVATE strata_kernels_cpu)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
   if(STRATA_ENABLE_CUDA)
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
@@ -527,6 +536,14 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_grouped_bench src/kernels/native_grouped_bench.cpp)
     target_include_directories(native_grouped_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(native_grouped_bench PRIVATE strata_kernels CUDA::cudart)
+    # 28.09.2026: dense projections whole vs split in two - what a tensor-parallel split would save
+    add_executable(mmvq_split_bench src/kernels/mmvq_split_bench.cpp)
+    target_include_directories(mmvq_split_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(mmvq_split_bench PRIVATE strata_kernels CUDA::cudart)
+    # 28.09.2026: the hyper-connection read on its own (timing, Nsight Compute, a hash to compare kernel versions)
+    add_executable(gr_bench src/kernels/gr_bench.cpp)
+    target_include_directories(gr_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(gr_bench PRIVATE strata_kernels CUDA::cudart)
   endif()
 endif()
 

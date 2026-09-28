@@ -38,6 +38,13 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// 28.09.2026 (the second card as the main card's coprocessor): flags in DEVICE memory between two cards, each
+/// holding (epoch << 10) | step (step < 1024) - `epoch` is a device copy of the window's number, taken at the start of each card's
+/// graph - so a flag only ever grows and needs no reset between windows.  `raise_flag64` fences the card's earlier
+/// work and sets the flag (which may live on the other card, peer access); `wait_flag64` spins on a flag in this
+/// card's memory and gives up after 5 s, writing `step` into `err` (mapped) so the host can fail the window.
+void raise_flag64(unsigned long long* flag, const uint32_t* epoch, uint32_t step, void* stream);
+void wait_flag64(const unsigned long long* flag, const uint32_t* epoch, uint32_t step, uint32_t* err, void* stream);
 
 /// Rows of the S2/S4/S8 embedding for T token ids read from DEVICE memory; out (T, n).  Bitwise `embedding_gather`.
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,

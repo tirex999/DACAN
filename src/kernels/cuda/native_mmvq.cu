@@ -995,12 +995,15 @@ struct SmallTraits {
 // llama.cpp's generic multi-column table (ncols 2-4: 4 warps; 5-8: 2 warps; always 2 rows per block): faster,
 // equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial sums differently).
 bool g_multi_exact = true;   // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
+// 28.09.2026: the output's column stride for ncols > 1 (0 = n_out), set only for the duration of native_mmvq_ld - a
+// block of rows of a bigger matrix written into its place (the coprocessor card's half of the head)
+thread_local int g_ldy = 0;
 
 template<typename F, int NCOLS, int NW, int ROWS>
 __launch_bounds__(NW * WARP, 1)
 __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w,
                                          const Q81Block* __restrict__ x,
-                                         float* __restrict__ y, int n_in, int n_out) {
+                                         float* __restrict__ y, int n_in, int n_out, int ldy) {
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * int(blockIdx.x);
@@ -1037,7 +1040,7 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
 #pragma unroll
             for (int l = 0; l < NW - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
             tmp[j][i] = warp_sum(tmp[j][i]);
-            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * ldy + row0 + i] = tmp[j][i];
         }
     }
 }
@@ -1046,26 +1049,27 @@ template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int ldy = g_ldy > 0 ? g_ldy : n_out;
     if (!g_multi_exact) {
         // 26.09.2026: STRATA_MMVQ_ROWS=4 - four rows per block of four warps (a quarter of the blocks of the exact
         // layout, each weight block still loaded once for all the columns); otherwise llama.cpp's 2-row table
         static const bool rows4 = std::getenv("STRATA_MMVQ_ROWS") != nullptr && std::atoi(std::getenv("STRATA_MMVQ_ROWS")) == 4;
         if (rows4) {
             const unsigned blocks4 = unsigned((std::size_t(n_out) + 3) / 4);
-            native_mmvq_multi_kernel<F, NCOLS, 4, 4><<<blocks4, dim3(WARP, 4), 0, s>>>(w, x, y, n_in, n_out);
+            native_mmvq_multi_kernel<F, NCOLS, 4, 4><<<blocks4, dim3(WARP, 4), 0, s>>>(w, x, y, n_in, n_out, ldy);
             return;
         }
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
-        native_mmvq_multi_kernel<F, NCOLS, NW, 2><<<blocks, dim3(WARP, NW), 0, s>>>(w, x, y, n_in, n_out);
+        native_mmvq_multi_kernel<F, NCOLS, NW, 2><<<blocks, dim3(WARP, NW), 0, s>>>(w, x, y, n_in, n_out, ldy);
         return;
     }
     const dim3 threads(WARP, WARPS);
     if (n_in / F::DIV < F::BPI) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        native_mmvq_multi_kernel<F, NCOLS, WARPS, WARPS><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
+        native_mmvq_multi_kernel<F, NCOLS, WARPS, WARPS><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out, ldy);
     } else {
-        native_mmvq_multi_kernel<F, NCOLS, WARPS, 1><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
+        native_mmvq_multi_kernel<F, NCOLS, WARPS, 1><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out, ldy);
     }
 }
 
@@ -1496,6 +1500,22 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
+}
+
+void native_mmvq_ld(int ggml_type, const void* weights, const void* x_q8_1, float* y, int ldy, int n_in, int n_out,
+                    int ncols, void* stream) {
+    if (ldy < n_out) throw std::invalid_argument("native MMVQ: the output stride is smaller than n_out");
+    const bool iq = ggml_type == 16 || ggml_type == 17 || ggml_type == 18 || ggml_type == 21 || ggml_type == 22 ||
+                    ggml_type == 29;
+    if (iq && ncols > 1 && ldy != n_out) throw std::invalid_argument("native MMVQ: no output stride for the i-quants");
+    g_ldy = ldy;
+    try {
+        native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
+    } catch (...) {
+        g_ldy = 0;
+        throw;
+    }
+    g_ldy = 0;
 }
 
 } // namespace strata::kernels

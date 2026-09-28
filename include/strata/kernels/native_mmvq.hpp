@@ -108,5 +108,9 @@ bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
+// 28.09.2026: the same with output column j at y + j * ldy (ldy >= n_out): rows [r0, r0 + n_out) of a bigger
+// matrix (weights advanced by r0 rows, y by r0) written into their place.  Not for the i-quants with ncols > 1.
+void native_mmvq_ld(int ggml_type, const void* weights, const void* x_q8_1, float* y, int ldy, int n_in, int n_out,
+                    int ncols, void* stream);
 
 } // namespace strata::kernels

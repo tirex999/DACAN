@@ -289,13 +289,17 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
     check_launch("doorbell_publish");
 }
 
+// 28.09.2026: one element per thread over as many blocks as it takes (was one block looping): each read crosses
+// PCIe, so a block of 128 threads walking a plan block of ~1600 ints paid a dozen round trips in a row - 15 us a
+// layer on each card
 __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) dst[i] = src[i];
 }
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
-    copy_i32_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
+    const unsigned blocks = (unsigned) (n + 127 < 64 * 128 ? (n + 127) / 128 : 64);
+    copy_i32_from_mapped_kernel<<<blocks, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
     check_launch("copy_i32_from_mapped");
 }
 

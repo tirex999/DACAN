@@ -61,7 +61,10 @@ std::vector<int> physical_cores(bool skip_first) {
     // workers per physical core halve the bandwidth the expert kernel is bound by.  Keep the first logical CPU
     // of each (package, core) pair, read from sysfs; if topology is unreadable, keep the list as it is.
     // (26.09.2026, 2x Xeon Ice Lake: the container's cpuset mixed siblings of the same cores.)
-    {
+    // 28.09.2026: STRATA_SMT=1 keeps the siblings too (one worker per LOGICAL CPU) - the halving above is the
+    // author's reasoning, not a measurement on this machine; the switch is there to measure it.
+    const char* smt = std::getenv("STRATA_SMT");
+    if (smt == nullptr || smt[0] != '1') {
         std::vector<int> firsts;
         std::vector<std::pair<int, int>> seen;
         bool ok = true;
@@ -233,8 +236,13 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, const PoolNuma*
     }
     if (n_ < 1) n_ = 1;
     group_of_.resize((size_t) n_, 0);
-    for (int i = 0; i < n_; ++i) ++gthreads_[group_of_[(size_t) i]];
+    gidx_.resize((size_t) n_, 0);
+    for (int i = 0; i < n_; ++i) gidx_[(size_t) i] = gthreads_[group_of_[(size_t) i]]++;   // place, then count
     if (host_works_) ++gthreads_[host_group_];
+    {
+        const char* v1 = std::getenv("STRATA_POOL_V1");
+        static_ = v1 == nullptr || v1[0] != '1';
+    }
     scratch_.resize((size_t) n_);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
@@ -303,6 +311,12 @@ void ExpertPool::worker(int id) {
         }
         if (stop_.load(std::memory_order_acquire)) return;
         seen = epoch_.load(std::memory_order_relaxed);
+        // 28.09.2026: a static phase - this thread's fixed rows, one count on its group's line, back to the park
+        // (the park counters are the claiming schedule's; the host waits for the group counts instead)
+        if (mode_ >= 7) {
+            static_slice(id);
+            continue;
+        }
         parked_.fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
         woke_.fetch_add(1, std::memory_order_acq_rel);     // 27.09.2026: and saying so (see `woke_`)
 
@@ -368,7 +382,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch) {
 
 void ExpertPool::native_rows(int e, int r0, int r1) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
-    if (mode_ == 5 && nfmt_->gu_type == 42) {
+    const bool gu = mode_ == 5 || mode_ == 7;   // 28.09.2026: 7/8 are the static schedule's gate/up and down
+    if (gu && nfmt_->gu_type == 42) {
         // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
         thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
         float* gp[MAXT];
@@ -380,7 +395,7 @@ void ExpertPool::native_rows(int e, int r0, int r1) {
         for (int t = 0; t < mjobs_[e].nt; ++t)
             for (int r = r0; r < r1; ++r)
                 sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
-    } else if (mode_ == 5) {
+    } else if (gu) {
         float* ff[MAXT];
         for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
         native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
@@ -417,6 +432,33 @@ void ExpertPool::drain_numa(int group) {
             done_.fetch_add(1, std::memory_order_release);
         }
     }
+}
+
+void ExpertPool::static_slice(int id) {
+    const int g = id < 0 ? host_group_ : group_of_[(size_t) id];
+    const int k = id < 0 ? gthreads_[host_group_] - 1 : gidx_[(size_t) id];
+    const int W = gthreads_[g];
+    const int per = mode_ == 7 ? FF : H;
+    const int lo = per * g / groups_, hi = per * (g + 1) / groups_, cnt = hi - lo;
+    const int64_t rows = (int64_t) snb_ * cnt;
+    const int64_t a = rows * k / W, b = rows * (k + 1) / W;
+    for (int64_t r = a; r < b;) {
+        const int e = (int) (r / cnt), r0 = lo + (int) (r % cnt);
+        const int r1 = (int) std::min<int64_t>(hi, r0 + (b - r));
+        native_rows(e, r0, r1);
+        r += r1 - r0;
+    }
+    gdone_[g].v.fetch_add(1, std::memory_order_release);
+}
+
+void ExpertPool::run_static(int mode, int nb) {
+    mode_ = mode;
+    snb_ = nb;
+    for (int g = 0; g < groups_; ++g) gtarget_[g] += (uint32_t) gthreads_[g];
+    publish();
+    if (host_works_) static_slice(-1);
+    for (int g = 0; g < groups_; ++g)
+        while (gdone_[g].v.load(std::memory_order_acquire) != gtarget_[g]) _mm_pause();
 }
 
 int ExpertPool::native_tasks(int mode, int nb) {
@@ -521,7 +563,8 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mtasks_ = 3 * threads;
         mrows_ = (int64_t) nb * FF;
         const auto a = std::chrono::steady_clock::now();
-        run_phase(5, native_tasks(5, nb));
+        if (static_) run_static(7, nb);
+        else run_phase(5, native_tasks(5, nb));
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e)
             for (int t = 0; t < mjobs_[e].nt; ++t)
@@ -529,7 +572,8 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * H;
-        run_phase(6, native_tasks(6, nb));
+        if (static_) run_static(8, nb);
+        else run_phase(6, native_tasks(6, nb));
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
         ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
