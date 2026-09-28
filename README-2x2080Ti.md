@@ -1,8 +1,10 @@
-# Strata on 2× RTX 2080 Ti and two Xeon sockets
+# DACAN (Дацан): Qwen3.8-Flash-Next on 2× RTX 2080 Ti and two Xeon sockets
 
-A fork of [Strata](https://github.com/Niko1221/Strata) (Qwen3.8-Flash-Next with the experts in system RAM) for older
-and server hardware: **Turing cards (sm_75), two GPUs, two CPU sockets with AVX-512**. Upstream Strata builds only for
-sm_80+ and uses one GPU and whatever cores the OS hands it.
+**DACAN** is our engine, a fork of [Strata](https://github.com/Niko1221/Strata) (Qwen3.8-Flash-Next with the experts
+in system RAM) rebuilt for older and server hardware: **Turing cards (sm_75), two GPUs joined by NVLink, two CPU sockets
+with AVX-512**. Upstream Strata builds only for sm_80+ and uses one GPU and whatever cores the OS hands it; DACAN runs
+the second card as a coprocessor of every layer, computes NVFP4 experts on AVX-512 VNNI and splits the expert arena by
+NUMA node. The binary and build targets are still called `strata`; "Strata" below means the upstream engine.
 
 `main` is upstream v0.1.9 (`9e599c0`) plus our changes; the conversation cache between requests, KV streaming, IQ3_S,
 prompt lookup and per-request sampling come from upstream. Checked against our v0.1.2 branch token for token: the same

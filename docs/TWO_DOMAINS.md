@@ -1,4 +1,4 @@
-# Two domains: socket + card + its memory, twice, NVLink between
+# DACAN: two domains - socket + card + its memory, twice, NVLink between
 
 The machine this fork is tuned on is two Xeon Ice Lake sockets (32 cores, 8 DDR4 channels, AVX-512 VNNI each) with
 one RTX 2080 Ti 22 GB on each socket's PCIe root and an NVLink bridge between the two cards. Strata was written for
