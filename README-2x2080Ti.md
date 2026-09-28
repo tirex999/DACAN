@@ -23,6 +23,12 @@ Decode tokens/s through the OpenAI server on long coding answers (8–13K tokens
 | ISTA GSQ-RCO IQ3_XXS | greedy (before sampling) | hamsters low / medium / xhigh | 68.5 / 60.8 / 50.1 | 8/8 each |
 | ISTA GSQ-RCO IQ3_XXS | greedy (before sampling) | aquarium low / medium / xhigh | 68.3 / 64.6 / 57.8 | 23 / 24 / 22 of 25 |
 
+Direct measurements on `main` (NVFP4 experts, greedy, one short prompt, 512 tokens, `--numa`, both cards; every step
+below leaves the output identical token for token): 65.97 tok/s after the port to v0.1.9 → 67.24 with the second
+card's rows over peer access → 69.11 with one weight read per expert group → 69.88 with the window's per-token
+small launches batched. Q8_0 experts made from the FP8 checkpoint: 64.4 tok/s (the arena is 128 GB and fewer experts
+fit on the cards), and the MTP drafts are accepted more often (0.733 vs 0.663). Long prompts, NVFP4: 65.8 tok/s at ~24K tokens of context, 52.8 at ~97K; prefill 310–330 tok/s.
+
 The sm_75 port alone, on one card and one socket: 25–39 tok/s on the same tasks. A direct single-prompt measurement of our 4-bit quant
 (IQ4_XS/IQ4_NL experts, Q8_0 dense and n-gram table) went 39.7 → 71.7 tok/s with `--numa`, output identical bit for
 bit. Full tables, scene screenshots and llama.cpp comparisons (in Russian):
@@ -43,6 +49,10 @@ bit. Full tables, scene screenshots and llama.cpp comparisons (in Russian):
 | Pool: one worker per physical core on Linux (dangling `else` in `physical_cores()`), a phase ends only when every worker has woken for it; idle sleep is upstream's (v0.1.3) | `pool.*` | — |
 | Hyper-connection kernels over the whole card (was 41 blocks on 68 SMs), equal to the originals up to fp32 rounding; PCIe miss path dropped from the graph at `--pcie-frac 0` | `fused_gr.cu`, `verify.*` | `STRATA_GR_V1=1` |
 | IQ4_XS experts on the GPU, Q8_0 token and n-gram tables | `iq_kernels.cu`, `ngram.*` | Q8_0 table: `--ple-io mmap` only |
+| **Q8_0 experts from the FP8 checkpoint.** `vec_dot_q8_0_q8_1` on the GPU, ggml on the CPU; `tools/q8_experts.py` requantizes Qwen's FP8 (128×128 block scales) the way `quantize_row_q8_0_ref` does: 0.55–0.59 % from the FP8 weights, NVFP4 is 9.8 % | `iq_kernels.cu`, `tools/q8_experts.py` | `native_experts.txt` v3 |
+| **Second card's rows over peer access.** The layer plan says where each row of the window's expert parts comes from; the main card pulls only the CPU's rows from mapped memory (was every row, ~0.5 MB a layer, mostly zeros) and the second card writes its rows straight into the main card's memory (NVLink here) | `verify.*`, `expert_source.*`, `elementwise.cu`, `generate.cpp` | `STRATA_CARD2_NVLINK=0` |
+| **Batched per-token launches.** The verify window ran its tiny projections once per token - router, shared-expert gate and its sigmoid, the f32→bf16 copy (and the QSA indexer's k and q in those 12 layers), plus the MTP router; now one launch for the window each (`bf16_gemv_fp32_mmvf_multi`, a block per row and token), every output bitwise as before | `native_bf16.cu`, `verify.cpp`, `shared_expert.cu`, `mtp.cpp` | — |
+| **One weight read per expert group.** An expert is routed from ~1.3 of a window's tokens; for NVFP4 and Q8_0 a group of 2+ entries unpacks each weight once for all of them (bitwise the per-entry result); UE4M3 scales without `ldexpf` | `iq_kernels.cu`, `native_grouped_bench.cpp` | — |
 
 ## Build
 
@@ -105,6 +115,8 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
   git, a VM) stalls the whole layer barrier: keep other work on the SMT siblings or wait.
 - **Main card heat.** With both sockets feeding it, the main card runs at 100 % and reaches 84 °C, where the driver
   lowers clocks (1545 of 2100 MHz). Long answers suffer most; it needs airflow.
+- Measured and left as they are: `STRATA_ASYNC_LAUNCH=1` (graph launched from its own thread) — no gain;
+  `--spec-min-p` 0.35 / 0.5 / 0.65 → 67.6 / 69.9 / 69.6 tok/s, 0.5 stays.
 - `--pcie-frac`: 0.15 with one card (the default 0.55 assumes PCIe 4.0), 0 with two.
 - A Q8_0 output head needs `--vram-reserve-mib 1024`.
 - Tried and left off: huge pages for the arena, draft window 6, graph launch from a separate thread,
