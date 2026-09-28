@@ -31,6 +31,19 @@ control with the same experts on each executor, identical token for token (+8.8 
 context). Q8_0 experts made from the FP8 checkpoint: 64.4 tok/s (the arena is 128 GB and fewer experts
 fit on the cards), and the MTP drafts are accepted more often (0.733 vs 0.663). Long prompts, NVFP4: 65.8 tok/s at ~24K tokens of context, 52.8 at ~97K; prefill 310–330 tok/s.
 
+The full 256K context (the OpenAI server, `--max-context 262144`, the coprocessor card on, sampling as served,
+no `max_tokens`): a code word hidden at 40 % depth of a code listing was found at every length —
+
+| prompt tokens | prefill | prefill tok/s | answer tok/s | code word |
+|---|---|---|---|---|
+| 7 844 | 25.4 s | 309 | 56.4 | found |
+| 24 246 | 80.6 s | 301 | 54.3 | found |
+| 105 017 | 6 min 9 s | 285 | 52.9 | found |
+| 195 164 | 12 min 12 s | 267 | 53.5 | found |
+
+Prefill runs on the main card alone and streams the experts it lacks over its one PCIe 3.0 link; the second card, NVLink
+and the CPUs sit idle in it (next on the list). A multi-turn chat re-reads only the new text (conversation cache).
+
 The sm_75 port alone, on one card and one socket: 25–39 tok/s on the same tasks. A direct single-prompt measurement of our 4-bit quant
 (IQ4_XS/IQ4_NL experts, Q8_0 dense and n-gram table) went 39.7 → 71.7 tok/s with `--numa`, output identical bit for
 bit. Full tables, scene screenshots and llama.cpp comparisons (in Russian):
@@ -82,8 +95,12 @@ CUDA_VISIBLE_DEVICES=1,0 ./build/strata --numa \
   --pack <pack> --native <shard 1> --ple-gguf <shard 2> --ple-io mmap \
   --expert-profile data/profile_other_2609.bin --expert-cache auto --adapt-every 0 \
   --second-card 1 --second-card-usage data/usage_other_2609.bin --pcie-frac 0 \
-  --prefill 2048 --spec 4 --spec-min-p 0.5 --mtp <mtp/rt> --max-context 131072 --kv int8 --tokens ...
+  --prefill 2048 --spec 4 --spec-min-p 0.5 --mtp <mtp/rt> --max-context 262144 --kv int8 --tokens ...
 ```
+
+With `STRATA_HELPER=zqhe STRATA_COMMIT_OVERLAP=1` in the environment the second card also computes part of every layer
+(+8.8 % on the verify round, output unchanged); it takes 1.3 GB of the second card's VRAM for weight copies. 256K of
+context costs the main card ~1.9 GB of expert cache (4043 slots instead of 4786 at 131K).
 
 The log should show `NUMA: the main card (...) is on node 1; the host loop on CPU 32, workers per group: 32 31`,
 `expert arena: ... placed by NUMA node` and `n-gram table: 50.7 of 50.7 GiB in memory ...; locked`.
@@ -123,6 +140,8 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
   vs 35.1 µs a layer - the experts are bound by the cores' vector units, not by the number of threads.
 - **Main card heat.** With both sockets feeding it, the main card runs at 100 % and reaches 84 °C, where the driver
   lowers clocks (1545 of 2100 MHz). Long answers suffer most; it needs airflow.
+- `--spec-split` (the window in two groups so the card and the CPUs overlap): 58.02 vs 73.07 tok/s, output identical -
+  experts shared by the two groups are computed twice on the CPUs (3.72 -> 4.41 distinct a layer). Leave it off.
 - Measured and left as they are: `STRATA_ASYNC_LAUNCH=1` (graph launched from its own thread) — no gain;
   `--spec-min-p` 0.35 / 0.5 / 0.65 → 67.6 / 69.9 / 69.6 tok/s, 0.5 stays.
 - `--pcie-frac`: 0.15 with one card (the default 0.55 assumes PCIe 4.0), 0 with two.

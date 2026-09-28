@@ -22,7 +22,8 @@ output (checked token for token against a control with the same experts on the s
 MTP draft) +8.5 %. Without `o` (1.3 GB of weight copies instead of 1.7, 145 more experts fit on the second card), the
 plan copied by many blocks, a faster row gather and the router / combine in one launch for the group: 73.07 -> 79.49
 tok/s against its control (+8.8 %, CPU pool 8.2 -> 4.4 ms a round, commit 0.89 -> 0.07); at ~24K tokens of context
-69.82 -> 73.56. Both pairs identical token for token.
+69.82 -> 73.56. Both pairs identical token for token. `--spec-split` (two groups a window, card and CPUs overlapped):
+58.02 tok/s against 73.07 - the CPUs compute experts shared by the groups twice; off.
 
 **CPU side**: NVFP4 expert rows on AVX-512 VNNI (`nvfp4_avx512.cpp`: ggml-cpu has only AVX2 for NVFP4 and decodes a
 row again for every token; bitwise ggml's result, 1.3x-2.9x per core); `pool_bench` / `nvfp4_parity`. SMT siblings as
@@ -47,3 +48,4 @@ The second card is busy ~35 % of the round.
 3. The CPU arena by domain (whole experts in their socket's memory), one planning thread per socket.
 4. The prompt path on both domains: the second card's VRAM tier and PCIe link unused today; the CPU sockets computing
    non-resident experts (VNNI GEMM over tens of tokens per expert) instead of streaming them over one PCIe link.
+   Today, at 256K of context: 309 tok/s at 8K, 301 at 24K, 285 at 105K, 267 at 195K (12 minutes for 195K tokens).
