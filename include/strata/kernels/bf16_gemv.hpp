@@ -51,4 +51,9 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t x_stride, const uint16_t* w, float* y, int64_t y_stride,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream);
 
+/// DACAN 29.09.2026: the same, 8 tokens a block - each weight pair read once for all 8, each output still
+/// bitwise the single call's (the same fused multiply-adds per token, the same reduction).  For many tokens.
+void bf16_gemv_fp32_mmvf_cols(const float* x, int64_t x_stride, const uint16_t* w, float* y, int64_t y_stride,
+                              int64_t n_in, int64_t n_out, int n_tok, void* stream);
+
 }  // namespace strata::kernels

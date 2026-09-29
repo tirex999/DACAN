@@ -86,6 +86,45 @@ __global__ void conv_residual_kernel(const float* history, const float* normaliz
     // Exact hidden/result alias is safe: each thread owns one element.
     result[c] = __fadd_rn(hidden[c], __fadd_rn(gated[c], activation));
 }
+// DACAN 29.09.2026: the kernels above for n_tok consecutive tokens (rows of D, values of N, gates of H), each
+// element computed exactly as the single-token kernel computes it.  The conv of token t reads the normalized rows
+// of tokens t-9, t-6, t-3 - from this batch when they are in it, else from the history (entry 9 + j holds token j
+// before the batch) - and the history ends up holding the batch's last nine rows, as nine single advances leave it.
+__global__ void broadcast_batch_kernel(const float* value, const float* gate, float* gated, int n_tok) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size_t(n_tok) * D) return;
+    const size_t t = i / D;
+    const int r = int(i % D);
+    gated[i] = __fmul_rn(value[t * N + r % N], gate[t * H + r / N]);
+}
+__global__ void conv_residual_batch_kernel(const float* history, const float* normalized,
+                                           const uint16_t* weights, float* hidden_result,
+                                           const float* gated, int n_tok) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size_t(n_tok) * D) return;
+    const int t = int(i / D), c = int(i % D);
+    float sum = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int j = t - HISTORY + 3 * k;
+        const float x = k == 3 ? normalized[i]
+                               : (j >= 0 ? normalized[size_t(j) * D + c] : history[c * HISTORY + HISTORY + j]);
+        const float w = __half2float(__ushort_as_half(weights[c * 4 + k]));
+        const float term = __fmul_rn(x, w);
+        sum = k == 0 ? term : __fadd_rn(sum, term);
+    }
+    const float activation = sum / (1.0f + expf(-sum));
+    hidden_result[i] = __fadd_rn(hidden_result[i], __fadd_rn(gated[i], activation));
+}
+__global__ void history_batch_kernel(float* history, const float* normalized, int n_tok) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= D) return;
+    float* column = history + size_t(c) * HISTORY;
+    for (int h = 0; h < HISTORY; ++h) {   // ascending: an old entry is read before it is overwritten
+        const int j = n_tok - HISTORY + h;
+        column[h] = j >= 0 ? normalized[size_t(j) * D + c] : column[h + n_tok];
+    }
+}
 struct Span { const void* p; size_t bytes; size_t alignment; };
 bool overlaps(Span a, Span b) {
     const auto x = reinterpret_cast<uintptr_t>(a.p), y = reinterpret_cast<uintptr_t>(b.p);
@@ -129,6 +168,23 @@ void native_ple_postops(const float* projected_key, const float* hidden,
     launch_check();
     native_gr_rms_norm_weighted(b.gated,w.norm_conv,b.normalized,N,H,NG_RMS_EPS,stream);
     conv_residual_kernel<<<D/256,256,0,st>>>(history,b.normalized,w.conv1d_f16,hidden,b.gated,b.conv,b.result);
+    launch_check();
+}
+void native_ple_postops_batch(const float* projected_key, float* hidden_result, const float* value, float* history,
+                              const PleWeights& w, float* key, float* query_normalized, float* gate, float* gated,
+                              int n_tok, void* stream) {
+    if (!stream || n_tok <= 0) throw std::invalid_argument("native PLE postops batch: no stream or no tokens");
+    auto st = static_cast<cudaStream_t>(stream);
+    native_gr_rms_norm_weighted_rep(projected_key, w.norm_key, key, N, H * n_tok, H, NG_RMS_EPS, stream);
+    native_gr_rms_norm_weighted_rep(hidden_result, w.norm_query, query_normalized, N, H * n_tok, H, NG_RMS_EPS, stream);
+    gate_kernel<<<H * n_tok, 512, 0, st>>>(key, query_normalized, gate, 1.0f / std::sqrt(float(N)));
+    const unsigned blocks = unsigned((size_t(n_tok) * D + 255) / 256);
+    broadcast_batch_kernel<<<blocks, 256, 0, st>>>(value, gate, gated, n_tok);
+    launch_check();
+    native_gr_rms_norm_weighted_rep(gated, w.norm_conv, query_normalized, N, H * n_tok, H, NG_RMS_EPS, stream);
+    conv_residual_batch_kernel<<<blocks, 256, 0, st>>>(history, query_normalized, w.conv1d_f16, hidden_result, gated,
+                                                        n_tok);
+    history_batch_kernel<<<(D + 255) / 256, 256, 0, st>>>(history, query_normalized, n_tok);
     launch_check();
 }
 } // namespace strata::kernels

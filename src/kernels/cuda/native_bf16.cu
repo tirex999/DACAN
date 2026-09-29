@@ -74,6 +74,61 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
     if (t == 0) y[blockIdx.x] = acc;
 }
 
+// DACAN 29.09.2026: the kernel above for up to 8 tokens a block (tokens blockIdx.y * 8 ...): each weight pair is
+// read once for all of them, and each token's accumulator gets exactly the single call's sequence of fused
+// multiply-adds and the same reduction, so every output is bitwise the single call's - with an eighth of the weight
+// traffic.
+template <int BLOCK_SIZE>
+__global__ void bf16_f32_mmvf_cols_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+                                          float* __restrict__ y, int n_in, long long x_stride, long long y_stride,
+                                          int n_tok) {
+    constexpr int NC = 8;
+    const int tok0 = blockIdx.y * NC;
+    const int nc = min(NC, n_tok - tok0);
+    const int t = threadIdx.x;
+    const uint16_t* row = w + (size_t) blockIdx.x * n_in;
+    const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
+    __shared__ float partials[NC][32];
+    if constexpr (BLOCK_SIZE > 32) {
+        if (t < 32) {
+#pragma unroll
+            for (int j = 0; j < NC; ++j) partials[j][t] = 0.0f;
+        }
+        __syncthreads();
+    }
+    float acc[NC];
+#pragma unroll
+    for (int j = 0; j < NC; ++j) acc[j] = 0.0f;
+    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+        const uint32_t weight = weights2[pair];
+        const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            if (j < nc) {
+                const float2 input = reinterpret_cast<const float2*>(x + (size_t) (tok0 + j) * x_stride)[pair];
+                acc[j] = __fmaf_rn(w0, input.x, acc[j]);
+                acc[j] = __fmaf_rn(w1, input.y, acc[j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < NC; ++j) acc[j] = mmvf_warp_sum(acc[j]);
+    if constexpr (BLOCK_SIZE > 32) {
+        if ((t & 31) == 0) {
+#pragma unroll
+            for (int j = 0; j < NC; ++j) partials[j][t / 32] = acc[j];
+        }
+        __syncthreads();
+        if (t < 32) {
+#pragma unroll
+            for (int j = 0; j < NC; ++j) acc[j] = mmvf_warp_sum(partials[j][t]);
+        }
+    }
+    if (t == 0) {
+        for (int j = 0; j < nc; ++j) y[(size_t) (tok0 + j) * y_stride + blockIdx.x] = acc[j];
+    }
+}
+
 int mmvf_block_size(int64_t n_in) {
     int best = 32;
     int64_t best_iterations = (n_in + 63) / 64;
@@ -125,5 +180,33 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t x_stride, const uint16_t*
         throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf launch: ") + cudaGetErrorString(result));
 }
 
+
+void bf16_gemv_fp32_mmvf_cols(const float* x, int64_t x_stride, const uint16_t* w, float* y, int64_t y_stride,
+                              int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+    if (n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
+        n_out <= 0 || n_out > std::numeric_limits<int>::max() || n_tok < 1 || n_tok > 65535 * 8)
+        throw std::invalid_argument("bf16_gemv_fp32_mmvf_cols: require positive even n_in and positive n_out <= INT_MAX");
+    if (x == nullptr || w == nullptr || y == nullptr ||
+        (reinterpret_cast<uintptr_t>(x) & 7u) != 0 ||
+        (reinterpret_cast<uintptr_t>(w) & 3u) != 0 ||
+        (reinterpret_cast<uintptr_t>(y) & 3u) != 0 ||
+        (n_tok > 1 && ((x_stride & 1) != 0)))
+        throw std::invalid_argument("bf16_gemv_fp32_mmvf_cols: null or misaligned pointer");
+    const cudaStream_t st = (cudaStream_t) stream;
+    const dim3 grid((unsigned) n_out, (unsigned) ((n_tok + 7) / 8));
+    switch (mmvf_block_size(n_in)) {
+        case 32: bf16_f32_mmvf_cols_kernel<32><<<grid, 32, 0, st>>>(x, w, y, (int) n_in, x_stride, y_stride, n_tok); break;
+        case 64: bf16_f32_mmvf_cols_kernel<64><<<grid, 64, 0, st>>>(x, w, y, (int) n_in, x_stride, y_stride, n_tok); break;
+        case 96: bf16_f32_mmvf_cols_kernel<96><<<grid, 96, 0, st>>>(x, w, y, (int) n_in, x_stride, y_stride, n_tok); break;
+        case 128: bf16_f32_mmvf_cols_kernel<128><<<grid, 128, 0, st>>>(x, w, y, (int) n_in, x_stride, y_stride, n_tok); break;
+        case 160: bf16_f32_mmvf_cols_kernel<160><<<grid, 160, 0, st>>>(x, w, y, (int) n_in, x_stride, y_stride, n_tok); break;
+        case 192: bf16_f32_mmvf_cols_kernel<192><<<grid, 192, 0, st>>>(x, w, y, (int) n_in, x_stride, y_stride, n_tok); break;
+        case 224: bf16_f32_mmvf_cols_kernel<224><<<grid, 224, 0, st>>>(x, w, y, (int) n_in, x_stride, y_stride, n_tok); break;
+        case 256: bf16_f32_mmvf_cols_kernel<256><<<grid, 256, 0, st>>>(x, w, y, (int) n_in, x_stride, y_stride, n_tok); break;
+    }
+    const cudaError_t result = cudaGetLastError();
+    if (result != cudaSuccess)
+        throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_cols launch: ") + cudaGetErrorString(result));
+}
 
 }  // namespace strata::kernels

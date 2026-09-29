@@ -24,6 +24,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -361,6 +362,51 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     // **NO `cudaStreamSynchronize` HERE.**  It was there to make the function self-contained for the parity
     // test, and inside a capture it is an error - a caller that wants the result immediately synchronises
     // itself, and the engine's caller does not want that at all.
+}
+
+
+// DACAN 29.09.2026: ple_block for n_tok consecutive tokens (see ple.hpp).
+bool ple_block_batch_supported(const PleWeights& w) {
+    return native_postops && native_bf16 && w.value_bf16 != nullptr &&
+           (w.key_bf16 != nullptr || (w.key_native_data != nullptr && w.key_native_type == 42));
+}
+
+uint64_t ple_block_batch_bytes(int max_tok) {
+    const uint64_t f = (uint64_t) max_tok * (4ull * NG_HC_DIM + NG_N_EMBD + NG_HC) * sizeof(float);
+    return ((f + 255) & ~255ull) + native_q8_1_bytes(NG_N_EMBD, 8) + 256;
+}
+
+void ple_block_batch(const float* emb, float* hidden, float* hist, const PleWeights& w, void* scratch, int n_tok,
+                     void* stream) {
+    if (!ple_block_batch_supported(w))
+        throw std::invalid_argument("ple_block_batch: needs a BF16 or native Q2_0 key, the native BF16 value and native post-ops");
+    if (emb == nullptr || hidden == nullptr || hist == nullptr || scratch == nullptr || stream == nullptr || n_tok <= 0)
+        throw std::invalid_argument("ple_block_batch: null input, scratch or stream, or no tokens");
+    const int n_embd = NG_N_EMBD, hc_dim = NG_HC_DIM;
+    float* pkey = (float*) scratch;                          // the projected keys
+    float* key = pkey + (size_t) n_tok * hc_dim;             // ...normalized
+    float* qn = key + (size_t) n_tok * hc_dim;               // the normalized query, then the normalized rows
+    float* gated = qn + (size_t) n_tok * hc_dim;
+    float* value = gated + (size_t) n_tok * hc_dim;
+    float* gate = value + (size_t) n_tok * n_embd;
+    const uint64_t f = (uint64_t) n_tok * (4ull * hc_dim + n_embd + NG_HC) * sizeof(float);
+    void* q8 = (uint8_t*) scratch + ((f + 255) & ~255ull);
+    if (w.key_bf16 != nullptr) {
+        // the BF16 key (as ple_block prefers it): 8 tokens a block, bitwise the single call's (bf16_gemv.hpp)
+        bf16_gemv_fp32_mmvf_cols(emb, n_embd, w.key_bf16, pkey, hc_dim, n_embd, hc_dim, n_tok, stream);
+    } else {
+        // the native key, up to 8 tokens a launch: in the exact multi-column layout every column is bitwise the
+        // single-token call's (native_mmvq.hpp); without it one token a launch
+        const int per = native_mmvq_multi_exact() ? 8 : 1;
+        for (int t0 = 0; t0 < n_tok; t0 += per) {
+            const int nc = std::min(per, n_tok - t0);
+            native_quantize_q8_1(emb + (size_t) t0 * n_embd, q8, n_embd, nc, stream);
+            native_mmvq(w.key_native_type, w.key_native_data, q8, pkey + (size_t) t0 * hc_dim, n_embd, hc_dim, nc, stream);
+        }
+    }
+    // the value projection, 8 tokens a block (bitwise the single call's, bf16_gemv.hpp)
+    bf16_gemv_fp32_mmvf_cols(emb, n_embd, w.value_bf16, value, n_embd, n_embd, n_embd, n_tok, stream);
+    native_ple_postops_batch(pkey, hidden, value, hist, w, key, qn, gate, gated, n_tok, stream);
 }
 
 }  // namespace strata::kernels

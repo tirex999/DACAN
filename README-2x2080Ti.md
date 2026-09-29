@@ -200,6 +200,25 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
   GDN, dense projections, routing), so during a prompt the second card sits at ~22 % (116 W) against the main card's
   91 % (235 W), and both run at ~90-99 % while answering. More prompt speed now needs those layers split across
   the cards (heads over NVLink, `docs/TWO_DOMAINS.md`), not a better expert split.
+- **Where a prompt's time goes.** The engine prints it per read (`strata prefill: N tokens in T ms, by section`),
+  from timing events at every section of every layer. The 19.3K prompt at 633 tok/s: MoE 7.5 s, QSA attention 6.0,
+  hyper-connection reads 4.2, PLE 3.0, QSA block selection 2.2, GDN 3.5. What changed after it:
+  - **BF16 projections on the FP16 tensor cores.** Turing's tensor cores take FP16, not BF16, so a BF16 `GemmEx`
+    (hyper-connections, router, alpha/beta, indexer) ran on the CUDA cores. `Gemm::bf16` now converts the weights and
+    the rows (in row tiles, in its scratch) to FP16 and runs the FP16 tensor-core GEMM with FP32 accumulation:
+    hyper-connections 4.2 -> 1.9 s, router 0.58 -> 0.34 s. The inputs are exact in FP16 (normed values, BF16's 8-bit
+    mantissa fits FP16's 11), the sums are ordered differently - the greedy answer took another phrasing from an early
+    near-tie ("canyon-1, copper, river, 46 grams" for "canyon-1, made of copper, kept near the river, weighs 46
+    grams"), all 25 facts right on two fresh documents. `STRATA_PREFILL_BF16_F16=0` goes back to the BF16 GEMM.
+  - **PLE in batches of 256 tokens** instead of ~10 launches a token: the same kernels per element, the BF16 key and
+    value through an exact 8-token MMVF (each weight pair read once for 8 tokens, each token's FMAs and reduction
+    unchanged - bitwise the single call). 3.0 -> 0.93 s. `STRATA_PLE_BATCH=0` keeps the token loop.
+  - **QSA block selection on both cards**: the second card selects the cells of a chunk's last queries (split by the
+    sum of positions - a query scores every block before it) from a copy of the pooled indexer keys; the same
+    kernels, the same cells. 2.2 -> 1.3 s. `STRATA_PREFILL_SEL2=0` keeps it on the main card.
+  The 19.3K prompt: 30.5 -> 24.2 s, **633 -> 798 tok/s**. The largest part left is QSA attention (6.0 s): the decode
+  kernel run per query, FP32 on the CUDA cores, every query reading its 2051 cells alone although neighbours select
+  nearly the same ones.
 - One request at a time. The conversation cache (upstream v0.1.3+, `--prompt-cache`, 6 checkpoints by default) keeps
   the next turn of a conversation from re-reading the whole context; `turing-v0.1.2` has no cache. In a Claude Code
   session that grew from 32K to 131K tokens, 70 turns in a row took 99 % of the prompt from the cache (2–6 s to read a

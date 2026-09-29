@@ -5,11 +5,30 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include <cuda_fp16.h>
+
 #include <cstdio>
 #include <cstdlib>
 
 namespace strata::prefill {
 namespace {
+
+// DACAN 29.09.2026: BF16 bits -> FP16 bits (round to nearest even), for the tensor-core path of Gemm::bf16
+__global__ void bf16_to_f16_kernel(const uint16_t* __restrict__ in, uint16_t* __restrict__ out, long long n) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half_as_ushort(__float2half_rn(__uint_as_float((uint32_t) in[i] << 16)));
+}
+
+void bf16_to_f16(const uint16_t* in, uint16_t* out, long long n, void* stream) {
+    if (n <= 0) return;
+    bf16_to_f16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(in, out, n);
+}
+
+// STRATA_PREFILL_BF16_F16=0 keeps the BF16 GemmEx (the CUDA cores)
+bool bf16_as_f16() {
+    static const bool on = std::getenv("STRATA_PREFILL_BF16_F16") == nullptr || std::getenv("STRATA_PREFILL_BF16_F16")[0] != '0';
+    return on;
+}
 
 void ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
@@ -67,6 +86,23 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                 float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+    // DACAN 29.09.2026: Turing's tensor cores take FP16, not BF16 - a BF16 GemmEx runs on the CUDA cores, several
+    // times slower (the hyper-connection projections alone were ~3 s of a 19K prompt).  With a scratch the weights and
+    // the rows (in row tiles) go to FP16 there and through the FP16 tensor-core GEMM; accumulation stays FP32.  Not
+    // bitwise the BF16 GEMM: FP16 keeps 3 more mantissa bits than BF16 but ends at 65504 (the inputs here are normed).
+    const int64_t w_elems = (N * K + 127) / 128 * 128;
+    if (bf16_as_f16() && scratch_ != nullptr && K > 0 && scratch_elems_ - w_elems >= K * 256) {
+        uint16_t* w16 = scratch_;
+        uint16_t* x16 = scratch_ + w_elems;
+        const int64_t tile = (scratch_elems_ - w_elems) / K;
+        bf16_to_f16(W, w16, (long long) (N * K), stream_);
+        for (int64_t t0 = 0; t0 < T; t0 += tile) {
+            const int64_t nt = T - t0 < tile ? T - t0 : tile;
+            bf16_to_f16(X + t0 * K, x16, (long long) (nt * K), stream_);
+            f16(x16, w16, Y + t0 * ldy, nt, N, K, ldy, beta);
+        }
+        return;
+    }
     const float alpha = 1.0f;
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,

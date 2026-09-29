@@ -15,4 +15,9 @@ namespace strata::kernels {
 void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* output,
                                  int n_cols, int n_rows, float epsilon, void* stream);
 
+// DACAN 29.09.2026: the same for many tokens at once - gamma holds `gamma_rows` rows and repeats (row r uses gamma
+// row r % gamma_rows); every row is bitwise what the call above gives for it.
+void native_gr_rms_norm_weighted_rep(const float* input, const float* gamma, float* output,
+                                     int n_cols, int n_rows, int gamma_rows, float epsilon, void* stream);
+
 } // namespace strata::kernels

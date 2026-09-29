@@ -116,4 +116,15 @@ void ple_history_advance(float* hist, const float* normalized, void* stream);
 /// Whether the CUDA path is available.  The host hash and the table read work without it; the block does not.
 bool ple_block_available();
 
+/// DACAN 29.09.2026: `ple_block` + `ple_history_advance` for n_tok consecutive tokens in a few launches instead of
+/// ~10 per token: `emb` holds n_tok rows of n_embd, `hidden` n_tok rows of hc_dim (overwritten with the results,
+/// as the prompt path passes result == hidden), `hist` is advanced by the batch.  Every output is bitwise the
+/// token-by-token one: the same kernels' arithmetic per element, the multi-token MMVF for a BF16 key (or the exact
+/// multi-column MMVQ for a native Q2_0 one) and for the value.  Only with the native BF16 value and native post-ops
+/// (`ple_block_batch_supported`); `scratch` holds `ple_block_batch_bytes(n_tok)`.
+bool ple_block_batch_supported(const PleWeights& w);
+uint64_t ple_block_batch_bytes(int max_tok);
+void ple_block_batch(const float* emb, float* hidden, float* hist, const PleWeights& w, void* scratch, int n_tok,
+                     void* stream);
+
 }  // namespace strata::kernels

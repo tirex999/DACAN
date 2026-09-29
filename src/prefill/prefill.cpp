@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <thread>
 #include <vector>
 
@@ -115,7 +116,14 @@ struct Prefill::Impl {
     std::vector<float> ple_emb_host;
     std::vector<uint32_t> ple_rows;
     float* ple_norm = nullptr;
+    uint8_t* ple_batch = nullptr;   // DACAN 29.09.2026: ple_block_batch's scratch for PLE_B tokens
     PrefillStats* stats = nullptr;
+    // DACAN 29.09.2026: where the prompt path's time goes - an event at every section boundary of every layer,
+    // read after each chunk (it syncs there anyway); `prof_ms` by section, printed per run
+    std::vector<cudaEvent_t> prof_ev;
+    std::vector<int> prof_lab;
+    size_t prof_n = 0;
+    double prof_ms[16] = {};
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
     strata::kernels::KvHostPools stage;
     int32_t* ident_table = nullptr;
@@ -148,6 +156,13 @@ struct Prefill::Impl {
         std::vector<double> ld1, ld2;
         std::vector<char> had;
         double rho = 1.0;
+        // DACAN 29.09.2026: the last queries' QSA block selection (see the QSA step): a copy of the pooled indexer
+        // keys and the dead row, the queries and steps, the scores of SEL2 queries at a time, the selected cells
+        bool sel_on = false;
+        float *sel_pooled = nullptr, *sel_dead = nullptr, *sel_q = nullptr, *sel_scores = nullptr;
+        int32_t *sel_steps = nullptr, *sel_ids = nullptr;
+        cudaEvent_t sel_ready = nullptr;           // main card: this layer's pooled keys and queries are written
+        cudaEvent_t sel_done = nullptr;            // second card: its selections are in the main card's sel_ids
         std::vector<void*> owned;
         // everything above, each piece with its own card current; safe on a half-built or empty state
         void release() {
@@ -166,6 +181,9 @@ struct Prefill::Impl {
                     stage_host[i] = nullptr;
                 }
                 if (dm_ready) cudaEventDestroy(dm_ready);
+                if (sel_done) cudaEventDestroy(sel_done);
+                sel_done = nullptr;
+                sel_on = false;
                 for (cudaEvent_t e : t2s) if (e) cudaEventDestroy(e);
                 for (cudaEvent_t e : t2e) if (e) cudaEventDestroy(e);
                 t2s.clear();
@@ -180,6 +198,8 @@ struct Prefill::Impl {
             cudaSetDevice(main_dev);
             if (xs_ready) cudaEventDestroy(xs_ready);
             xs_ready = nullptr;
+            if (sel_ready) cudaEventDestroy(sel_ready);
+            sel_ready = nullptr;
             for (cudaEvent_t e : t1s) if (e) cudaEventDestroy(e);
             for (cudaEvent_t e : t1e) if (e) cudaEventDestroy(e);
             t1s.clear();
@@ -231,6 +251,7 @@ Prefill::~Prefill() {
     if (!impl_) return;
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     impl_->c2.release();
+    for (cudaEvent_t e : impl_->prof_ev) if (e) cudaEventDestroy(e);
     for (int i = 0; i < STAGE; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -243,6 +264,8 @@ Prefill::~Prefill() {
 namespace {
 constexpr int64_t GEMM_SCRATCH = 32ll << 20;        // FP16 elements for the largest dequantized dense weight
 constexpr size_t GEMM_WS = 32u << 20;               // cuBLAS workspace
+constexpr int PLE_B = 256;                          // DACAN 29.09.2026: PLE tokens per batch (ple_block_batch)
+constexpr int64_t SEL2 = 64;                        // DACAN 29.09.2026: queries per scoring pass on the second card
 }
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
@@ -303,6 +326,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
+    m.ple_batch = o.take<uint8_t>((size_t) strata::kernels::ple_block_batch_bytes(PLE_B), ok);
     take_stage(o, ss, s, m.stage, ok);
     if (ok && m.stage.present()) {
         const int64_t pages = ss.qsa_states[0].n_pages;
@@ -335,6 +359,8 @@ bool Prefill::enable_card2(const core::SecondCard& sc, std::string& err) {
     int prev = 0;
     cudaGetDevice(&prev);
     bool ok = cudaSetDevice(c.dev) == cudaSuccess;
+    int64_t sel_rows = 0, sel_bytes = 0;
+    bool sel_want = false;
     // its buffers: 60% of a chunk's rows, or fewer if the card has less free beside its expert cache and the decode
     // helper (with 8K-token chunks ~1.2 GB would be needed, ~0.7 GB is free).  They cap a GROUP, not its share - the
     // MoE step sends a larger share over in groups - so they must hold one expert's rows: up to a chunk's tokens.
@@ -344,7 +370,20 @@ bool Prefill::enable_card2(const core::SecondCard& sc, std::string& err) {
         const int64_t per_row = N * 2 + 1280 * 4 + 640 * 2 + N * 4;   // Xs + GU + Hh + Dm
         const int64_t fixed = (int64_t) DQ * (1280 * 2560 + 2560 * 640) * 2 + (int64_t) STAGE * MAXBLOB() + (32ll << 20);
         const int64_t reserve = 192ll << 20;
-        const int64_t fit = ((int64_t) free_b - reserve - fixed - (8ll << 20)) / per_row;
+        // DACAN 29.09.2026: the QSA selection of the last queries (see the QSA step) comes off the same free memory
+        static const bool sel_env = std::getenv("STRATA_PREFILL_SEL2") == nullptr || std::getenv("STRATA_PREFILL_SEL2")[0] != '0';
+        sel_rows = (m.ss->qsa_states != nullptr && m.g->n_qsa_layers() > 0) ? m.ss->qsa_states[0].idx_pooled_rows : 0;
+        sel_want = sel_env && sel_rows > 2 && m.cap > 0 && m.max_blocks > 0;
+        const int64_t idx_dim = (int64_t) m.g->idx_key_dim;
+        sel_bytes = sel_want ? (sel_rows * idx_dim + idx_dim + m.T * 512 + SEL2 * m.max_blocks) * 4 +
+                                   m.T * (int64_t) strata::kernels::kStepCount * 4 + m.T * m.cap * 4 + (8ll << 20)
+                             : 0;
+        int64_t fit = ((int64_t) free_b - reserve - fixed - sel_bytes - (8ll << 20)) / per_row;
+        if (sel_want && fit < m.T) {   // the experts come first: without room for both, no selection here
+            sel_want = false;
+            sel_bytes = 0;
+            fit = ((int64_t) free_b - reserve - fixed - (8ll << 20)) / per_row;
+        }
         c.rows_cap = std::min<int64_t>(m.T * K * 6 / 10, fit);
         if (c.rows_cap < m.T) {
             err = "prefill: the second card has only " + std::to_string((long long) (free_b >> 20)) + " MiB free";
@@ -390,6 +429,16 @@ bool Prefill::enable_card2(const core::SecondCard& sc, std::string& err) {
         c.ld1.assign(L, 0.0);
         c.ld2.assign(L, 0.0);
         c.had.assign(L, 0);
+        if (ok && sel_want) {
+            const size_t idx_dim = (size_t) m.g->idx_key_dim, T = (size_t) m.T;
+            c.sel_pooled = o.take<float>((size_t) sel_rows * idx_dim, ok);
+            c.sel_dead = o.take<float>(idx_dim, ok);
+            c.sel_q = o.take<float>(T * 512, ok);
+            c.sel_steps = o.take<int32_t>(T * (size_t) strata::kernels::kStepCount, ok);
+            c.sel_scores = o.take<float>((size_t) SEL2 * (size_t) m.max_blocks, ok);
+            c.sel_ids = o.take<int32_t>(T * (size_t) m.cap, ok);
+            ok = ok && cudaEventCreateWithFlags(&c.sel_done, cudaEventDisableTiming) == cudaSuccess;
+        }
     }
     if (ok) {
         ok = cudaSetDevice(c.main_dev) == cudaSuccess;
@@ -399,6 +448,7 @@ bool Prefill::enable_card2(const core::SecondCard& sc, std::string& err) {
             (void) cudaGetLastError();
         }
         ok = ok && cudaEventCreateWithFlags(&c.xs_ready, cudaEventDisableTiming) == cudaSuccess;
+        if (sel_want) ok = ok && cudaEventCreateWithFlags(&c.sel_ready, cudaEventDisableTiming) == cudaSuccess;
         const size_t L = (size_t) m.g->n_layers;   // ...and the main card's
         c.t1s.assign(L, nullptr);
         c.t1e.assign(L, nullptr);
@@ -413,6 +463,10 @@ bool Prefill::enable_card2(const core::SecondCard& sc, std::string& err) {
         return false;
     }
     c.on = true;
+    c.sel_on = sel_want;
+    if (sel_want)
+        std::fprintf(stderr, "strata serve: the second card also selects the QSA cells of a chunk's last queries "
+                             "(%.0f MiB)\n", (double) sel_bytes / 1048576.0);
     return true;
 }
 
@@ -444,6 +498,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     for (int i = 0; i < STAGE; ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
+    o.take<uint8_t>((size_t) strata::kernels::ple_block_batch_bytes(PLE_B), ok);
     strata::kernels::KvHostPools stage;
     take_stage(o, ss, s, stage, ok);
     return o.used + (8u << 20);   // alignment slack
@@ -476,6 +531,23 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
+    // DACAN 29.09.2026: the sections of the prompt path's time (see prof_ev); a mark closes the previous section
+    enum { P_OTHER, P_PLE, P_HC, P_GDN_PROJ, P_GDN_SCAN, P_GDN_OUT, P_QSA_PROJ, P_QSA_IDX, P_QSA_SEL, P_QSA_ATTN, P_QSA_OUT,
+           P_MOE_ROUTE, P_MOE, P_HC_WRITE, P_N };
+    static const char* const P_NAME[P_N] = {"other", "ple", "hc", "gdn proj", "gdn scan", "gdn out", "qsa proj",
+                                           "qsa idx", "qsa sel", "qsa attn", "qsa out", "moe route", "moe", "hc write"};
+    std::fill(std::begin(m.prof_ms), std::end(m.prof_ms), 0.0);
+    m.prof_n = 0;
+    auto mark = [&](int lab) {   // on the main card, which is current wherever this is called
+        if (m.prof_n == m.prof_ev.size()) {
+            cudaEvent_t e = nullptr;
+            if (cudaEventCreate(&e) != cudaSuccess) { (void) cudaGetLastError(); return; }
+            m.prof_ev.push_back(e);
+            m.prof_lab.push_back(0);
+        }
+        m.prof_lab[m.prof_n] = lab;
+        cudaEventRecord(m.prof_ev[m.prof_n++], m.cs);
+    };
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
@@ -489,6 +561,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         ++stats_.chunks;
+        mark(P_OTHER);
         // ---- embeddings, broadcast to the four streams
         for (int64_t t = 0; t < T; ++t) {
             const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
@@ -528,21 +601,43 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             const core::LayerView v(*m.wt, l);
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on) {
+                mark(P_PLE);
                 const auto tp = Clock::now();
-                for (int64_t t = 0; t < T; ++t) {
-                    strata::kernels::PleOut po;
-                    po.normalized = m.ple_norm;
-                    po.result = m.R + t * D;
-                    try {
-                        strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
-                                                   ss.ple.scratch, m.cs);
-                    } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
-                    strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
+                // DACAN 29.09.2026: PLE_B tokens at a time (ple_block_batch: a few launches instead of ~10 a token,
+                // every output bitwise the same); STRATA_PLE_BATCH=0 keeps the token-by-token loop
+                static const bool ple_batch_on = std::getenv("STRATA_PLE_BATCH") == nullptr ||
+                                                 std::getenv("STRATA_PLE_BATCH")[0] != '0';
+                const bool ple_batch = ple_batch_on && m.ple_batch != nullptr && strata::kernels::ple_block_batch_supported(ss.ple.w);
+                if (static bool said = false; !said) {
+                    said = true;
+                    std::fprintf(stderr, "strata prefill: PLE %s\n", ple_batch ? (ss.ple.w.key_bf16 ? "in batches (BF16 key)" : "in batches (native key)")
+                                                                     : "token by token");
+                }
+                if (ple_batch) {
+                    for (int64_t t0 = 0; t0 < T; t0 += PLE_B) {
+                        const int nb = (int) std::min<int64_t>(PLE_B, T - t0);
+                        try {
+                            strata::kernels::ple_block_batch(m.ple_emb + t0 * N, m.R + t0 * D, ss.ple.hist, ss.ple.w,
+                                                             m.ple_batch, nb, m.cs);
+                        } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
+                    }
+                } else {
+                    for (int64_t t = 0; t < T; ++t) {
+                        strata::kernels::PleOut po;
+                        po.normalized = m.ple_norm;
+                        po.result = m.R + t * D;
+                        try {
+                            strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
+                                                       ss.ple.scratch, m.cs);
+                        } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
+                        strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
+                    }
                 }
                 stats_.ms_ple += ms_since(tp);
             }
             for (int half = 0; half < 2; ++half) {
                 // ---- the hyper-connection read of this half
+                mark(P_HC);
                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
                 const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
                                   su = std::string(pre) + "up.weight", si = std::string(pre) + "inject.weight";
@@ -566,13 +661,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
                     float* state = ss.gdn_state + (size_t) gdn_index * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    mark(P_GDN_PROJ);
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV)) return false;
+                    mark(P_GDN_SCAN);
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
+                    mark(P_GDN_OUT);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
@@ -586,6 +684,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                           *wiqn = need(v, "indexer.q_norm.weight", err),
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
+                    mark(P_QSA_PROJ);
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
                     if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
@@ -618,6 +717,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     rope(m.q_idx, T, 4, 128, 512, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
                     // the indexer appends, token by token; then scores + selection for many queries at once:
                     // a query reads completed blocks (final once completed) and `dead` for its own tail block
+                    mark(P_QSA_IDX);
                     const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     for (int64_t t = 0; t < T; ++t) {
                         const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
@@ -627,14 +727,52 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                                        (float) strata::kernels::qsa_freq_base(), m.cs);
                         } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     }
-                    for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
-                        const int64_t nb = std::min(m.sel_batch, T - t0);
+                    mark(P_QSA_SEL);
+                    // DACAN 29.09.2026: the second card selects the cells of the chunk's last queries [split, T) while
+                    // the main card selects the first ones.  A query's work grows with its position (it scores every
+                    // block before it), so the split gives both parts the same sum of positions.  It needs the pooled
+                    // keys up to the chunk's last block and the dead row (just written by the appends above), the
+                    // queries and their steps; the same kernels on the same inputs: the same cells.
+                    int64_t split = T;
+                    if (m.c2.sel_on && T >= 512) {
+                        Impl::Card2& c = m.c2;
+                        const double P = (double) p0, Sall = (double) T * P + (double) T * (double) (T - 1) / 2.0;
+                        const double b = 2.0 * P - 1.0;
+                        split = std::clamp<int64_t>((int64_t) ((-b + std::sqrt(b * b + 4.0 * Sall)) / 2.0), 0, T);
+                        const int64_t n2 = T - split;
+                        if (n2 > 0) {
+                            const int64_t rows = std::min<int64_t>(st.idx_pooled_rows, (p0 + T) / s.idx_block + 1);
+                            cudaEventRecord(c.sel_ready, m.cs);
+                            cudaSetDevice(c.dev);
+                            cudaStreamWaitEvent(c.cs, c.sel_ready, 0);
+                            cudaMemcpyPeerAsync(c.sel_pooled, c.dev, st.idx_pooled, c.main_dev, (size_t) rows * s.idx_dim * 4, c.cs);
+                            cudaMemcpyPeerAsync(c.sel_dead, c.dev, st.idx_dead, c.main_dev, (size_t) s.idx_dim * 4, c.cs);
+                            cudaMemcpyPeerAsync(c.sel_q, c.dev, m.q_idx + split * 512, c.main_dev, (size_t) n2 * 512 * 4, c.cs);
+                            cudaMemcpyPeerAsync(c.sel_steps, c.dev, m.steps_dev + split * strata::kernels::kStepCount,
+                                                c.main_dev, (size_t) n2 * strata::kernels::kStepCount * 4, c.cs);
+                            for (int64_t t0 = 0; t0 < n2; t0 += SEL2) {
+                                const int64_t nb = std::min<int64_t>(SEL2, n2 - t0);
+                                const int32_t* steps0 = c.sel_steps + t0 * strata::kernels::kStepCount;
+                                strata::kernels::qsa_block_scores(c.sel_pooled, c.sel_dead, c.sel_q + t0 * 512, steps0, nb,
+                                                                  m.max_blocks, s, c.sel_scores, c.cs);
+                                strata::kernels::qsa_block_topk(c.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
+                                                                c.sel_ids + t0 * m.cap, c.cs);
+                            }
+                            cudaMemcpyPeerAsync(m.sel_ids + split * m.cap, c.main_dev, c.sel_ids, c.dev,
+                                                (size_t) n2 * (size_t) m.cap * 4, c.cs);
+                            cudaEventRecord(c.sel_done, c.cs);
+                            cudaSetDevice(c.main_dev);
+                        }
+                    }
+                    for (int64_t t0 = 0; t0 < split; t0 += m.sel_batch) {
+                        const int64_t nb = std::min(m.sel_batch, split - t0);
                         const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
                         strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                           m.max_blocks, s, m.sel_scores, m.cs);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs);
                     }
+                    if (split < T) cudaStreamWaitEvent(m.cs, m.c2.sel_done, 0);   // its selections are in sel_ids now
                     // STRATA_IDX_FP16_CHECK: would FP16 pooled indexer keys select the same cells? (the KV-streaming
                     // design's last question). Every query is selected again from the pooled keys and `dead` rounded
                     // to fp16 (exactly what an fp16 store reads back); the agreement with the fp32 selection is
@@ -700,6 +838,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                         }
                     }
+                    mark(P_QSA_ATTN);
                     const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                        : core::qsa_attn_pools(st);
                     for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
@@ -710,10 +849,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
+                    mark(P_QSA_OUT);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
                     ++qsa_index;
                 } else {
                     // ======================= MoE =======================
+                    mark(P_MOE_ROUTE);
                     const core::WeightRef *wr = need(v, "ffn_gate_inp.weight", err),
                                           *wgi = need(v, "ffn_gate_inp_shexp.weight", err),
                                           *wsg = need(v, "ffn_gate_shexp.weight", err),
@@ -820,6 +961,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // Its buffers hold `rows_cap` rows, so its share goes in groups of whole experts of at most that
                     // many rows: a group's rows in, its experts, its results back - all on its one stream, so the
                     // next group's rows never overwrite rows still in use.
+                    mark(P_MOE);
                     if (m.c2.on) cudaEventRecord(m.c2.t1s[(size_t) l], m.cs);   // the main card's MoE time starts
                     if (!order2.empty()) {
                         Impl::Card2& c = m.c2;
@@ -982,10 +1124,24 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                 }
                 // ---- the hyper-connection write of this half
+                mark(P_HC_WRITE);
                 gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
                 if (half == 1 && strata::kernels::cvec().covers(l))   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
+        }
+        {   // DACAN 29.09.2026: this chunk's time by section
+            mark(P_OTHER);
+            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            for (size_t i = 0; i + 1 < m.prof_n; ++i) {
+                float x = 0.0f;
+                if (cudaEventElapsedTime(&x, m.prof_ev[i], m.prof_ev[i + 1]) == cudaSuccess) m.prof_ms[m.prof_lab[i]] += x;
+                else (void) cudaGetLastError();
+            }
+            m.prof_n = 0;
         }
         if (m.c2.on) {
             // DACAN 29.09.2026: the balance.  Each card's MoE time in this chunk over the load it was given is its ms
@@ -1029,6 +1185,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
         err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
         return false;
+    }
+    if (n >= 1024) {   // DACAN 29.09.2026: where the time went
+        std::fprintf(stderr, "strata prefill: %lld tokens in %.0f ms, by section (ms):", (long long) n, ms_since(t_start));
+        for (int i = 0; i < P_N; ++i)
+            if (m.prof_ms[i] >= 0.5) std::fprintf(stderr, " %s %.0f", P_NAME[i], m.prof_ms[i]);
+        std::fprintf(stderr, "\n");
     }
     stats_.ms_total += ms_since(t_start);
     if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them

@@ -27,4 +27,12 @@ void native_ple_postops(const float* projected_key, const float* hidden,
                         const PleWeights& weights, const NativePlePostopsBuffers& buffers,
                         void* stream);
 
+// DACAN 29.09.2026: the same for n_tok consecutive tokens (every buffer holds n_tok rows back to back), each output
+// bitwise the single-token call's; `hidden_result` is read and overwritten in place, and the history is advanced by
+// the batch (what n_tok ple_history_advance calls with the normalized rows would leave).  `query_normalized` holds
+// the normalized rows afterwards.
+void native_ple_postops_batch(const float* projected_key, float* hidden_result, const float* value, float* history,
+                              const PleWeights& weights, float* key, float* query_normalized, float* gate, float* gated,
+                              int n_tok, void* stream);
+
 } // namespace strata::kernels
