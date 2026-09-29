@@ -34,7 +34,7 @@ The loader refuses any other geometry (`Qwen4ExpGuard` in `include/strata/artifa
 288 / 320 experts and the like) do not.
 
 Weights packed for DACAN: **[tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN)**
-(uploading): Q8_0 experts we requantized from Qwen's FP8 checkpoint, NVIDIA's
+(26 files, 254.6 GB): Q8_0 experts we requantized from Qwen's FP8 checkpoint, NVIDIA's
 [NVFP4 experts](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) repacked, the dense part, the n-gram table and
 the MTP layer. Also usable: the [ISTA-DASLab GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 quants. Licenses: the model's [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE);
@@ -103,7 +103,7 @@ bit. Full tables, scene screenshots and llama.cpp comparisons (in Russian):
 ## Build
 
 ```bash
-git clone https://github.com/tirex999/strata-2x2080ti && cd strata-2x2080ti   # main; -b turing-v0.1.2 for the old base
+git clone https://github.com/tirex999/DACAN && cd DACAN   # main; -b turing-v0.1.2 for the old base
 # dependencies, model pack, MTP: as in upstream's README (setup.sh, tools/iq_pack.py, tools/mtp_fetch.py, tools/mtp_rt.py)
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON \
       -DCMAKE_CUDA_ARCHITECTURES=75 -DSTRATA_GGML_DIR=/path/to/llama.cpp

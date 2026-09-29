@@ -12,7 +12,7 @@
 >   shape run, other models and pruned variants (REAP etc.) do not.
 > - **Weights for DACAN:** [tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN)
 >   — our Q8_0 experts from the FP8 checkpoint, NVIDIA's NVFP4 experts repacked, the dense part, the n-gram table and
->   the MTP layer (uploading). The [ISTA-DASLab GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+>   the MTP layer (26 files, 254.6 GB). The [ISTA-DASLab GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 >   quants work too.
 > - Setup, measurements and what changed: **[README-2x2080Ti.md](README-2x2080Ti.md)**. Below is upstream Strata's README.
 
