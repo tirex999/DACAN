@@ -123,7 +123,7 @@ CUDA_VISIBLE_DEVICES=1,0 ./build/strata --numa \
   --pack <pack> --native <shard 1> --ple-gguf <shard 2> --ple-io mmap \
   --expert-profile data/profile_other_2609.bin --expert-cache auto --adapt-every 0 \
   --second-card 1 --second-card-usage data/usage_other_2609.bin --pcie-frac 0 \
-  --prefill 2048 --spec 4 --spec-min-p 0.5 --mtp <mtp/rt> --max-context 262144 --kv int8 --tokens ...
+  --prefill 8192 --spec 4 --spec-min-p 0.5 --mtp <mtp/rt> --max-context 262144 --kv int8 --tokens ...
 ```
 
 With `STRATA_HELPER=zqhe STRATA_COMMIT_OVERLAP=1` in the environment the second card also computes part of every layer
@@ -185,6 +185,21 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
   own cache holds and a share of the ones streamed from RAM, over its own PCIe link; its rows go over NVLink and back.
   A fresh 19.3K-token prompt: 65.3 s -> 40.1 s (296 -> 483 tok/s), the second card took 55 % of the expert rows, the
   answer identical token for token. `STRATA_PREFILL_CARD2=0` keeps the prompt on one card.
+- **8K-token prompt chunks** (`--prefill 8192`, was 2048): the same prompt in 30.5 s (633 tok/s), the answer identical
+  again - a chunk streams the experts it lacks from RAM once, and it now carries four times the tokens. The prompt
+  path's buffers grow to 5.59 GiB, lent by 2170 of the main card's 4043 cache slots (609 slots, 1.57 GiB at 2048) and
+  refilled after the prompt. The second card has only ~0.7 GB free beside its 19 GiB of experts and the decode helper
+  (60 % of an 8K chunk's rows needs ~1.2 GB): a first cut capped its share by that and left it at 5-9 % while the
+  main card ran at 100 % (608 tok/s). Now its buffers size a *group*, not its share: its rows go over NVLink group by
+  group (`the second card's buffers hold 20544 expert rows at a time`), and it takes 55 % of the rows again.
+- **The balance is measured.** Each expert goes to the card that would finish it first (in its cache: 1 unit, in the
+  other card's cache - weights over NVLink: 2, streamed from RAM: 3, plus rows / 64), the second card's units scaled
+  by its measured MoE time per unit over the main card's, learned chunk by chunk. The request line shows it:
+  `MoE 7.0 s main / 6.9 s second, balance 0.98, 7882 experts over NVLink` for the 19.3K prompt - the experts were
+  already split evenly. Of the 30.5 s read, the MoE takes 7; the other ~23 s are the main card's alone (attention,
+  GDN, dense projections, routing), so during a prompt the second card sits at ~22 % (116 W) against the main card's
+  91 % (235 W), and both run at ~90-99 % while answering. More prompt speed now needs those layers split across
+  the cards (heads over NVLink, `docs/TWO_DOMAINS.md`), not a better expert split.
 - One request at a time. The conversation cache (upstream v0.1.3+, `--prompt-cache`, 6 checkpoints by default) keeps
   the next turn of a conversation from re-reading the whole context; `turing-v0.1.2` has no cache. In a Claude Code
   session that grew from 32K to 131K tokens, 70 turns in a row took 99 % of the prompt from the cache (2–6 s to read a

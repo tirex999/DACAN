@@ -2983,6 +2983,8 @@ int main(int argc, char** argv) {
             cur = ids;
             const Clock::time_point r0 = Clock::now();
             const int64_t c2_experts0 = sp.stats().experts_card2, c2_rows0 = sp.stats().rows_card2;   // DACAN
+            const double moe1_0 = sp.stats().ms_moe1, moe2_0 = sp.stats().ms_moe2;             // DACAN: the balance
+            const int64_t nvl0 = sp.stats().fetched_nvlink;
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
@@ -3511,13 +3513,16 @@ int main(int argc, char** argv) {
             const int64_t fresh = n - resume;
             std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %lld read in %.0f ms (%.1f tok/s), "
                                  "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s, "
-                                 "%zu parked%s, second card %lld experts / %lld rows\n",
+                                 "%zu parked%s, second card %lld experts / %lld rows, MoE %.1f s main / %.1f s second, "
+                                 "balance %.2f, %lld experts over NVLink\n",
                          (long long) n, (long long) resume, (long long) fresh, prompt_ms,
                          prompt_ms > 0 ? 1000.0 * fresh / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "", parked.size(),
                          unparked ? " (a parked conversation came back)" : "",
-                         (long long) (sp.stats().experts_card2 - c2_experts0), (long long) (sp.stats().rows_card2 - c2_rows0));
+                         (long long) (sp.stats().experts_card2 - c2_experts0), (long long) (sp.stats().rows_card2 - c2_rows0),
+                         (sp.stats().ms_moe1 - moe1_0) / 1000.0, (sp.stats().ms_moe2 - moe2_0) / 1000.0, sp.stats().balance,
+                         (long long) (sp.stats().fetched_nvlink - nvl0));
             if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
                 uint64_t miss = 0, look = 0;

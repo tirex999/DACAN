@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <thread>
@@ -119,8 +120,8 @@ struct Prefill::Impl {
     strata::kernels::KvHostPools stage;
     int32_t* ident_table = nullptr;
     // DACAN 29.09.2026: the second card's share of every MoE layer (enable_card2).  Its buffers mirror the main
-    // card's expert ones for up to `rows_cap` (token, expert) rows; the rows come over NVLink after the gather and go
-    // back into the main card's `Dm` before the combine.
+    // card's expert ones for `rows_cap` (token, expert) rows at a time; the rows come over NVLink after the gather,
+    // group by group, and go back into the main card's `Dm` before the combine.
     struct Card2 {
         bool on = false;
         int dev = -1, main_dev = 0;
@@ -140,6 +141,13 @@ struct Prefill::Impl {
         bool stage_live[STAGE] = {};
         cudaEvent_t xs_ready = nullptr;            // main card: the gathered rows are in Xs
         cudaEvent_t dm_ready = nullptr;            // second card: its rows are back in the main card's Dm
+        // the balance: each card's MoE time per layer (timing events, main card t1*, second card t2*), the load each
+        // was given in the balance's units, and rho - the second card's ms per unit over the main card's, learned
+        // chunk by chunk so both cards finish a layer's experts together
+        std::vector<cudaEvent_t> t1s, t1e, t2s, t2e;
+        std::vector<double> ld1, ld2;
+        std::vector<char> had;
+        double rho = 1.0;
         std::vector<void*> owned;
         // everything above, each piece with its own card current; safe on a half-built or empty state
         void release() {
@@ -158,6 +166,10 @@ struct Prefill::Impl {
                     stage_host[i] = nullptr;
                 }
                 if (dm_ready) cudaEventDestroy(dm_ready);
+                for (cudaEvent_t e : t2s) if (e) cudaEventDestroy(e);
+                for (cudaEvent_t e : t2e) if (e) cudaEventDestroy(e);
+                t2s.clear();
+                t2e.clear();
                 if (copy) cudaStreamDestroy(copy);
                 if (cs) cudaStreamDestroy(cs);
                 for (void* p : owned) cudaFree(p);
@@ -168,6 +180,10 @@ struct Prefill::Impl {
             cudaSetDevice(main_dev);
             if (xs_ready) cudaEventDestroy(xs_ready);
             xs_ready = nullptr;
+            for (cudaEvent_t e : t1s) if (e) cudaEventDestroy(e);
+            for (cudaEvent_t e : t1e) if (e) cudaEventDestroy(e);
+            t1s.clear();
+            t1e.clear();
             cudaSetDevice(prev);
         }
     } c2;
@@ -316,10 +332,29 @@ bool Prefill::enable_card2(const core::SecondCard& sc, std::string& err) {
     c.host_res = sc.host_res;
     c.cache_base = sc.cache_base;
     c.slot_off = sc.slot_off;
-    c.rows_cap = m.T * K * 6 / 10;   // its share is kept under 60% of a chunk's rows (see the MoE step)
     int prev = 0;
     cudaGetDevice(&prev);
     bool ok = cudaSetDevice(c.dev) == cudaSuccess;
+    // its buffers: 60% of a chunk's rows, or fewer if the card has less free beside its expert cache and the decode
+    // helper (with 8K-token chunks ~1.2 GB would be needed, ~0.7 GB is free).  They cap a GROUP, not its share - the
+    // MoE step sends a larger share over in groups - so they must hold one expert's rows: up to a chunk's tokens.
+    if (ok) {
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const int64_t per_row = N * 2 + 1280 * 4 + 640 * 2 + N * 4;   // Xs + GU + Hh + Dm
+        const int64_t fixed = (int64_t) DQ * (1280 * 2560 + 2560 * 640) * 2 + (int64_t) STAGE * MAXBLOB() + (32ll << 20);
+        const int64_t reserve = 192ll << 20;
+        const int64_t fit = ((int64_t) free_b - reserve - fixed - (8ll << 20)) / per_row;
+        c.rows_cap = std::min<int64_t>(m.T * K * 6 / 10, fit);
+        if (c.rows_cap < m.T) {
+            err = "prefill: the second card has only " + std::to_string((long long) (free_b >> 20)) + " MiB free";
+            ok = false;
+        } else {
+            std::fprintf(stderr, "strata serve: the second card's buffers hold %lld expert rows at a time (%lld MiB "
+                                 "free there); its share of a chunk's %lld rows goes over in groups of that size\n",
+                         (long long) c.rows_cap, (long long) (free_b >> 20), (long long) (m.T * K));
+        }
+    }
     if (ok) {   // the rows go over NVLink both ways: peer access from this card to the main card and back
         const cudaError_t e = cudaDeviceEnablePeerAccess(c.main_dev, 0);
         if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) ok = false;
@@ -347,6 +382,14 @@ bool Prefill::enable_card2(const core::SecondCard& sc, std::string& err) {
             c.gemm.reset(new Gemm);
             ok = c.gemm->init((void*) c.cs, 0, err);   // created with this card current: its handle works here
         }
+        const size_t L = (size_t) m.g->n_layers;   // the balance's timing events of this card, one pair a layer
+        c.t2s.assign(L, nullptr);
+        c.t2e.assign(L, nullptr);
+        for (size_t i = 0; i < L && ok; ++i)
+            ok = cudaEventCreate(&c.t2s[i]) == cudaSuccess && cudaEventCreate(&c.t2e[i]) == cudaSuccess;
+        c.ld1.assign(L, 0.0);
+        c.ld2.assign(L, 0.0);
+        c.had.assign(L, 0);
     }
     if (ok) {
         ok = cudaSetDevice(c.main_dev) == cudaSuccess;
@@ -356,6 +399,11 @@ bool Prefill::enable_card2(const core::SecondCard& sc, std::string& err) {
             (void) cudaGetLastError();
         }
         ok = ok && cudaEventCreateWithFlags(&c.xs_ready, cudaEventDisableTiming) == cudaSuccess;
+        const size_t L = (size_t) m.g->n_layers;   // ...and the main card's
+        c.t1s.assign(L, nullptr);
+        c.t1e.assign(L, nullptr);
+        for (size_t i = 0; i < L && ok; ++i)
+            ok = cudaEventCreate(&c.t1s[i]) == cudaSuccess && cudaEventCreate(&c.t1e[i]) == cudaSuccess;
     }
     cudaSetDevice(prev);
     if (!ok) {
@@ -435,6 +483,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
 
+    if (m.c2.on) std::fill(m.c2.had.begin(), m.c2.had.end(), 0);   // a cancelled run leaves no half-timed layer
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
@@ -673,13 +722,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
                     route(m.logits, m.ids, m.w, T, m.cs);
-                    // the shared expert and its scalar gate
-                    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
-                    swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-                    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                     if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
-                    m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                    // (the shared expert is computed below, after the second card has its rows: DACAN 29.09.2026)
                     // group the (token, k) pairs by expert on the host
                     cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
                     cudaStreamSynchronize(m.cs);
@@ -689,43 +733,49 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (e < 0 || e >= NE) { err = "prefill: routed id out of range"; return false; }
                         ++m.cnt[(size_t) e];
                     }
-                    // DACAN 29.09.2026: which card computes each expert (see enable_card2).  One in the main card's cache
-                    // stays here; one only the second card holds goes there; the rest are streamed from the host and
-                    // each goes to the card with less work so far, so both PCIe links carry them.  The main card's rows
-                    // come first and the second card's after them, so one copy each way moves those over NVLink.
+                    // DACAN 29.09.2026: which card computes each expert (see enable_card2).  An expert costs a card 1
+                    // unit if it is in that card's cache, 2 if it is in the other card's (its weights come over NVLink),
+                    // 3 if neither holds it (streamed from the host over that card's PCIe link), plus its rows / 64.
+                    // The second card's units are scaled by rho, its measured ms per unit over the main card's (learned
+                    // chunk by chunk), and each expert, largest first, goes to the card that would finish it first -
+                    // so both cards end a layer's experts together.  The main card's rows come first and the second
+                    // card's after them, so one copy each way per group moves those over NVLink.  Its share is not
+                    // capped by its buffers (they only size a group).
                     std::vector<int32_t> order, order2;   // the experts of each card, in id order
                     int64_t rows2 = 0;
                     {
-                        const bool two = m.c2.on;
-                        double load1 = 0.0, load2 = 0.0;
-                        std::vector<int32_t> streamed;
-                        for (int32_t e = 0; e < NE; ++e) {
-                            const int64_t ne = m.cnt[(size_t) e];
-                            if (ne == 0) continue;
-                            const bool r1 = m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0;
-                            const bool r2 = two && m.c2.host_res[(size_t) l * NE + e] >= 0;
-                            if (r1 || !two) {
-                                order.push_back(e);
-                                load1 += (r1 ? 1.0 : 3.0) + (double) ne / 64.0;
-                            } else if (r2 && rows2 + ne <= m.c2.rows_cap) {
-                                order2.push_back(e);
-                                rows2 += ne;
-                                load2 += 1.0 + (double) ne / 64.0;
-                            } else {
-                                streamed.push_back(e);
+                        Impl::Card2& c = m.c2;
+                        if (!c.on) {
+                            for (int32_t e = 0; e < NE; ++e)
+                                if (m.cnt[(size_t) e] > 0) order.push_back(e);
+                        } else {
+                            struct Cost { int32_t e; double c1, c2; };
+                            std::vector<Cost> costs;
+                            for (int32_t e = 0; e < NE; ++e) {
+                                const int64_t ne = m.cnt[(size_t) e];
+                                if (ne == 0) continue;
+                                const bool r1 = m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0;
+                                const bool r2 = c.host_res[(size_t) l * NE + e] >= 0;
+                                const double rows = (double) ne / 64.0;
+                                costs.push_back({e, (r1 ? 1.0 : r2 ? 2.0 : 3.0) + rows, (r2 ? 1.0 : r1 ? 2.0 : 3.0) + rows});
                             }
-                        }
-                        for (const int32_t e : streamed) {   // a streamed expert costs its PCIe copy more than its math
-                            const int64_t ne = m.cnt[(size_t) e];
-                            const double w = 3.0 + (double) ne / 64.0;
-                            if (load2 < load1 && rows2 + ne <= m.c2.rows_cap) {
-                                order2.push_back(e);
-                                rows2 += ne;
-                                load2 += w;
-                            } else {
-                                order.push_back(e);
-                                load1 += w;
+                            std::sort(costs.begin(), costs.end(), [](const Cost& a, const Cost& b) {
+                                const double x = std::max(a.c1, a.c2), y = std::max(b.c1, b.c2);
+                                return x != y ? x > y : a.e < b.e;
+                            });
+                            double load1 = 0.0, load2 = 0.0;
+                            for (const Cost& k : costs) {
+                                if (load1 + k.c1 <= c.rho * (load2 + k.c2)) {
+                                    order.push_back(k.e);
+                                    load1 += k.c1;
+                                } else {
+                                    order2.push_back(k.e);
+                                    rows2 += m.cnt[(size_t) k.e];
+                                    load2 += k.c2;
+                                }
                             }
+                            c.ld1[(size_t) l] = load1;
+                            c.ld2[(size_t) l] = load2;
                         }
                         std::sort(order.begin(), order.end());
                         std::sort(order2.begin(), order2.end());
@@ -766,13 +816,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                     };
                     // the second card's experts, issued first so they run while the main card works through its own:
-                    // its rows over NVLink, its experts from its cache or over its own PCIe link, the results back
+                    // its rows over NVLink, its experts from its cache or over its own PCIe link, the results back.
+                    // Its buffers hold `rows_cap` rows, so its share goes in groups of whole experts of at most that
+                    // many rows: a group's rows in, its experts, its results back - all on its one stream, so the
+                    // next group's rows never overwrite rows still in use.
+                    if (m.c2.on) cudaEventRecord(m.c2.t1s[(size_t) l], m.cs);   // the main card's MoE time starts
                     if (!order2.empty()) {
                         Impl::Card2& c = m.c2;
                         cudaEventRecord(c.xs_ready, m.cs);
                         cudaSetDevice(c.dev);
                         cudaStreamWaitEvent(c.cs, c.xs_ready, 0);
-                        cudaMemcpyPeerAsync(c.Xs, c.dev, m.Xs + (size_t) split * N, c.main_dev, (size_t) rows2 * N * 2, c.cs);
+                        cudaEventRecord(c.t2s[(size_t) l], c.cs);   // ...and this card's
+                        int64_t g_row = 0, g_end = 0;   // the current group's rows [g_row, g_end), counted from split
                         int next2 = 0;
                         std::vector<int> stage2(order2.size(), -1);
                         size_t staged2 = 0;
@@ -783,26 +838,45 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 if (c.host_res[(size_t) l * NE + e] < 0) {
                                     const int sl = next2;
                                     next2 = (next2 + 1) % STAGE;
-                                    const uint8_t* b = m.src->blob(l, e);
-                                    if (!b) { err = "prefill: expert source has no blob"; ok2 = false; break; }
                                     const size_t bytes = (size_t) lay.blob_bytes(l);
-                                    if (m.src->pinned(l, e)) {
+                                    const int32_t s1 = (m.host_res && m.cache) ? m.host_res[(size_t) l * NE + e] : -1;
+                                    if (s1 >= 0) {   // in the main card's cache: its weights over NVLink
                                         if (c.stage_live[sl]) cudaStreamWaitEvent(c.copy, c.used[sl], 0);
-                                        cudaMemcpyAsync(c.stage_dev[sl], b, bytes, cudaMemcpyHostToDevice, c.copy);
+                                        cudaMemcpyPeerAsync(c.stage_dev[sl], c.dev, m.cache->device_slot(s1), c.main_dev, bytes, c.copy);
+                                        ++stats_.fetched_nvlink;
                                     } else {
-                                        if (c.stage_live[sl]) cudaEventSynchronize(c.used[sl]);
-                                        std::memcpy(c.stage_host[sl], b, bytes);
-                                        cudaMemcpyAsync(c.stage_dev[sl], c.stage_host[sl], bytes, cudaMemcpyHostToDevice, c.copy);
+                                        const uint8_t* b = m.src->blob(l, e);
+                                        if (!b) { err = "prefill: expert source has no blob"; ok2 = false; break; }
+                                        if (m.src->pinned(l, e)) {
+                                            if (c.stage_live[sl]) cudaStreamWaitEvent(c.copy, c.used[sl], 0);
+                                            cudaMemcpyAsync(c.stage_dev[sl], b, bytes, cudaMemcpyHostToDevice, c.copy);
+                                        } else {
+                                            if (c.stage_live[sl]) cudaEventSynchronize(c.used[sl]);
+                                            std::memcpy(c.stage_host[sl], b, bytes);
+                                            cudaMemcpyAsync(c.stage_dev[sl], c.stage_host[sl], bytes, cudaMemcpyHostToDevice, c.copy);
+                                        }
+                                        ++stats_.streamed_card2;
                                     }
                                     cudaEventRecord(c.copied[sl], c.copy);
                                     c.stage_live[sl] = true;
                                     stage2[staged2] = sl;
-                                    ++stats_.streamed_card2;
                                 }
                                 ++staged2;
                             }
                             if (!ok2) break;
                             const int32_t e = order2[j];
+                            const int64_t r0 = m.off[(size_t) e] - split, ne = m.cnt[(size_t) e];
+                            if (r0 >= g_end) {   // a new group: whole experts up to rows_cap rows, their rows in
+                                g_row = g_end = r0;
+                                for (size_t k = j; k < order2.size(); ++k) {
+                                    const int64_t nk = m.cnt[(size_t) order2[k]];
+                                    if (g_end + nk - g_row > c.rows_cap) break;
+                                    g_end += nk;
+                                }
+                                if (g_end == g_row) { err = "prefill: an expert's rows exceed the second card's buffers"; ok2 = false; break; }
+                                cudaMemcpyPeerAsync(c.Xs, c.dev, m.Xs + (size_t) (split + g_row) * N, c.main_dev,
+                                                    (size_t) (g_end - g_row) * N * 2, c.cs);
+                            }
                             const uint8_t* blob_dev = nullptr;
                             if (stage2[j] < 0) {
                                 blob_dev = c.cache_base + c.slot_off[c.host_res[(size_t) l * NE + e]];
@@ -813,20 +887,31 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const int q = (int) (j % DQ);
                             dequant(blob_dev, c.dq_gu[q], c.dq_d[q], c.cs);
                             if (stage2[j] >= 0) cudaEventRecord(c.used[stage2[j]], c.cs);
-                            const int64_t o0 = m.off[(size_t) e] - split, ne = m.cnt[(size_t) e];
+                            const int64_t o0 = r0 - g_row;
                             c.gemm->f16(c.Xs + o0 * N, c.dq_gu[q], c.GU + o0 * 1280, ne, 1280, N);
                             swiglu_interleaved(c.GU + o0 * 1280, c.Hh + o0 * 640, ne, c.cs);
                             c.gemm->f16(c.Hh + o0 * 640, c.dq_d[q], c.Dm + o0 * N, ne, N, 640);
+                            if (r0 + ne == g_end)   // the group's last expert: its results back
+                                cudaMemcpyPeerAsync(m.Dm + (size_t) (split + g_row) * N, c.main_dev, c.Dm, c.dev,
+                                                    (size_t) (g_end - g_row) * N * 4, c.cs);
                         }
                         if (ok2) {
-                            cudaMemcpyPeerAsync(m.Dm + (size_t) split * N, c.main_dev, c.Dm, c.dev, (size_t) rows2 * N * 4, c.cs);
+                            cudaEventRecord(c.t2e[(size_t) l], c.cs);
                             cudaEventRecord(c.dm_ready, c.cs);
+                            c.had[(size_t) l] = 1;
                         }
                         cudaSetDevice(c.main_dev);
                         if (!ok2) return false;
                         stats_.experts_card2 += (int64_t) order2.size();
                         stats_.rows_card2 += rows2;
                     }
+                    // the shared expert and its scalar gate - on the main card while the second works through its share
+                    // (it reads mixed_h and mixed_bf, which the gather leaves as they are; the combine reads its output)
+                    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                    swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
+                    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                    m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                     // the main card's experts, in id order: resident ones from VRAM, the others through the staging ring
                     // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                     int stage_next = 0;
@@ -837,6 +922,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (resident) return true;
                         const int sl = stage_next;
                         stage_next = (stage_next + 1) % STAGE;
+                        const int32_t s2 = m.c2.on ? m.c2.host_res[(size_t) l * NE + e] : -1;
+                        if (s2 >= 0) {   // DACAN: in the second card's cache - its weights over NVLink
+                            if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+                            cudaMemcpyPeerAsync(m.stage_dev[sl], m.c2.main_dev, m.c2.cache_base + m.c2.slot_off[s2],
+                                                m.c2.dev, (size_t) lay.blob_bytes(l), m.copy);
+                            cudaEventRecord(m.copied[sl], m.copy);
+                            m.stage_live[sl] = true;
+                            stage_of[j] = sl;
+                            ++stats_.fetched_nvlink;
+                            return true;
+                        }
                         const auto th = Clock::now();
                         const uint8_t* b = m.src->blob(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
@@ -881,6 +977,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                         m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                     }
+                    if (m.c2.on) cudaEventRecord(m.c2.t1e[(size_t) l], m.cs);   // the main card's MoE time ends
                     if (!order2.empty()) cudaStreamWaitEvent(m.cs, m.c2.dm_ready, 0);   // its rows are in Dm now
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                 }
@@ -889,6 +986,34 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 if (half == 1 && strata::kernels::cvec().covers(l))   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
+        }
+        if (m.c2.on) {
+            // DACAN 29.09.2026: the balance.  Each card's MoE time in this chunk over the load it was given is its ms
+            // per unit; rho moves halfway (geometrically) to the second card's over the main card's.  Once the
+            // cards take equal time rho stops moving; it carries over to the next chunk and the next request.
+            Impl::Card2& c = m.c2;
+            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            double t1 = 0.0, t2 = 0.0, l1 = 0.0, l2 = 0.0;
+            for (size_t i = 0; i < c.had.size(); ++i) {
+                if (!c.had[i]) continue;
+                c.had[i] = 0;
+                float a = 0.0f, b = 0.0f;
+                const bool ok1 = cudaEventElapsedTime(&a, c.t1s[i], c.t1e[i]) == cudaSuccess;
+                cudaSetDevice(c.dev);
+                const bool ok2 = cudaEventElapsedTime(&b, c.t2s[i], c.t2e[i]) == cudaSuccess;
+                cudaSetDevice(c.main_dev);
+                if (!ok1 || !ok2) { (void) cudaGetLastError(); continue; }
+                if (a <= 0.0f || b <= 0.0f) continue;
+                t1 += a; t2 += b; l1 += c.ld1[i]; l2 += c.ld2[i];
+            }
+            stats_.ms_moe1 += t1;
+            stats_.ms_moe2 += t2;
+            if (t1 > 0.0 && t2 > 0.0 && l1 > 0.0 && l2 > 0.0)
+                c.rho = std::clamp(std::sqrt(c.rho * ((t2 / l2) / (t1 / l1))), 0.2, 5.0);
+            stats_.balance = c.rho;
         }
         stats_.tokens += T;
         if (on_chunk) {

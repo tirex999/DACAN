@@ -35,6 +35,10 @@ struct PrefillStats {
     int64_t experts_card2 = 0;      ///< DACAN: expert-layer groups the second card computed (enable_card2)
     int64_t streamed_card2 = 0;     ///< ...of which it streamed from the host over its own PCIe link
     int64_t rows_card2 = 0;         ///< (token, expert) rows it computed
+    int64_t fetched_nvlink = 0;     ///< expert blobs one card took from the other card's cache over NVLink
+    double ms_moe1 = 0;             ///< the main card's MoE time (after the gather) and the second card's
+    double ms_moe2 = 0;
+    double balance = 1.0;           ///< rho: the second card's ms per unit of the balance over the main card's
 };
 
 class Prefill {
@@ -51,10 +55,12 @@ public:
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
               void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0);
 
-    /// DACAN 29.09.2026: the second card takes part in every MoE layer of the prompt.  It computes the experts its
-    /// own cache holds (and the main card's does not), and the experts neither card holds - streamed from the host -
-    /// are split between the two cards by the work each has so far, each over its own PCIe link; the rows travel over
-    /// NVLink.  Every expert is computed with the same kernels either way, so the result is the one-card result.
+    /// DACAN 29.09.2026: the second card takes part in every MoE layer of the prompt.  Each expert goes to the card
+    /// that would finish it first: in that card's cache it costs least, in the other card's cache its weights come
+    /// over NVLink, in neither it is streamed from the host over that card's own PCIe link; the second card's costs
+    /// are scaled by its measured MoE time per unit over the main card's, learned chunk by chunk, so both cards end a
+    /// layer's experts together.  The rows travel over NVLink, in groups the second card's buffers hold.  Every
+    /// expert is computed with the same kernels either way, so the result is the one-card result.
     /// Allocates ~350 MB on that card; call after `init` (and after the decode helper has taken its share).
     bool enable_card2(const core::SecondCard& card2, std::string& err);
 
