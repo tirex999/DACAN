@@ -181,11 +181,16 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
 - `"min_max_tokens": 100000` in the server config: a client that asks for less (agents that send `max_tokens: 32000`)
   gets 100,000 - never more than the context has left; `max_tokens` above it and "unlimited" (0 / -1) are unchanged.
 - One request at a time. The conversation cache (upstream v0.1.3+, `--prompt-cache`, 6 checkpoints by default) keeps
-  the next turn of a conversation from re-reading the whole context; `turing-v0.1.2` has no cache. It holds **one
-  conversation**: in a Claude Code session that grew from 32K to 131K tokens, 70 turns in a row took 99 % of the prompt
-  from the cache (2–6 s to read a turn). Any other request in between (another chat, a separate short request of the
-  same client) replaces it, and the next turn re-reads everything at ~300 tok/s: 88K and 90K tokens took 296 and 303 s.
-  The engine log shows it per request: `prompt N tokens = R reused + X read`.
+  the next turn of a conversation from re-reading the whole context; `turing-v0.1.2` has no cache. In a Claude Code
+  session that grew from 32K to 131K tokens, 70 turns in a row took 99 % of the prompt from the cache (2–6 s to read a
+  turn). Upstream holds **one conversation**: any other request in between replaced it, and the next turn re-read
+  everything at ~300 tok/s (88K and 90K tokens: 296 and 303 s). DACAN **parks** other conversations in RAM
+  (`--park N`, default 4, `--park-mib`, default 8192): a session that a request would overwrite is copied out - the
+  K/V of the 12 QSA layers and the draft layer, the pooled indexer keys, its end state and last turn checkpoints - and
+  copied back when its chat continues. Measured: a 16.8K-token chat parked in 759 ms (585 MiB), brought back in 55 ms,
+  its next answer identical to the uninterrupted run. One-off requests (a client's title or summary side requests) are
+  not parked. The engine log shows it per request: `prompt N tokens = R reused + X read`, `parked ...`,
+  `brought back ...`.
 - A GPU-computed expert gives slightly different tokens than a CPU one (different activation quantization, both from
   llama.cpp); `--numa` does not change the output.
 

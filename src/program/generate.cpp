@@ -38,6 +38,7 @@
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
@@ -265,6 +266,13 @@ struct Options {
     int prompt_cache = 6;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
+    /// --serve (DACAN 29.09.2026): conversations kept in RAM besides the live one (see ParkedConv), so a request of
+    /// another chat in between does not make the first one read its whole context again (0 = off).
+    int park = 4;
+    /// --serve: park the live session only when a request would rewrite at least this many of its tokens
+    int64_t park_min = 8192;
+    /// --serve: RAM for the parked conversations, MiB (the oldest goes first)
+    int64_t park_mib = 8192;
     /// --serve: the token that opens a chat turn (<|im_start|>).  The last one in a prompt is where the chat's
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
     int64_t turn_token = 248045;
@@ -352,6 +360,11 @@ void usage() {
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
+                 "  --park N             --serve: keep N other conversations in RAM (default 4, ~15 KB a token with\n"
+                 "                       the INT8 KV; 0 = one conversation, switching chats re-reads the other)\n"
+                 "  --park-min N         --serve: park the live session when a request rewrites >= N of its tokens\n"
+                 "                       (default 8192)\n"
+                 "  --park-mib N         --serve: RAM for the parked conversations, MiB (default 8192)\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
@@ -601,6 +614,93 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
+// ---- DACAN 29.09.2026: more than one conversation.  The cache above holds ONE: a request of another chat rewrites
+// the positional cells, and the first chat's next turn reads its whole context again (measured on a Claude Code
+// session: 88K and 90K tokens took 296 and 303 s after a 17K request of another client had run in between).  So a
+// session about to be rewritten is PARKED in RAM first - its positional cells [0, L) (every QSA layer's K/V and
+// pooled indexer keys, the draft layer's K/V), the running state at its end and its last checkpoints - and a request
+// that continues a parked conversation further than the live session can brings it back: the cells go back into
+// place, the live session is parked in its turn, and the checkpoint logic above picks where to resume.  With the
+// INT8 KV that is ~15 KB a cell (a 131K-token session ~2 GB), copied in well under a second either way, against
+// ~300 tok/s to read the prompt again.
+struct PosRegion {
+    void* dev;
+    size_t bytes;
+};
+
+/// The device regions that hold cells [0, L) of one QSA-type state (a main layer or the draft layer), appended to
+/// `out`.  False when the state keeps its authoritative K/V on the host (KV streaming, the drafter's ring), which
+/// parking does not handle.  The layout is [page][kv_head][page_size][...], so the first pages are one block.
+bool positional_regions(const strata::core::QsaState& st, const strata::kernels::QsaShapes& s, int64_t L,
+                        std::vector<PosRegion>& out) {
+    if (st.kv_mode != 0) return false;
+    const int64_t pages = std::min<int64_t>((L + s.page_size - 1) / s.page_size, st.n_pages);
+    const size_t rows = (size_t) pages * (size_t) s.n_head_kv * (size_t) s.page_size;
+    if (st.kv_q4) {
+        const size_t w = (size_t) strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+        out.push_back({st.k_q4, rows * w});
+        out.push_back({st.v_q4, rows * w});
+    } else if (st.kv_int8) {
+        const size_t sc = (size_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * sizeof(uint16_t);
+        out.push_back({st.k_q, rows * (size_t) s.head_dim});
+        out.push_back({st.v_q, rows * (size_t) s.head_dim});
+        out.push_back({st.k_scale, rows * sc});
+        out.push_back({st.v_scale, rows * sc});
+    } else {
+        out.push_back({st.k_pool, rows * (size_t) s.head_dim * sizeof(uint16_t)});
+        out.push_back({st.v_pool, rows * (size_t) s.head_dim * sizeof(uint16_t)});
+    }
+    if (st.idx_pooled != nullptr && st.idx_pooled_rows > 0) {
+        const int64_t r = std::min<int64_t>(st.idx_pooled_rows, L / s.idx_block + 2);
+        out.push_back({st.idx_pooled, (size_t) r * (size_t) s.idx_dim * sizeof(float)});
+    }
+    if (st.idx_dead != nullptr) out.push_back({st.idx_dead, (size_t) s.idx_dim * sizeof(float)});
+    return true;
+}
+
+/// Cells [0, L) of the 12 QSA layers and the draft layer: out into `buf` (`to_host`), or from it back into place.
+bool park_cells(std::vector<uint8_t>& buf, int64_t L, const strata::core::SessionState& ss,
+                const strata::core::QsaState& draft, const strata::core::ModelGeometry& g, bool to_host) {
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.n_head_kv = g.n_head_kv;
+    s.head_dim = g.head_dim;
+    s.idx_dim = g.idx_key_dim;
+    std::vector<PosRegion> r;
+    for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
+        if (!positional_regions(ss.qsa_states[i], s, L, r)) return false;
+    if (!positional_regions(draft, s, L, r)) return false;
+    size_t total = 0;
+    for (const PosRegion& x : r) total += x.bytes;
+    if (to_host) buf.resize(total);
+    else if (buf.size() != total) return false;
+    if (cudaDeviceSynchronize() != cudaSuccess) return false;
+    size_t off = 0;
+    for (const PosRegion& x : r) {
+        const cudaError_t e = to_host ? cudaMemcpy(buf.data() + off, x.dev, x.bytes, cudaMemcpyDefault)
+                                      : cudaMemcpy(x.dev, buf.data() + off, x.bytes, cudaMemcpyDefault);
+        if (e != cudaSuccess) return false;
+        off += x.bytes;
+    }
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+/// One parked conversation.  `checks` always holds the running state at its end (ids.size()); the others are its
+/// latest turn boundaries, where the next request of that chat usually resumes.
+struct ParkedConv {
+    std::vector<int32_t> ids;             ///< the tokens its cells hold
+    std::vector<ImgKey> imgs;
+    bool cvec = true;                     ///< read with the control vector on or off
+    std::vector<ConvCheckpoint> checks;
+    std::vector<uint8_t> cells;           ///< park_cells' copy of [0, ids.size())
+    uint64_t used = 0;                    ///< the request count when it was last live: the oldest goes first
+    int turns = 0;                        ///< requests it has served (a one-off request of a client is not parked)
+    size_t bytes() const {
+        size_t b = cells.size();
+        for (const ConvCheckpoint& c : checks) b += c.gdn.size() + c.ple.size() + c.tails.size();
+        return b;
+    }
+};
+
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
 // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports.
@@ -798,6 +898,9 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+        else if (a == "--park") o.park = std::max(0, std::atoi(next("--park")));
+        else if (a == "--park-min") o.park_min = std::max(1LL, std::atoll(next("--park-min")));
+        else if (a == "--park-mib") o.park_mib = std::max(0LL, std::atoll(next("--park-mib")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
@@ -2508,6 +2611,16 @@ int main(int argc, char** argv) {
         bool live_ok = false;
         std::vector<ConvCheckpoint> checks;
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        // ---- other conversations parked in RAM (DACAN 29.09.2026, see ParkedConv).  Their cells are copied out of
+        // VRAM and back, so every main layer and the draft layer must keep their K/V there (no KV streaming).
+        std::vector<ParkedConv> parked;
+        uint64_t park_clock = 0;
+        int live_turns = 0;   // requests the live session has served: 1 for a one-off request
+        const bool park_ok = o.park > 0 && o.prompt_cache > 0 && g.n_qsa_layers() > 0 &&
+                             ss.qsa_states[0].kv_mode == 0 && mtp.kv_state().kv_mode == 0;
+        if (o.park > 0 && !park_ok)
+            std::fprintf(stderr, "strata serve: parking other conversations is off (it needs --prompt-cache and the "
+                                 "K/V in VRAM)\n");
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         Clock::time_point pp_t0 = Clock::now();
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
@@ -2680,12 +2793,12 @@ int main(int argc, char** argv) {
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
-                        "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s\n",
+                        "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s park=%d\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
                                          ? ss.qsa_states[0].n_slots * 4 : 0),
                         (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
-                        o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str());
+                        o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(), park_ok ? o.park : 0);
         }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
@@ -2875,6 +2988,115 @@ int main(int argc, char** argv) {
                 }
                 strata::kernels::cvec_set_enabled(want);
             }
+            // ---- other conversations (see ParkedConv): the live session is parked when this request would rewrite
+            // a long stretch of it, and a parked one comes back when it carries this prompt further than the live one
+            bool unparked = false;
+            if (park_ok) {
+                ++park_clock;
+                int64_t here = 0;   // how far the live session and its checkpoints carry this prompt
+                if (live_ok && starts_with(live, live_imgs)) here = (int64_t) live.size();
+                for (const ConvCheckpoint& c : checks)
+                    if ((int64_t) c.ids.size() > here && starts_with(c.ids, c.imgs)) here = (int64_t) c.ids.size();
+                int best = -1;
+                int64_t best_at = 0;   // how far the best parked conversation carries it
+                for (size_t i = 0; i < parked.size(); ++i) {
+                    if (parked[i].cvec != cvec_cached) continue;
+                    for (const ConvCheckpoint& c : parked[i].checks)
+                        if ((int64_t) c.ids.size() > best_at && starts_with(c.ids, c.imgs)) {
+                            best_at = (int64_t) c.ids.size();
+                            best = (int) i;
+                        }
+                }
+                // bringing one back is a copy of its cells, well under a second: worth it past a few hundred tokens
+                ParkedConv back;
+                const bool going_back = best >= 0 && best_at > here + 256;
+                if (going_back) {
+                    back = std::move(parked[(size_t) best]);
+                    parked.erase(parked.begin() + best);
+                }
+                const int64_t L = live_ok ? (int64_t) live.size() : 0;
+                // a chat that has gone on for a turn or more, or a long single request; not a client's one-off side
+                // request (Claude Code sends 17-18K-token ones for titles and summaries), which would push real
+                // conversations out
+                const bool worth = live_turns >= 2 || L >= 4 * o.park_min;
+                if (worth && L >= o.park_min && L - (going_back ? 0 : here) >= o.park_min) {
+                    const Clock::time_point t0 = Clock::now();
+                    ParkedConv p;
+                    p.ids = live;
+                    p.imgs = live_imgs;
+                    p.cvec = cvec_cached;
+                    p.used = park_clock;
+                    p.turns = live_turns;
+                    bool ok = false;
+                    try {
+                        // its two latest turn boundaries (every checkpoint is a prefix of `live`: longer is later)
+                        std::vector<const ConvCheckpoint*> by_len;
+                        for (const ConvCheckpoint& c : checks) if ((int64_t) c.ids.size() < L) by_len.push_back(&c);
+                        std::sort(by_len.begin(), by_len.end(), [](const ConvCheckpoint* a, const ConvCheckpoint* b) {
+                            return a->ids.size() > b->ids.size();
+                        });
+                        for (size_t i = 0; i < by_len.size() && i < 2; ++i) p.checks.push_back(*by_len[i]);
+                        ConvCheckpoint end;   // and the running state at its end, where the live session is now
+                        end.ids = live;
+                        end.imgs = live_imgs;
+                        ok = cudaDeviceSynchronize() == cudaSuccess && checkpoint_save(end, ss, g) &&
+                             park_cells(p.cells, L, ss, mtp.kv_state(), g, true);
+                        p.checks.push_back(std::move(end));
+                    } catch (const std::exception&) {
+                        ok = false;
+                    }
+                    if (ok) {
+                        const double mib = (double) p.bytes() / 1048576.0;
+                        parked.push_back(std::move(p));
+                        // at most --park of them in --park-mib: the oldest go first
+                        auto total = [&] {
+                            size_t b = 0;
+                            for (const ParkedConv& q : parked) b += q.bytes();
+                            return b;
+                        };
+                        while (!parked.empty() &&
+                               ((int) parked.size() > o.park || total() > ((size_t) o.park_mib << 20))) {
+                            auto old = std::min_element(parked.begin(), parked.end(),
+                                                        [](const ParkedConv& a, const ParkedConv& b) { return a.used < b.used; });
+                            std::fprintf(stderr, "strata serve: dropped a parked conversation of %zu tokens (the oldest)\n",
+                                         old->ids.size());
+                            parked.erase(old);
+                        }
+                        std::fprintf(stderr, "strata serve: parked a conversation of %lld tokens (%.0f MiB) in %.0f ms; "
+                                             "%zu parked\n", (long long) L, mib,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), parked.size());
+                    } else {
+                        std::fprintf(stderr, "strata serve: parking a conversation of %lld tokens failed (RAM?); it "
+                                             "will be read again if it comes back\n", (long long) L);
+                    }
+                }
+                if (going_back) {
+                    const Clock::time_point t0 = Clock::now();
+                    const int64_t BL = (int64_t) back.ids.size();
+                    const ConvCheckpoint* end = nullptr;
+                    for (const ConvCheckpoint& c : back.checks) if ((int64_t) c.ids.size() == BL) end = &c;
+                    if (end != nullptr && park_cells(back.cells, BL, ss, mtp.kv_state(), g, false) &&
+                        checkpoint_restore(*end, ss, g)) {
+                        live = std::move(back.ids);
+                        live_imgs = std::move(back.imgs);
+                        live_ok = true;
+                        live_turns = back.turns;
+                        checks = std::move(back.checks);
+                        unparked = true;
+                        std::fprintf(stderr, "strata serve: brought back a parked conversation of %lld tokens in %.0f ms\n",
+                                     (long long) BL, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    } else {
+                        // cells half copied: nothing to continue from, so this request reads from the start
+                        live_ok = false;
+                        checks.clear();
+                        std::fprintf(stderr, "strata serve: bringing back a parked conversation of %lld tokens failed; "
+                                             "reading the prompt from the start\n", (long long) BL);
+                    }
+                }
+            }
+            // a request that reuses most of the live session continues its chat (see live_turns); one that only
+            // shares its opening - a client's side request with the same system prompt - starts its own
+            const int64_t live_len_before = live_ok ? (int64_t) live.size() : 0;
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0) {
@@ -3187,6 +3409,7 @@ int main(int argc, char** argv) {
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0;
+                live_turns = resume > 0 && 2 * resume >= live_len_before ? live_turns + 1 : 1;
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && live_ok) {
@@ -3272,11 +3495,13 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             const int64_t fresh = n - resume;
             std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %lld read in %.0f ms (%.1f tok/s), "
-                                 "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s\n",
+                                 "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s, "
+                                 "%zu parked%s\n",
                          (long long) n, (long long) resume, (long long) fresh, prompt_ms,
                          prompt_ms > 0 ? 1000.0 * fresh / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
-                         (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+                         (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "", parked.size(),
+                         unparked ? " (a parked conversation came back)" : "");
             if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
                 uint64_t miss = 0, look = 0;
