@@ -3032,11 +3032,12 @@ int main(int argc, char** argv) {
                     parked.erase(parked.begin() + best);
                 }
                 const int64_t L = live_ok ? (int64_t) live.size() : 0;
-                // a chat that has gone on for a turn or more, or a long single request; not a client's one-off side
-                // request (Claude Code sends 17-18K-token ones for titles and summaries), which would push real
-                // conversations out
-                const bool worth = live_turns >= 2 || L >= 4 * o.park_min;
-                if (worth && L >= o.park_min && L - (going_back ? 0 : here) >= o.park_min) {
+                // DACAN 29.09.2026: every session of park_min tokens or more.  It used to take a chat of two turns or
+                // a request of 4 x park_min, to keep a client's one-off side requests (Claude Code's 17-18K-token
+                // titles and summaries) out - but a Claude Code subagent looks the same (17-26K tokens, one turn at a
+                // time) and continues, so a workflow's subagents re-read their whole prompt every turn.  The side
+                // requests now take a place too; the oldest go first, and a chat in use is parked afresh every time.
+                if (L >= o.park_min && L - (going_back ? 0 : here) >= o.park_min) {
                     const Clock::time_point t0 = Clock::now();
                     ParkedConv p;
                     p.ids = live;

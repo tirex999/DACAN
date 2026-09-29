@@ -216,7 +216,11 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
   - **QSA block selection on both cards**: the second card selects the cells of a chunk's last queries (split by the
     sum of positions - a query scores every block before it) from a copy of the pooled indexer keys; the same
     kernels, the same cells. 2.2 -> 1.3 s. `STRATA_PREFILL_SEL2=0` keeps it on the main card.
-  The 19.3K prompt: 30.5 -> 24.2 s, **633 -> 798 tok/s**. The largest part left is QSA attention (6.0 s): the decode
+  The 19.3K prompt: 30.5 -> 24.2 s, **633 -> 798 tok/s**. A live 94.3K-token Claude Code conversation read from
+  scratch: 122.5 s, 770 tok/s (the morning's one-card engine: 88K and 90K in 296 and 303 s) - MoE 35.4 s, QSA
+  attention 31.3, QSA selection 13.1, hyper-connections 9.2, GDN scan 8.2, GDN projections 5.7, PLE 4.6. The
+  attention grows with the prompt linearly (a query reads 2051 cells however long it is), the selection faster (a
+  query scores every block before it: 0.07 ms a token at 19K, 0.14 at 94K). The largest part left is QSA attention (6.0 s): the decode
   kernel run per query, FP32 on the CUDA cores, every query reading its 2051 cells alone although neighbours select
   nearly the same ones.
 - One request at a time. The conversation cache (upstream v0.1.3+, `--prompt-cache`, 6 checkpoints by default) keeps
@@ -227,8 +231,11 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
   (`--park N`, default 4, `--park-mib`, default 8192): a session that a request would overwrite is copied out - the
   K/V of the 12 QSA layers and the draft layer, the pooled indexer keys, its end state and last turn checkpoints - and
   copied back when its chat continues. Measured: a 16.8K-token chat parked in 759 ms (585 MiB), brought back in 55 ms,
-  its next answer identical to the uninterrupted run. One-off requests (a client's title or summary side requests) are
-  not parked. The engine log shows it per request: `prompt N tokens = R reused + X read`, `parked ...`,
+  its next answer identical to the uninterrupted run. Every session of `--park-min` (8192) tokens or more is parked:
+  a first rule kept one-turn requests under 32K out (a client's title and summary side requests), but a Claude Code
+  subagent looks the same (17-26K tokens, one turn at a time) and continues, so a workflow's subagents re-read their
+  whole prompt every turn (12 reads of 17-26K, 23-35 s each, in half an hour). The service runs `--park 16
+  --park-mib 16384`; the oldest go first, and a chat in use is parked afresh every time. The engine log shows it per request: `prompt N tokens = R reused + X read`, `parked ...`,
   `brought back ...`.
 - A GPU-computed expert gives slightly different tokens than a CPU one (different activation quantization, both from
   llama.cpp); `--numa` does not change the output.

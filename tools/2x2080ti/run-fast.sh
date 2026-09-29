@@ -29,7 +29,7 @@ root, pack, s1, s2, mtp, ctx, tag, prof, usage, extra, kv, port = sys.argv[1:13]
 args = ["--pack", pack, "--native", s1, "--ple-gguf", s2, "--ple-io", "mmap",
         "--expert-profile", prof, "--expert-cache", "auto", "--adapt-every", "0",
         "--second-card", "1", "--second-card-usage", usage, "--pcie-frac", "0",
-        "--prefill", "8192", "--spec", "4", "--spec-min-p", "0.5", "--mtp", mtp, "--max-context", ctx, "--kv", kv] + extra.split()
+        "--prefill", "8192", "--park", "16", "--park-mib", "16384", "--spec", "4", "--spec-min-p", "0.5", "--mtp", mtp, "--max-context", ctx, "--kv", kv] + extra.split()
 cfg = {"exe": "%s/run-fast-%s.sh" % (root, tag), "args": args, "cwd": root, "tokenizer": pack + "/tokenizer",
        "model_name": "qwen3.8-flash-next-" + tag, "log": "%s/strata-%s.log" % (root, tag), "port": int(port)}
 open("%s/strata-%s.json" % (root, tag), "w").write(json.dumps(cfg, indent=1))
