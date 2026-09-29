@@ -393,9 +393,10 @@ class Detokenizer:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, min_max_tokens: int = 0):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
+        self.min_max_tokens = max(0, int(min_max_tokens or 0))   # "min_max_tokens": raise a smaller client cap to it
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -481,6 +482,8 @@ class Service:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
         room = self.engine.max_context - CTX_SLACK - len(ids)
+        if max_new and 0 < max_new < self.min_max_tokens:   # a client's small cap (e.g. 32000) -> the configured
+            max_new = min(self.min_max_tokens, max(max_new, room))   # floor, but never past what the context holds
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
                 raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
@@ -1089,7 +1092,11 @@ def main() -> int:
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True,
+                  min_max_tokens=int(cfg.get("min_max_tokens") or 0))
+    if svc.min_max_tokens:
+        print(f"[strata] min_max_tokens from the config: a smaller max_tokens is raised to {svc.min_max_tokens}",
+              flush=True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     httpd = serve(svc, host=a.host, port=a.port)
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host

@@ -165,6 +165,51 @@ class FitMaxTokens(unittest.TestCase):
         self.assertIn("no room to answer", b["error"]["message"])
 
 
+class MinMaxTokens(unittest.TestCase):
+    """"min_max_tokens" in the config: a client's smaller max_tokens is raised to it, never past the context."""
+    FLOOR = 1500
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = RecordingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                          min_max_tokens=cls.FLOOR)
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    post = MaxTokens.post
+    call = MaxTokens.call
+
+    def test_a_smaller_cap_is_raised_to_the_floor(self):
+        for api in ("openai", "anthropic"):
+            with self.subTest(api=api):
+                s, b, _, _ = self.call(api, max_tokens=50)
+                self.assertEqual(s, 200, b)
+                self.assertEqual(self.engine.last_max_new, self.FLOOR)
+
+    def test_a_larger_cap_and_unlimited_are_unchanged(self):
+        s, b, _, _ = self.call("openai", max_tokens=2000)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(self.engine.last_max_new, 2000)
+        s, b, pt, _ = self.call("openai", max_tokens=-1)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
+
+    def test_the_floor_stops_at_the_room(self):
+        _, _, pt0, _ = self.call("openai", max_tokens=1)
+        overhead = pt0 - len("hi")
+        room = 1000                                  # less than the floor, more than the client's cap
+        s, b, _, _ = self.call("openai", text="y" * (CTX - CTX_SLACK - overhead - room), max_tokens=50)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(self.engine.last_max_new, room)
+
+
 class WebApp(unittest.TestCase):
     """The web app (PR #22's dashboard idea, rebuilt): its page and files, and GET /metrics."""
 

@@ -178,6 +178,8 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
   `--second-card-dup` (+2.5 % with more misses).
 - Without `STRATA_HELPER` the second card computes experts only and sits at 10–15 %; with it, ~35 % of the round.
   Tensor parallel by heads over NVLink is next (`docs/TWO_DOMAINS.md`).
+- `"min_max_tokens": 100000` in the server config: a client that asks for less (agents that send `max_tokens: 32000`)
+  gets 100,000 - never more than the context has left; `max_tokens` above it and "unlimited" (0 / -1) are unchanged.
 - One request at a time. The conversation cache (upstream v0.1.3+, `--prompt-cache`, 6 checkpoints by default) keeps
   the next turn of a conversation from re-reading the whole context; `turing-v0.1.2` has no cache.
 - A GPU-computed expert gives slightly different tokens than a CPU one (different activation quantization, both from
