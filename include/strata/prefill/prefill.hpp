@@ -32,6 +32,9 @@ struct PrefillStats {
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     double ms_ple = 0;
+    int64_t experts_card2 = 0;      ///< DACAN: expert-layer groups the second card computed (enable_card2)
+    int64_t streamed_card2 = 0;     ///< ...of which it streamed from the host over its own PCIe link
+    int64_t rows_card2 = 0;         ///< (token, expert) rows it computed
 };
 
 class Prefill {
@@ -47,6 +50,13 @@ public:
     bool init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
               void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0);
+
+    /// DACAN 29.09.2026: the second card takes part in every MoE layer of the prompt.  It computes the experts its
+    /// own cache holds (and the main card's does not), and the experts neither card holds - streamed from the host -
+    /// are split between the two cards by the work each has so far, each over its own PCIe link; the rows travel over
+    /// NVLink.  Every expert is computed with the same kernels either way, so the result is the one-card result.
+    /// Allocates ~350 MB on that card; call after `init` (and after the decode helper has taken its share).
+    bool enable_card2(const core::SecondCard& card2, std::string& err);
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);

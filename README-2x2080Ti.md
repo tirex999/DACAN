@@ -180,6 +180,11 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
   Tensor parallel by heads over NVLink is next (`docs/TWO_DOMAINS.md`).
 - `"min_max_tokens": 100000` in the server config: a client that asks for less (agents that send `max_tokens: 32000`)
   gets 100,000 - never more than the context has left; `max_tokens` above it and "unlimited" (0 / -1) are unchanged.
+- **The prompt is read on both cards.** Upstream reads a prompt on the main card only (measured: main card at 100 %,
+  the second at 0 % and 39 W). DACAN splits every MoE layer of the prompt: the second card computes the experts its
+  own cache holds and a share of the ones streamed from RAM, over its own PCIe link; its rows go over NVLink and back.
+  A fresh 19.3K-token prompt: 65.3 s -> 40.1 s (296 -> 483 tok/s), the second card took 55 % of the expert rows, the
+  answer identical token for token. `STRATA_PREFILL_CARD2=0` keeps the prompt on one card.
 - One request at a time. The conversation cache (upstream v0.1.3+, `--prompt-cache`, 6 checkpoints by default) keeps
   the next turn of a conversation from re-reading the whole context; `turing-v0.1.2` has no cache. In a Claude Code
   session that grew from 32K to 131K tokens, 70 turns in a row took 99 % of the prompt from the cache (2–6 s to read a

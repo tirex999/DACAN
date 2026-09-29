@@ -118,6 +118,59 @@ struct Prefill::Impl {
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
     strata::kernels::KvHostPools stage;
     int32_t* ident_table = nullptr;
+    // DACAN 29.09.2026: the second card's share of every MoE layer (enable_card2).  Its buffers mirror the main
+    // card's expert ones for up to `rows_cap` (token, expert) rows; the rows come over NVLink after the gather and go
+    // back into the main card's `Dm` before the combine.
+    struct Card2 {
+        bool on = false;
+        int dev = -1, main_dev = 0;
+        const int32_t* host_res = nullptr;         // [layer * NE + e] -> slot on the second card, or -1
+        const uint8_t* cache_base = nullptr;       // device address of its slot 0
+        const uint64_t* slot_off = nullptr;        // host array: byte offset of every slot
+        cudaStream_t cs = nullptr, copy = nullptr;
+        std::unique_ptr<Gemm> gemm;
+        int64_t rows_cap = 0;
+        uint16_t *Xs = nullptr, *Hh = nullptr;
+        float *GU = nullptr, *Dm = nullptr;
+        uint16_t* dq_gu[DQ] = {};
+        uint16_t* dq_d[DQ] = {};
+        uint8_t* stage_dev[STAGE] = {};
+        uint8_t* stage_host[STAGE] = {};
+        cudaEvent_t copied[STAGE] = {}, used[STAGE] = {};
+        bool stage_live[STAGE] = {};
+        cudaEvent_t xs_ready = nullptr;            // main card: the gathered rows are in Xs
+        cudaEvent_t dm_ready = nullptr;            // second card: its rows are back in the main card's Dm
+        std::vector<void*> owned;
+        // everything above, each piece with its own card current; safe on a half-built or empty state
+        void release() {
+            on = false;
+            int prev = 0;
+            cudaGetDevice(&prev);
+            if (dev >= 0) {
+                cudaSetDevice(dev);
+                if (cs) cudaStreamSynchronize(cs);
+                gemm.reset();
+                for (int i = 0; i < STAGE; ++i) {
+                    if (copied[i]) cudaEventDestroy(copied[i]);
+                    if (used[i]) cudaEventDestroy(used[i]);
+                    if (stage_host[i]) cudaFreeHost(stage_host[i]);
+                    copied[i] = used[i] = nullptr;
+                    stage_host[i] = nullptr;
+                }
+                if (dm_ready) cudaEventDestroy(dm_ready);
+                if (copy) cudaStreamDestroy(copy);
+                if (cs) cudaStreamDestroy(cs);
+                for (void* p : owned) cudaFree(p);
+                dm_ready = nullptr;
+                copy = cs = nullptr;
+                owned.clear();
+            }
+            cudaSetDevice(main_dev);
+            if (xs_ready) cudaEventDestroy(xs_ready);
+            xs_ready = nullptr;
+            cudaSetDevice(prev);
+        }
+    } c2;
 };
 
 namespace {
@@ -161,6 +214,7 @@ Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() {
     if (!impl_) return;
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
+    impl_->c2.release();
     for (int i = 0; i < STAGE; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -247,6 +301,70 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(NE); m.off.resize(NE + 1);
     m.ple_emb_host.resize(T * N); m.ple_rows.resize(T * strata::kernels::PLE_N_HEADS);
     if (!ok) { err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit"; return false; }
+    return true;
+}
+
+bool Prefill::enable_card2(const core::SecondCard& sc, std::string& err) {
+    Impl& m = *impl_;
+    Impl::Card2& c = m.c2;
+    if (sc.device < 0 || sc.host_res == nullptr || sc.cache_base == nullptr || sc.slot_off == nullptr) {
+        err = "prefill: the second card has no expert cache";
+        return false;
+    }
+    c.dev = sc.device;
+    c.main_dev = sc.main_device;
+    c.host_res = sc.host_res;
+    c.cache_base = sc.cache_base;
+    c.slot_off = sc.slot_off;
+    c.rows_cap = m.T * K * 6 / 10;   // its share is kept under 60% of a chunk's rows (see the MoE step)
+    int prev = 0;
+    cudaGetDevice(&prev);
+    bool ok = cudaSetDevice(c.dev) == cudaSuccess;
+    if (ok) {   // the rows go over NVLink both ways: peer access from this card to the main card and back
+        const cudaError_t e = cudaDeviceEnablePeerAccess(c.main_dev, 0);
+        if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) ok = false;
+        (void) cudaGetLastError();
+    }
+    ok = ok && cudaStreamCreateWithFlags(&c.cs, cudaStreamNonBlocking) == cudaSuccess &&
+         cudaStreamCreateWithFlags(&c.copy, cudaStreamNonBlocking) == cudaSuccess &&
+         cudaEventCreateWithFlags(&c.dm_ready, cudaEventDisableTiming) == cudaSuccess;
+    if (ok) {
+        Alloc o;
+        o.owned = &c.owned;
+        const size_t R = (size_t) c.rows_cap;
+        c.Xs = o.take<uint16_t>(R * N, ok);
+        c.GU = o.take<float>(R * 1280, ok);
+        c.Hh = o.take<uint16_t>(R * 640, ok);
+        c.Dm = o.take<float>(R * N, ok);
+        for (int i = 0; i < DQ; ++i) { c.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); c.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+        for (int i = 0; i < STAGE; ++i) {
+            c.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
+            if (cudaHostAlloc((void**) &c.stage_host[i], (size_t) MAXBLOB(), cudaHostAllocPortable) != cudaSuccess) ok = false;
+            if (cudaEventCreateWithFlags(&c.copied[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
+            if (cudaEventCreateWithFlags(&c.used[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
+        }
+        if (ok) {
+            c.gemm.reset(new Gemm);
+            ok = c.gemm->init((void*) c.cs, 0, err);   // created with this card current: its handle works here
+        }
+    }
+    if (ok) {
+        ok = cudaSetDevice(c.main_dev) == cudaSuccess;
+        if (ok) {
+            const cudaError_t e = cudaDeviceEnablePeerAccess(c.dev, 0);
+            if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) ok = false;
+            (void) cudaGetLastError();
+        }
+        ok = ok && cudaEventCreateWithFlags(&c.xs_ready, cudaEventDisableTiming) == cudaSuccess;
+    }
+    cudaSetDevice(prev);
+    if (!ok) {
+        if (err.empty())
+            err = "prefill: the second card's buffers for " + std::to_string(c.rows_cap) + " rows do not fit";
+        c.release();
+        return false;
+    }
+    c.on = true;
     return true;
 }
 
@@ -571,8 +689,51 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (e < 0 || e >= NE) { err = "prefill: routed id out of range"; return false; }
                         ++m.cnt[(size_t) e];
                     }
-                    m.off[0] = 0;
-                    for (int64_t e = 0; e < NE; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
+                    // DACAN 29.09.2026: which card computes each expert (see enable_card2).  One in the main card's cache
+                    // stays here; one only the second card holds goes there; the rest are streamed from the host and
+                    // each goes to the card with less work so far, so both PCIe links carry them.  The main card's rows
+                    // come first and the second card's after them, so one copy each way moves those over NVLink.
+                    std::vector<int32_t> order, order2;   // the experts of each card, in id order
+                    int64_t rows2 = 0;
+                    {
+                        const bool two = m.c2.on;
+                        double load1 = 0.0, load2 = 0.0;
+                        std::vector<int32_t> streamed;
+                        for (int32_t e = 0; e < NE; ++e) {
+                            const int64_t ne = m.cnt[(size_t) e];
+                            if (ne == 0) continue;
+                            const bool r1 = m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0;
+                            const bool r2 = two && m.c2.host_res[(size_t) l * NE + e] >= 0;
+                            if (r1 || !two) {
+                                order.push_back(e);
+                                load1 += (r1 ? 1.0 : 3.0) + (double) ne / 64.0;
+                            } else if (r2 && rows2 + ne <= m.c2.rows_cap) {
+                                order2.push_back(e);
+                                rows2 += ne;
+                                load2 += 1.0 + (double) ne / 64.0;
+                            } else {
+                                streamed.push_back(e);
+                            }
+                        }
+                        for (const int32_t e : streamed) {   // a streamed expert costs its PCIe copy more than its math
+                            const int64_t ne = m.cnt[(size_t) e];
+                            const double w = 3.0 + (double) ne / 64.0;
+                            if (load2 < load1 && rows2 + ne <= m.c2.rows_cap) {
+                                order2.push_back(e);
+                                rows2 += ne;
+                                load2 += w;
+                            } else {
+                                order.push_back(e);
+                                load1 += w;
+                            }
+                        }
+                        std::sort(order.begin(), order.end());
+                        std::sort(order2.begin(), order2.end());
+                    }
+                    int32_t pos = 0;
+                    for (const int32_t e : order) { m.off[(size_t) e] = pos; pos += m.cnt[(size_t) e]; }
+                    const int64_t split = pos;   // rows [split, T*K) belong to the second card
+                    for (const int32_t e : order2) { m.off[(size_t) e] = pos; pos += m.cnt[(size_t) e]; }
                     std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                     for (int64_t i = 0; i < T * K; ++i) {
                         const int32_t e = m.ids_host[(size_t) i];
@@ -583,10 +744,90 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
                     cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
                     gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
-                    // the experts, in id order: resident ones from VRAM, the others through the staging ring
-                    std::vector<int32_t> order;
-                    for (int32_t e = 0; e < NE; ++e) if (m.cnt[(size_t) e] > 0) order.push_back(e);
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+                    // one expert's weights to FP16 - the same calls on either card
+                    auto dequant = [&](const uint8_t* blob_dev, uint16_t* gu, uint16_t* dd, cudaStream_t st) {
+                        if (lay.native) {
+                            // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
+                            const auto& f = lay.fmt[(size_t) l];
+                            if (f.scaled) {   // 27.09.2026: NVFP4 - the expert's global scales folded into the fp16
+                                const float* sc = (const float*) (blob_dev + f.scale_off);
+                                strata::kernels::iq_dequant_gu_f16_scaled(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
+                                                                          f.n_embd, gu, sc, st);
+                                strata::kernels::iq_dequant_f16_scaled(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff,
+                                                                       dd, sc + 2, st);
+                            } else {
+                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
+                                                                   f.n_embd, gu, st);
+                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, dd, st);
+                            }
+                        } else {
+                            blob_dequant_f16(blob_dev, gu, dd, st);
+                        }
+                    };
+                    // the second card's experts, issued first so they run while the main card works through its own:
+                    // its rows over NVLink, its experts from its cache or over its own PCIe link, the results back
+                    if (!order2.empty()) {
+                        Impl::Card2& c = m.c2;
+                        cudaEventRecord(c.xs_ready, m.cs);
+                        cudaSetDevice(c.dev);
+                        cudaStreamWaitEvent(c.cs, c.xs_ready, 0);
+                        cudaMemcpyPeerAsync(c.Xs, c.dev, m.Xs + (size_t) split * N, c.main_dev, (size_t) rows2 * N * 2, c.cs);
+                        int next2 = 0;
+                        std::vector<int> stage2(order2.size(), -1);
+                        size_t staged2 = 0;
+                        bool ok2 = true;
+                        for (size_t j = 0; j < order2.size() && ok2; ++j) {
+                            while (ok2 && staged2 < order2.size() && staged2 <= j + (STAGE - 1)) {
+                                const int32_t e = order2[staged2];
+                                if (c.host_res[(size_t) l * NE + e] < 0) {
+                                    const int sl = next2;
+                                    next2 = (next2 + 1) % STAGE;
+                                    const uint8_t* b = m.src->blob(l, e);
+                                    if (!b) { err = "prefill: expert source has no blob"; ok2 = false; break; }
+                                    const size_t bytes = (size_t) lay.blob_bytes(l);
+                                    if (m.src->pinned(l, e)) {
+                                        if (c.stage_live[sl]) cudaStreamWaitEvent(c.copy, c.used[sl], 0);
+                                        cudaMemcpyAsync(c.stage_dev[sl], b, bytes, cudaMemcpyHostToDevice, c.copy);
+                                    } else {
+                                        if (c.stage_live[sl]) cudaEventSynchronize(c.used[sl]);
+                                        std::memcpy(c.stage_host[sl], b, bytes);
+                                        cudaMemcpyAsync(c.stage_dev[sl], c.stage_host[sl], bytes, cudaMemcpyHostToDevice, c.copy);
+                                    }
+                                    cudaEventRecord(c.copied[sl], c.copy);
+                                    c.stage_live[sl] = true;
+                                    stage2[staged2] = sl;
+                                    ++stats_.streamed_card2;
+                                }
+                                ++staged2;
+                            }
+                            if (!ok2) break;
+                            const int32_t e = order2[j];
+                            const uint8_t* blob_dev = nullptr;
+                            if (stage2[j] < 0) {
+                                blob_dev = c.cache_base + c.slot_off[c.host_res[(size_t) l * NE + e]];
+                            } else {
+                                cudaStreamWaitEvent(c.cs, c.copied[stage2[j]], 0);
+                                blob_dev = c.stage_dev[stage2[j]];
+                            }
+                            const int q = (int) (j % DQ);
+                            dequant(blob_dev, c.dq_gu[q], c.dq_d[q], c.cs);
+                            if (stage2[j] >= 0) cudaEventRecord(c.used[stage2[j]], c.cs);
+                            const int64_t o0 = m.off[(size_t) e] - split, ne = m.cnt[(size_t) e];
+                            c.gemm->f16(c.Xs + o0 * N, c.dq_gu[q], c.GU + o0 * 1280, ne, 1280, N);
+                            swiglu_interleaved(c.GU + o0 * 1280, c.Hh + o0 * 640, ne, c.cs);
+                            c.gemm->f16(c.Hh + o0 * 640, c.dq_d[q], c.Dm + o0 * N, ne, N, 640);
+                        }
+                        if (ok2) {
+                            cudaMemcpyPeerAsync(m.Dm + (size_t) split * N, c.main_dev, c.Dm, c.dev, (size_t) rows2 * N * 4, c.cs);
+                            cudaEventRecord(c.dm_ready, c.cs);
+                        }
+                        cudaSetDevice(c.main_dev);
+                        if (!ok2) return false;
+                        stats_.experts_card2 += (int64_t) order2.size();
+                        stats_.rows_card2 += rows2;
+                    }
+                    // the main card's experts, in id order: resident ones from VRAM, the others through the staging ring
                     // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                     int stage_next = 0;
                     std::vector<int> stage_of(order.size(), -1);
@@ -633,30 +874,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             blob_dev = m.stage_dev[stage_of[j]];
                         }
                         const int q = (int) (j % DQ);
-                        if (lay.native) {
-                            // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
-                            const auto& f = lay.fmt[(size_t) l];
-                            if (f.scaled) {   // 27.09.2026: NVFP4 - the expert's global scales folded into the fp16
-                                const float* sc = (const float*) (blob_dev + f.scale_off);
-                                strata::kernels::iq_dequant_gu_f16_scaled(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
-                                                                          f.n_embd, m.dq_gu[q], sc, m.cs);
-                                strata::kernels::iq_dequant_f16_scaled(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff,
-                                                                       m.dq_d[q], sc + 2, m.cs);
-                            } else {
-                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
-                                                                   f.n_embd, m.dq_gu[q], m.cs);
-                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff,
-                                                                m.dq_d[q], m.cs);
-                            }
-                        } else {
-                            blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
-                        }
+                        dequant(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                         if (stage_of[j] >= 0) cudaEventRecord(m.used[stage_of[j]], m.cs);
                         const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                         m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
                         swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                         m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                     }
+                    if (!order2.empty()) cudaStreamWaitEvent(m.cs, m.c2.dm_ready, 0);   // its rows are in Dm now
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                 }
                 // ---- the hyper-connection write of this half
