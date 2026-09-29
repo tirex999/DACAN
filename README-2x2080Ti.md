@@ -181,7 +181,11 @@ for the main card; `usage_other_2609.bin`: the full counts, from which the secon
 - `"min_max_tokens": 100000` in the server config: a client that asks for less (agents that send `max_tokens: 32000`)
   gets 100,000 - never more than the context has left; `max_tokens` above it and "unlimited" (0 / -1) are unchanged.
 - One request at a time. The conversation cache (upstream v0.1.3+, `--prompt-cache`, 6 checkpoints by default) keeps
-  the next turn of a conversation from re-reading the whole context; `turing-v0.1.2` has no cache.
+  the next turn of a conversation from re-reading the whole context; `turing-v0.1.2` has no cache. It holds **one
+  conversation**: in a Claude Code session that grew from 32K to 131K tokens, 70 turns in a row took 99 % of the prompt
+  from the cache (2–6 s to read a turn). Any other request in between (another chat, a separate short request of the
+  same client) replaces it, and the next turn re-reads everything at ~300 tok/s: 88K and 90K tokens took 296 and 303 s.
+  The engine log shows it per request: `prompt N tokens = R reused + X read`.
 - A GPU-computed expert gives slightly different tokens than a CPU one (different activation quantization, both from
   llama.cpp); `--numa` does not change the output.
 
