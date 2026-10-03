@@ -64,9 +64,23 @@ layers and the draft layer) - about **7 GB at 262K** instead of 3.6 GB. That VRA
 KV streaming (`--kv-resident`, which the installer turns on from 64K of context when the RAM allows) the KV lives in
 system RAM instead, so 16-bit needs those 7 GB of RAM.
 
-## What we measured and what we did not
+## Measured on a 48 GB card (a user's report, 03.10.2026)
 
-We run DACAN on two 22 GB cards (see [README-2x2080Ti.md](../README-2x2080Ti.md)); we have no single 48 GB card. The
-cap and the fix follow from the code above, and the profile files were checked (the first 8,000 pairs identical, all
-24,576 distinct and in range, a valid frequency table). The speed gain on a big card was not measured by us - if you
-run it, the log line above and the tokens/s before and after are what tells.
+RTX 4090 48 GB, Ryzen 7 9700X (8 cores), 59 GB of RAM; the same model and settings before and after: ISTA's
+Qwen3.8-Flash-Next IQ3_S, `--kv fp16`, 262K context. Figures from DACAN's Monitor:
+
+| | before | with the full profile |
+|---|---:|---:|
+| experts cached on the card | 8,000 (22.8 of 48 GB of VRAM) | **17,304** (32.8 GB; the card at 47.6 of 48 GB) |
+| answer speed | 50.6 tok/s (the Monitor's live figure, early in an answer) | **95.3 tok/s** over a whole 2,279-token answer, 75-85K of context |
+| short answers at 75-85K of context | - | 112-176 tok/s |
+
+The user's own word: "noticeably faster, almost twice". The CPU stays at 97 % and the card at ~81 %: every expert moved
+onto the card is work taken off the 8 cores. The "before" figure is a live reading, not a whole answer, so "about twice"
+is an estimate rather than an exact ratio. The requests carry the Monitor's ESP badge (the experimental projection
+vector was on); by [DETAILS.md](DETAILS.md#experimental-speed-projection-experimental-off-by-default) it costs
+0.2-0.4 % per token, so it is not where the gain comes from.
+
+We run DACAN on two 22 GB cards ourselves (see [README-2x2080Ti.md](../README-2x2080Ti.md)). The cap and the fix follow
+from the code above; the profile files were checked (the first 8,000 pairs identical, all 24,576 distinct and in range,
+a valid frequency table).
