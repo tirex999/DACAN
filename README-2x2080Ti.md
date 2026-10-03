@@ -35,9 +35,10 @@ The loader refuses any other geometry (`Qwen4ExpGuard` in `include/strata/artifa
 288 / 320 experts and the like) do not.
 
 Weights packed for DACAN: **[tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN)**
-(26 files, 254.6 GB): Q8_0 experts we requantized from Qwen's FP8 checkpoint, NVIDIA's
-[NVFP4 experts](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) repacked, the dense part, the n-gram table and
-the MTP layer. Also usable: the [ISTA-DASLab GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+(27 files, 260.6 GB): Q8_0 experts we requantized from Qwen's FP8 checkpoint, NVIDIA's
+[NVFP4 experts](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) repacked, the dense GGUF for `--native`
+(`Qwen3.8-Flash-Next-dense-Q8_0.gguf`, 5.99 GB, cut by `tools/2x2080ti/dense_gguf.py`; with it the engine gave three
+greedy answers identical character for character to the service's), the n-gram table and the MTP layer. Also usable: the [ISTA-DASLab GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 quants. Licenses: the model's [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE);
 the NVFP4 experts also NVIDIA's Open Model License.
 
