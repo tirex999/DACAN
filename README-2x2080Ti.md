@@ -11,8 +11,9 @@ prompt lookup and per-request sampling come from upstream. Checked against our v
 256 greedy tokens at the same speed (60.45 vs 60.48 tok/s; one card, a fixed 4000-expert cache, prompt lookup off).
 `turing-v0.1.2` is upstream v0.1.2 (`6da1f66`) plus the same changes, the version most numbers below were measured on.
 
-Our rig: 2× RTX 2080 Ti 22 GB (modded, NVLink bridge, PCIe 3.0 x16 each), 2× Xeon Ice Lake (AVX-512 VNNI/VBMI),
-251 GB DDR4-2666, Proxmox LXC, CUDA 13.0, driver 610, gcc 15.
+Our rig: 2× RTX 2080 Ti 22 GB (modded, NVLink bridge, PCIe 3.0 x16 each), 2× Xeon Ice Lake (AVX-512 VNNI/VBMI,
+64 cores / 128 threads), 16× 16 GB DDR4 RDIMM at 2666 on all 16 channels (256 GB, 251 GiB visible), Proxmox LXC,
+CUDA 13.0, driver 610, gcc 15.
 
 ## The model
 
@@ -42,6 +43,33 @@ the NVFP4 experts also NVIDIA's Open Model License.
 
 ## Speed
 
+**The service as it runs now, measured 03.10.2026 on a free node** (NVFP4 experts, `--prefill 8192 --park 16`,
+the neighbouring VM's workload stopped for the run). Greedy, no reasoning unless noted; every request is new text,
+not in the engine's cache; speeds from the engine's own line (`strata serve: prompt … read in …, … generated in …`):
+
+| request | prompt tokens | prompt read, tok/s | answer tokens | answer, tok/s | drafts accepted |
+|---|---:|---:|---:|---:|---:|
+| Python module (in-memory SQL: parser, executor, tests) | 72 | — | 10 250 | **76.9** | 85 % |
+| list from a fresh 19K-token document (25 facts of 25 right) | 19 338 | **785.6** | 597 | **80.4** | 89 % |
+| list from a fresh 98K-token document (11 of 11) | 97 875 | **714.6** | 259 | **69.9** | 87 % |
+| LRU cache, reasoning low (the 27.09 calibration prompt) | 88 | — | 1 984 | **71.9** | 67 % |
+| essay in English | 58 | — | 1 931 | **60.4** | 57 % |
+| essay in Russian | 77 | — | 2 340 | **47.0** | 32 % |
+
+The spread is the MTP drafts: code and lists are predictable, prose less so, Russian prose least. One "tok/s" without
+the kind of text says little. The same calibration prompt gave 64.9 tok/s on 27.09 with the neighbouring VM loaded
+(68.3 with that VM capped at 4 CPUs); part of the gain since then is the engine, not only the free node.
+
+Memory bandwidth of this node (STREAM triad, `membw.c` and
+[`membw_numa.sh`](https://github.com/tirex999/2x2080ti-nvlink-44gb/blob/main/scripts/membw_numa.sh) from the site
+repo, 03.10, quiet node):
+whole machine with pages first-touched by their socket 269 GB/s at 64 threads whether threads are pinned or not
+(274 at 128); one socket on its own memory 133–135, on the other socket's memory over UPI 70.8;
+`numactl --interleave=all` 182; both sockets with all memory on one node 95. That is why `--numa` places each half
+of every expert's rows on its own node.
+
+The tables below are earlier measurements (27–28.09).
+
 Decode tokens/s through the OpenAI server on long coding answers (8–13K tokens), MTP drafts (`--spec 4`), 131K context:
 
 | quant (experts / dense) | decoding | task, reasoning level | tok/s | checks passed |
@@ -69,8 +97,9 @@ no `max_tokens`): a code word hidden at 40 % depth of a code listing was found a
 | 105 017 | 6 min 9 s | 285 | 52.9 | found |
 | 195 164 | 12 min 12 s | 267 | 53.5 | found |
 
-Prefill runs on the main card alone and streams the experts it lacks over its one PCIe 3.0 link; the second card, NVLink
-and the CPUs sit idle in it (next on the list). A multi-turn chat re-reads only the new text (conversation cache).
+Up to 29.09 prefill ran on the main card alone and streamed the experts it lacked over its one PCIe 3.0 link, with the
+second card, NVLink and the CPUs idle. Since 29.09 both cards read the prompt in 8K-token chunks: 786 tok/s at 19K and
+715 at 98K (table above; how — further down). A multi-turn chat re-reads only the new text (conversation cache).
 
 The sm_75 port alone, on one card and one socket: 25–39 tok/s on the same tasks. A direct single-prompt measurement of our 4-bit quant
 (IQ4_XS/IQ4_NL experts, Q8_0 dense and n-gram table) went 39.7 → 71.7 tok/s with `--numa`, output identical bit for
