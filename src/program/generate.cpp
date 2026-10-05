@@ -612,22 +612,23 @@ struct PosRegion {
 
 bool positional_regions(const strata::core::QsaState& st, const strata::kernels::QsaShapes& s, int64_t L,
                         std::vector<PosRegion>& out) {
-    if (st.kv_mode != 0) return false;
+    const bool on_host = st.kv_mode != 0;
+    if (on_host && !st.host.present()) return false;
     const int64_t pages = std::min<int64_t>((L + s.page_size - 1) / s.page_size, st.n_pages);
     const size_t rows = (size_t) pages * (size_t) s.n_head_kv * (size_t) s.page_size;
     if (st.kv_q4) {
         const size_t w = (size_t) strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
-        out.push_back({st.k_q4, rows * w});
-        out.push_back({st.v_q4, rows * w});
+        out.push_back({on_host ? (void*) st.host.k_q4 : (void*) st.k_q4, rows * w});
+        out.push_back({on_host ? (void*) st.host.v_q4 : (void*) st.v_q4, rows * w});
     } else if (st.kv_int8) {
         const size_t sc = (size_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * sizeof(uint16_t);
-        out.push_back({st.k_q, rows * (size_t) s.head_dim});
-        out.push_back({st.v_q, rows * (size_t) s.head_dim});
-        out.push_back({st.k_scale, rows * sc});
-        out.push_back({st.v_scale, rows * sc});
+        out.push_back({on_host ? (void*) st.host.k_q : (void*) st.k_q, rows * (size_t) s.head_dim});
+        out.push_back({on_host ? (void*) st.host.v_q : (void*) st.v_q, rows * (size_t) s.head_dim});
+        out.push_back({on_host ? (void*) st.host.k_scale : (void*) st.k_scale, rows * sc});
+        out.push_back({on_host ? (void*) st.host.v_scale : (void*) st.v_scale, rows * sc});
     } else {
-        out.push_back({st.k_pool, rows * (size_t) s.head_dim * sizeof(uint16_t)});
-        out.push_back({st.v_pool, rows * (size_t) s.head_dim * sizeof(uint16_t)});
+        out.push_back({on_host ? (void*) st.host.k_pool : (void*) st.k_pool, rows * (size_t) s.head_dim * sizeof(uint16_t)});
+        out.push_back({on_host ? (void*) st.host.v_pool : (void*) st.v_pool, rows * (size_t) s.head_dim * sizeof(uint16_t)});
     }
     if (st.idx_pooled != nullptr && st.idx_pooled_rows > 0) {
         const int64_t r = std::min<int64_t>(st.idx_pooled_rows, L / s.idx_block + 2);
@@ -659,6 +660,9 @@ bool park_cells(std::vector<uint8_t>& buf, int64_t L, const strata::core::Sessio
         if (e != cudaSuccess) return false;
         off += x.bytes;
     }
+    if (!to_host)
+        for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
+            if (ss.qsa_states[i].kv_mode == 1) strata::kernels::kv_stream_reset(ss.qsa_states[i].map, nullptr);
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
@@ -2568,11 +2572,12 @@ int main(int argc, char** argv) {
         std::vector<ParkedConv> parked;
         uint64_t park_clock = 0;
         int live_turns = 0;
+        auto parkable = [](const strata::core::QsaState& st) { return st.kv_mode == 0 || st.host.present(); };
         const bool park_ok = o.park > 0 && o.prompt_cache > 0 && g.n_qsa_layers() > 0 &&
-                             ss.qsa_states[0].kv_mode == 0 && mtp.kv_state().kv_mode == 0;
+                             parkable(ss.qsa_states[0]) && parkable(mtp.kv_state());
         if (o.park > 0 && !park_ok)
             std::fprintf(stderr, "strata serve: parking other conversations is off (it needs --prompt-cache and the "
-                                 "K/V in VRAM)\n");
+                                 "K/V in VRAM or in a host copy)\n");
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         Clock::time_point pp_t0 = Clock::now();
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {

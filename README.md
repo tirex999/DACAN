@@ -94,8 +94,8 @@ stay BF16.
 - **MTP speculative decoding**: the model's own draft layer proposes 4 tokens, one pass checks them.
 - **Fast prompt reading**: a fresh 19K-token prompt at ~800 tok/s, a 98K one at ~715, 235K at 670, 462K at 555.
 - **The n-gram table** (51 GiB as Q8_0) stays in RAM; **conversations are cached** — the next turn reads only what is
-  new, and without `--kv-resident` up to 16 other chats are parked in RAM, so a returning chat does not re-read its
-  whole context (with KV streaming parking is off).
+  new, and up to 16 other chats are parked in RAM (since 06.10.2026 with KV streaming too), so a returning chat does
+  not re-read its whole context.
 - **Server**: OpenAI-compatible (`/v1/chat/completions`) and Anthropic-compatible (`/v1/messages`), a web app with
   Chat and a live Monitor of the cards, sockets and RAM, the answer speed and the prompt-read speed (fresh
   tokens per second, live while a prompt is read and per request); images through the model's mmproj encoder.
