@@ -34,7 +34,8 @@ twice the model's native 262,144. Checked on Swift 1.5 NVFP4 + Q8 (DACAN), both 
 | 461,866 tokens | 833 s (**555 tok/s**) | 7 of 7, 4 of 4 past the 262K mark |
 | 452,336 tokens | — | a function at ~340K explained step by step and computed correctly, as at 32K |
 
-Long prompts read faster in this version: 235K 409 → 350 s, 462K 1,034 → 833 s; the answers are the same.
+Long prompts read faster in this version — engine changes plus reading in 16,384-token chunks (`--prefill 16384`):
+235K 409 → 350 s, 462K 1,034 → 833 s. The needles found after the speed-up are the same, 7 of 7.
 
 ## DACAN vs upstream Strata 0.1.39 (measured 04.10.2026)
 
@@ -48,9 +49,10 @@ CUDA 13.0) and put it next to DACAN on the same model and the same request.
 | upstream Strata 0.1.39 (its layer split across the two cards) | 605 tok/s | 17.7 tok/s |
 
 Same for both: Swift 1.5 IQ3_XXS by UkisAI, the same pack, MTP draft head and expert profile, the prompt "hamsters —
-honest physics" (1 902 tokens), greedy, 512 answer tokens, each engine through its own server. Prompt reading is a tie;
-**DACAN answers 3.8 times faster** on this hardware. Our production model, Swift 1.5 Q8_0, runs on DACAN at 75 tok/s;
-upstream 0.1.39 cannot load it (its per-layer table accepts IQ4_NL, Q5_0 or FP8, not Q8_0).
+honest physics" (1 902 tokens), greedy, 512 answer tokens, each engine through its own server. Prompt reading is close
+(3 % apart); **DACAN answers 3.8 times faster** on this hardware. Our production model is Swift 1.5 NVFP4 + Q8 (DACAN):
+58 tok/s on DACAN (median of 9 runs; Swift 1.5 Q8_0: 49 tok/s). Upstream 0.1.39 cannot load our quants: it takes
+the n-gram table only as IQ4_NL, Q5_0 or FP8, and ours is Q8_0.
 
 What we take from upstream next, one change at a time and measured: several requests at once (`parallel`), the
 system-prompt checkpoint, the faster sampler (#197), the watchdog that restarts a silent engine.
@@ -62,26 +64,27 @@ built it together.
 
 One model family: Qwen3.8-Flash-Next, architecture `qwen4exp` (Hugging Face `Qwen4ExpForConditionalGeneration`) —
 125B parameters with 6B active per token, plus a 51B n-gram embedding table and a 4B MTP layer; 48 layers of
-3 × Gated DeltaNet + 1 × Qwen Sparse Attention, each followed by a MoE of 512 experts (10 routed + 1 shared); context
-262,144 tokens. The loader checks this geometry and refuses anything else, so fine-tunes of the same shape work —
+3 × Gated DeltaNet + 1 × Qwen Sparse Attention, each followed by a MoE of 512 experts (10 routed + 1 shared); native
+context 262,144 tokens, up to 524,288 on DACAN with KV streaming (`--kv-resident`). The loader checks this geometry and refuses anything else, so fine-tunes of the same shape work —
 [Swift 1.5](https://huggingface.co/ukisai/Swift1.5-Qwen3.8-Flash-Next) by UkisAI runs unchanged — while other models and
 pruned variants (REAP etc.) do not.
 
-Weights packed for DACAN:
+Weights:
 
 - **[tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN)** — the original
-  model: **NVFP4 + Q8 (DACAN)** with NVIDIA's NVFP4 experts repacked (68 GB, what our service runs), or our Q8_0
+  model: **NVFP4 + Q8 (DACAN)** with NVIDIA's NVFP4 experts repacked (68 GB), or our Q8_0
   experts from Qwen's FP8 checkpoint (128 GB); the dense GGUF, the n-gram table, the MTP layer.
 - **[tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN)** —
-  Swift 1.5, our quants from its BF16: 8-bit (Q8_0) and **NVFP4 + Q8 (DACAN)** with our NVFP4 experts (uploaded 04.10.2026: 30 files, 321 GB).
+  Swift 1.5, our quants from its BF16: 8-bit (Q8_0) and **NVFP4 + Q8 (DACAN)** with our NVFP4 experts — what our service runs (uploaded 04.10.2026: 30 files, 321 GB).
+- The GSQ-RCO GGUF quants (2–3.5 bit) — [by ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+  for the original model and [by UkisAI](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) for
+  Swift 1.5; the installer sets these up.
 
-**NVFP4 + Q8 (DACAN)** is our name for this mix. The routed experts — about 95 % of the 125B weights — are 4-bit NVFP4
-(FP4 E2M1 values, an FP8 E4M3 scale per 16 values, an FP32 scale per tensor). The large matrices every token passes
+**NVFP4 + Q8 (DACAN)** is our name for this mix. The routed experts — about 97 % of the 125B weights — are 4-bit NVFP4
+(FP4 E2M1 values, an FP8 E4M3 scale per 16 values, an FP32 scale per expert matrix). The large matrices every token passes
 through (attention and DeltaNet projections, the shared expert, embeddings, output head) and the n-gram table are 8-bit
 Q8_0; the small sensitive ones (router, hyper-connections, the sparse-attention indexer, DeltaNet α/β, 1.4 GiB in all)
 stay BF16.
-- The [ISTA-DASLab GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) quants (2–3.5 bit)
-  that upstream's installer downloads.
 
 ## What it does
 
@@ -89,9 +92,10 @@ stay BF16.
   its own way; `--numa --second-card 1` turns the whole machine on.
 - **CPU experts on AVX-512 VNNI**, bitwise equal to ggml's results.
 - **MTP speculative decoding**: the model's own draft layer proposes 4 tokens, one pass checks them.
-- **Fast prompt reading**: a fresh 19K-token prompt at ~800 tok/s, a 98K one at ~715.
-- **The n-gram table** (51 GB) stays in RAM; **conversations are cached** and up to 16 other chats are parked in RAM,
-  so a returning chat does not re-read its whole context.
+- **Fast prompt reading**: a fresh 19K-token prompt at ~800 tok/s, a 98K one at ~715, 235K at 670, 462K at 555.
+- **The n-gram table** (51 GiB as Q8_0) stays in RAM; **conversations are cached** — the next turn reads only what is
+  new, and without `--kv-resident` up to 16 other chats are parked in RAM, so a returning chat does not re-read its
+  whole context (with KV streaming parking is off).
 - **Server**: OpenAI-compatible (`/v1/chat/completions`) and Anthropic-compatible (`/v1/messages`), a web app with
   Chat and a live Monitor of the cards, sockets and RAM, the answer speed and the prompt-read speed (fresh
   tokens per second, live while a prompt is read and per request); images through the model's mmproj encoder.
@@ -99,7 +103,9 @@ stay BF16.
 ## Hardware
 
 Ours: 2× RTX 2080 Ti 22 GB (NVLink, PCIe 3.0 x16 each), 2× Xeon Ice Lake (64 cores, AVX-512 VNNI), 256 GB DDR4-2666 on
-16 channels. RAM needed: the experts (40 GiB for 3-bit, 63 GiB NVFP4, 120 GiB Q8_0) plus the n-gram table (27–51 GiB).
+16 channels. RAM needed: the experts (40–50 GiB for GSQ-RCO, 63 GiB NVFP4, 120 GiB Q8_0) plus the n-gram table: 51 GiB as Q8_0
+in our quants; the GSQ-RCO IQ4_NL table (27 GiB) is read straight from disk. The arithmetic is in
+[docs/MANUAL.ru.md](docs/MANUAL.ru.md).
 
 Other machines users have run it on:
 
@@ -110,8 +116,10 @@ Other machines users have run it on:
 
 ## Install and run
 
-- **One card, Windows or Linux** — upstream's installer: `START-HERE.bat` (Windows) or `./setup.sh` (Linux) asks for the
-  model, size, context and images, downloads everything and starts the server; from 20 GB of VRAM it offers 16-bit KV.
+- **One card, Windows or Linux** — the installer (from upstream Strata): `START-HERE.bat` (Windows) or `./setup.sh`
+  (Linux) asks for the GSQ-RCO model, size, context, KV cache (8, 4 or 16 bit; 16 for 24 GB cards and up) and images,
+  downloads everything and starts the server; from 20 GB of VRAM it uses the full expert profile. Without `--build`
+  it installs upstream Strata's ready-made engine, with `--build` it compiles DACAN for your card.
   Details: [docs/DETAILS.md](docs/DETAILS.md).
 - **Two cards and two sockets** (our setup): build with `-DCMAKE_CUDA_ARCHITECTURES=75` and run with `--numa
   --second-card 1` — the full command and the switches: [README-2x2080Ti.md](README-2x2080Ti.md).
