@@ -23,6 +23,19 @@ the MTP draft acceptance: 85–89 % on code and lists, 57 % on English prose, 32
 256K test: **[README-2x2080Ti.md](README-2x2080Ti.md)**. Gallery of generated scenes, comparisons with llama.cpp and
 FreeToken (in Russian): **[the site](https://tirex999.github.io/2x2080ti-nvlink-44gb/flash-next.html)**.
 
+### Long context: up to 524,288 tokens (05.10.2026)
+
+With `--max-context 524288 --kv int8 --kv-resident 32768` the KV cache lives in RAM (6.2 GiB for the whole window),
+twice the model's native 262,144. Checked on Swift 1.5 NVFP4 + Q8 (DACAN), both cards, both sockets:
+
+| prompt | prompt read | check |
+|---:|---:|---|
+| 234,727 tokens | 350 s (**670 tok/s**) | 7 of 7 needles |
+| 461,866 tokens | 833 s (**555 tok/s**) | 7 of 7, 4 of 4 past the 262K mark |
+| 452,336 tokens | — | a function at ~340K explained step by step and computed correctly, as at 32K |
+
+Long prompts read faster in this version: 235K 409 → 350 s, 462K 1,034 → 833 s; the answers are the same.
+
 ## DACAN vs upstream Strata 0.1.39 (measured 04.10.2026)
 
 In one week Strata's author released 30 versions (0.1.10 to 0.1.39): a model split by layers across two or three
@@ -103,6 +116,9 @@ Other machines users have run it on:
 - **Two cards and two sockets** (our setup): build with `-DCMAKE_CUDA_ARCHITECTURES=75` and run with `--numa
   --second-card 1` — the full command and the switches: [README-2x2080Ti.md](README-2x2080Ti.md).
   `tools/2x2080ti/run-fast.sh` writes the server config and starts it.
+- **By hand, any model variant, any hardware** - our NVFP4 + Q8 and Q8_0 quants from Hugging Face, the GSQ-RCO
+  quants, one or two cards, up to 524K of context: **[docs/MANUAL.ru.md](docs/MANUAL.ru.md)** (in Russian) - which
+  files, how to build, the config and the switches.
 
 Once running: the web app at the server's address, `/v1` for OpenAI-compatible clients and coding agents,
 `/v1/messages` for Anthropic's API.
@@ -112,6 +128,7 @@ Once running: the web app at the server's address, `/v1` for OpenAI-compatible c
 | | |
 |---|---|
 | [README-2x2080Ti.md](README-2x2080Ti.md) | build and run on two cards, switches, measurements |
+| [docs/MANUAL.ru.md](docs/MANUAL.ru.md) | by hand (in Russian): every model variant, build, config, switches, memory |
 | [docs/ONE_BIG_CARD.md](docs/ONE_BIG_CARD.md) | one 24–48 GB card: fill the VRAM with experts, 16-bit KV |
 | [docs/DETAILS.md](docs/DETAILS.md) | upstream's full guide: install, API, images, troubleshooting |
 | [docs/STRATA_README.md](docs/STRATA_README.md) | upstream Strata's README |
