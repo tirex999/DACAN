@@ -3,13 +3,30 @@
 🇬🇧 **English** | 🇷🇺 [Русский](README.ru.md) · [❤️ Support the project](#support-the-project)
 
 **DACAN** is an inference engine for **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** — a 125B
-mixture-of-experts model — on hardware it was never meant for: **two RTX 2080 Ti (22 GB, NVLink) and two Xeon sockets
-with AVX-512**. It is our fork of [Strata](https://github.com/Niko1221/Strata), rebuilt for Turing cards (sm_75) and
-for a machine with two cards and two CPU sockets. The binary and build targets are still called `strata`.
+mixture-of-experts model — on ordinary hardware: **any NVIDIA card from the RTX 20 series up and any x86-64 CPU with
+AVX2; one or two cards, one or two CPU sockets, with or without AVX-512**. It is our fork of
+[Strata](https://github.com/Niko1221/Strata) that adds Turing cards (sm_75), a second card and a second CPU socket.
+We build and measure it on two RTX 2080 Ti (22 GB, NVLink) and two Xeon sockets with AVX-512; the same engine without
+AVX-512 and on one card and one socket is measured below. The binary and build targets are still called `strata`.
+
+## What it runs on
+
+| | needed | notes |
+|---|---|---|
+| **GPU** | NVIDIA, compute capability 7.5 or newer: RTX 20 (Turing), RTX 30 (Ampere), RTX 40 (Ada), RTX 50 (Blackwell) and their workstation cards; 12 GB of VRAM or more | one or two cards; NVLink is not required; the two cards may be of different generations. Fewer than 12 GB runs, but slowly. AMD and Intel GPUs are not supported (the engine is CUDA) |
+| **CPU** | x86-64, Intel or AMD, with **AVX2** (Intel Core and Xeon from Haswell, 2013; AMD Ryzen, Threadripper and EPYC) | **AVX-512 is optional**: when the CPU has AVX-512 with VNNI and VBMI (Intel Xeon from Ice Lake on, Intel Core 11th gen, AMD Zen 4 and Zen 5) the engine uses it by itself; otherwise it runs on AVX2 — that includes Intel Core 12th gen and newer and Skylake / Cascade Lake Xeons. **One or two sockets**: add `--numa` for two |
+| **RAM** | 48–64 GB for the GSQ-RCO quants (2–3.5 bit); 128 GB and more for our NVFP4 + Q8 (63 GiB of experts + the 51 GiB n-gram table), 192 GB for our Q8_0 (120 + 51 GiB) | all experts live in RAM; the GPU keeps copies of the most used ones |
+| **Driver, OS** | NVIDIA driver 580+ (CUDA 13.0); Linux or Windows (we test on Linux) | the installer checks all of the above (`./setup.sh --check`) |
+
+The build targets the card: `-DCMAKE_CUDA_ARCHITECTURES=75` (RTX 20), `86` (RTX 30), `89` (RTX 40), `120` (RTX 50),
+several separated by `;` for mixed cards. Other NVIDIA cards from compute capability 7.5 (data-centre T4, A100, L40,
+H100 and the like) take their own value (`75`, `80`, `89`, `90`); we have not tried them. Build on the machine that will
+run it, or with `-DSTRATA_PORTABLE=ON` for a binary that runs on any AVX2 CPU.
 
 ## How fast
 
-Measured 03.10.2026 on our rig (NVFP4 experts, greedy, every request new text, speeds from the engine's own log):
+Measured 03.10.2026 on our rig — two cards, two sockets, AVX-512 (NVFP4 experts, greedy, every request new text,
+speeds from the engine's own log):
 
 | request | prompt | prompt read | answer | answer speed |
 |---|---:|---:|---:|---:|
@@ -36,6 +53,29 @@ twice the model's native 262,144. Checked on Swift 1.5 NVFP4 + Q8 (DACAN), both 
 
 Long prompts read faster in this version — engine changes plus reading in 16,384-token chunks (`--prefill 16384`):
 235K 409 → 350 s, 462K 1,034 → 833 s. The needles found after the speed-up are the same, 7 of 7.
+
+### Without AVX-512, and on one card and one socket (06–07.10.2026)
+
+The same machine, engine and weights (Swift 1.5 NVFP4 + Q8), greedy, the answer capped at 2,500 tokens, answer speed
+from the engine's metrics, tok/s. The code request (a Python module with an SQL parser and tests) was sent twice, then
+an essay.
+
+| setup | code, 1st run | code, 2nd run | essay |
+|---|---:|---:|---:|
+| 2 cards, 2 sockets, AVX-512 | **82.0** | **74.0** | **51.0** |
+| 2 cards, 2 sockets, AVX2 only | 70.9 | 65.8 | 47.0 |
+| 1 card, 1 socket, AVX-512 | 56.2 | 51.5 | 38.2 |
+| 1 card, 1 socket, AVX2 only | 55.5 | 51.9 | 38.1 |
+
+- **AVX2 only**: built with `-DSTRATA_PORTABLE=ON`, run with `STRATA_FORCE_AVX2=1 STRATA_NO_NVFP4_512=1
+  STRATA_NO_IQ512=1` and AVX-512 hidden from the C library
+  (`GLIBC_TUNABLES=glibc.cpu.hwcaps=-AVX512F,-AVX512VL,-AVX512BW,-AVX512DQ,-AVX512CD`); the engine then prints
+  `this CPU has no AVX-512: the expert kernels run on AVX2`. The answers are the same as with AVX-512, token for token.
+- **1 card, 1 socket**: the second card off and the process bound to one NUMA node (`CUDA_VISIBLE_DEVICES=1 numactl
+  --cpunodebind=1 --preferred=1`, no `--numa`, no `--second-card`), `--pcie-frac 0.15`, 131,072 of context, `--vram-reserve-mib 1024`.
+- Another VM on the host was busy during all four runs.
+
+A CPU without AVX-512 costs 8–14 % here with two cards and two sockets, and at most 1.2 % with one card and one socket.
 
 ## DACAN vs upstream Strata 0.1.39 (measured 04.10.2026)
 
@@ -88,9 +128,9 @@ stay BF16.
 
 ## What it does
 
-- **Built for two cards and two sockets.** DACAN spreads the work over both GPUs, both CPU sockets and their memory in
-  its own way; `--numa --second-card 1` turns the whole machine on.
-- **CPU experts on AVX-512 VNNI**, bitwise equal to ggml's results.
+- **One card or two, one CPU socket or two.** On one card and one socket it runs as is; `--second-card 1` adds the
+  second card, `--numa` the second socket.
+- **CPU experts on AVX2 or AVX-512 (VNNI)** — picked at start by what the CPU has, results bitwise equal to ggml's.
 - **MTP speculative decoding**: the model's own draft layer proposes 4 tokens, one pass checks them.
 - **Fast prompt reading**: a fresh 19K-token prompt at ~800 tok/s, a 98K one at ~715, 235K at 670, 462K at 555.
 - **The n-gram table** (51 GiB as Q8_0) stays in RAM; **conversations are cached** — the next turn reads only what is
@@ -102,8 +142,8 @@ stay BF16.
 
 ## Hardware
 
-Ours: 2× RTX 2080 Ti 22 GB (NVLink, PCIe 3.0 x16 each), 2× Xeon Ice Lake (64 cores, AVX-512 VNNI), 256 GB DDR4-2666 on
-16 channels. RAM needed: the experts (40–50 GiB for GSQ-RCO, 63 GiB NVFP4, 120 GiB Q8_0) plus the n-gram table: 51 GiB as Q8_0
+Requirements for any machine — in [What it runs on](#what-it-runs-on). Ours: 2× RTX 2080 Ti 22 GB (NVLink, PCIe 3.0
+x16 each), 2× Xeon Ice Lake (64 cores, AVX-512 VNNI), 256 GB DDR4-2666 on 16 channels. RAM needed: the experts (40–50 GiB for GSQ-RCO, 63 GiB NVFP4, 120 GiB Q8_0) plus the n-gram table: 51 GiB as Q8_0
 in our quants; the GSQ-RCO IQ4_NL table (27 GiB) is read straight from disk. The arithmetic is in
 [docs/MANUAL.ru.md](docs/MANUAL.ru.md).
 
@@ -111,8 +151,8 @@ Other machines users have run it on:
 
 - **One RTX 4090 48 GB**, Ryzen 7 9700X: 95 tok/s on a long answer at 75–85K of context after filling the card with experts
   — see [docs/ONE_BIG_CARD.md](docs/ONE_BIG_CARD.md) if your big card shows "8 000 experts cached".
-- **RTX 4070 Ti SUPER + RTX 5060 Ti (16 GB each), 2× Xeon E5-2678 v3**: about 45 tok/s while reasoning; these Haswell
-  CPUs have no AVX-512, so the experts run on ggml's AVX2 path and the CPUs set the pace. NVLink is not required.
+- **RTX 4070 Ti SUPER + RTX 5060 Ti (16 GB each, two generations, no NVLink), 2× Xeon E5-2678 v3 (Haswell, AVX2
+  only)**: about 45 tok/s while reasoning.
 
 ## Install and run
 
@@ -121,9 +161,10 @@ Other machines users have run it on:
   downloads everything and starts the server; from 20 GB of VRAM it uses the full expert profile. Without `--build`
   it installs upstream Strata's ready-made engine, with `--build` it compiles DACAN for your card.
   Details: [docs/DETAILS.md](docs/DETAILS.md).
-- **Two cards and two sockets** (our setup): build with `-DCMAKE_CUDA_ARCHITECTURES=75` and run with `--numa
-  --second-card 1` — the full command and the switches: [README-2x2080Ti.md](README-2x2080Ti.md).
-  `tools/2x2080ti/run-fast.sh` writes the server config and starts it.
+- **Two cards and/or two sockets**: build with your cards' architecture (ours: `-DCMAKE_CUDA_ARCHITECTURES=75`) and
+  add `--second-card 1` for the second card and `--numa` for the second socket — the full command and the switches:
+  [README-2x2080Ti.md](README-2x2080Ti.md). `tools/2x2080ti/run-fast.sh` writes the server config and starts it.
+- **Without AVX-512** nothing changes: the same build and switches; the engine picks AVX2 by itself.
 - **By hand, any model variant, any hardware** - our NVFP4 + Q8 and Q8_0 quants from Hugging Face, the GSQ-RCO
   quants, one or two cards, up to 524K of context: **[docs/MANUAL.ru.md](docs/MANUAL.ru.md)** (in Russian) - which
   files, how to build, the config and the switches.

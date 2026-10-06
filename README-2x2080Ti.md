@@ -3,9 +3,10 @@
 Build, run and measurements behind [README.md](README.md) (overview in English) and [README.ru.md](README.ru.md)
 (overview in Russian).
 
-**DACAN** is our engine, a fork of [Strata](https://github.com/Niko1221/Strata) rebuilt for older and server hardware:
-**Turing cards (sm_75), two GPUs joined by NVLink, two CPU sockets with AVX-512**. The binary and build targets are
-still called `strata`; "Strata" below means the upstream engine.
+**DACAN** is our engine, a fork of [Strata](https://github.com/Niko1221/Strata) that adds **Turing cards (sm_75), a
+second GPU (NVLink optional) and a second CPU socket**. It runs on one or two cards, one or two sockets, with or without
+AVX-512 — requirements: [What it runs on](README.md#what-it-runs-on). This page is about our rig with two cards and two
+sockets. The binary and build targets are still called `strata`; "Strata" below means the upstream engine.
 
 DACAN is based on upstream v0.1.9 (`9e599c0`); the conversation cache between requests, KV streaming, IQ3_S, prompt
 lookup and per-request sampling come from upstream.
@@ -89,7 +90,8 @@ length —
 Since 29.09 a fresh prompt reads at 786 tok/s at 19K and 715 at 98K (table above). A multi-turn chat re-reads only the
 new text (conversation cache).
 
-The sm_75 port alone, on one card and one socket: 25–39 tok/s on the same tasks. Full tables, scene screenshots and
+On one card and one socket (06–07.10.2026): 51.5–56.2 tok/s on code and 38.2 on an essay, with or without AVX-512 —
+[the table](README.md#without-avx-512-and-on-one-card-and-one-socket-0607102026). Full tables, scene screenshots and
 llama.cpp comparisons (in Russian):
 [tirex999.github.io/2x2080ti-nvlink-44gb/flash-next.html](https://tirex999.github.io/2x2080ti-nvlink-44gb/flash-next.html).
 
@@ -103,7 +105,7 @@ llama.cpp comparisons (in Russian):
 | **The n-gram table stays in RAM** | `STRATA_PLE_LOCK=0` leaves it in the page cache |
 | **Faster prompt reading** | `--prefill 8192`; `STRATA_PREFILL_CARD2=0` keeps the prompt on one card |
 | **Parked conversations**: other chats wait in RAM instead of being re-read | `--park N`, `--park-mib`, `--park-min` |
-| **NVIDIA NVFP4 experts** straight from NVIDIA's ModelOpt checkpoint, on the GPU and on AVX-512 VNNI | `native_experts.txt` v4, `tools/nvfp4_experts.py` |
+| **NVIDIA NVFP4 experts** straight from NVIDIA's ModelOpt checkpoint, on the GPU and on the CPU (AVX-512 VNNI or AVX2) | `native_experts.txt` v4, `tools/nvfp4_experts.py` |
 | **Q8_0 experts from Qwen's FP8 checkpoint** (0.55–0.59 % from the FP8 weights; NVFP4 is 9.8 %) | `native_experts.txt` v3, `tools/q8_experts.py` |
 | IQ4_XS experts on the GPU, Q8_0 token and n-gram tables | Q8_0 table: `--ple-io mmap` only |
 | **Sampling order**: upstream's per-request sampling plus vLLM's order (top-p and min-p over the temperature-scaled distribution) | `--temp-first`, `STRATA_SAMPLE_ORDER=llama` |
@@ -139,6 +141,10 @@ Add `STRATA_HELPER=zqhe STRATA_COMMIT_OVERLAP=1` to the environment for about +8
 1.3 GB of the second card's VRAM). 256K of context leaves less VRAM for the rest and costs a little speed.
 
 The log should show `NUMA: ...` with both worker groups and `n-gram table: 50.7 of 50.7 GiB in memory ...; locked`.
+
+On one socket leave out `--numa`; on one card leave out `--second-card` and `--second-card-usage` and use
+`--pcie-frac 0.15` on PCIe 3.0 instead of `0`. A CPU without AVX-512 needs no switch: the engine prints
+`this CPU has no AVX-512: the expert kernels run on AVX2`.
 
 `tools/2x2080ti/run-fast.sh` writes a config for `serve/server.py` with the same switches and starts the OpenAI server
 (`NUMA=0`: the old single-socket mode, `KV=fp16|int8`, `EXTRA="..."` for more switches).
