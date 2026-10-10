@@ -191,7 +191,9 @@ MIN_DRIVER = 580                       # CUDA 13.0
 # model, so the choice is per model config, by its oldest GPU; --cuda 12|13 overrides it (docs/OLDER_GPUS.md).
 CUDA13_MIN_ARCH = 75                   # the oldest compute capability CUDA 13 compiles for (sm_75, RTX 20)
 CUDA12_ASSET = "strata-windows-x64-cuda12.zip" if WIN else "strata-linux-x64-cuda12.zip"
-DACAN_ASSETS = ("strata-windows-x64.zip", "strata-linux-x64.zip")   # DACAN's own ready-made engines ("dacan": true)
+DACAN_ASSETS = ("strata-windows-x64.zip", "strata-linux-x64.zip")   # DACAN's own ready-made engines
+DACAN_BUILD = 2       # BUILD.json "dacan" of the current DACAN engine; a lower one (true = 1) is replaced
+                      # 2: scaled (NVFP4) packs load on Windows
 DACAN_NO_SOURCE = ("DACAN ships its engine ready-made: this folder has no engine source to compile",
                    "run UPDATE.bat (Windows) or ./update.sh (Linux) with internet: the engine comes from "
                    "https://github.com/tirex999/DACAN/releases. A GPU older than RTX 20 or an AMD card: use upstream "
@@ -2992,7 +2994,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
             warn(f"the installed engine is built for {', '.join(str(a) for a in have)}; your GPU is "
                  f"{', '.join(str(x) for x in miss)}: compiling instead")
             return None
-        if ver >= MIN_ENGINE and (meta.get("dacan") or asset not in DACAN_ASSETS):
+        if ver >= MIN_ENGINE and (int(meta.get("dacan") or 0) >= DACAN_BUILD or asset not in DACAN_ASSETS):
             ok("ready-made engine already installed")
             return eng
         say(f"  Updating the ready-made engine ({meta.get('version')} -> {'.'.join(map(str, MIN_ENGINE))} or newer) ...")
@@ -3141,7 +3143,8 @@ def update_installed_engine(url_base, toolkit=None) -> None:
         if meta.get("src") == source_hash(ENGINE_SOURCES) and \
                 (vision == "none" or meta.get("vision_src") == source_hash(VISION_SOURCES)):
             return
-    elif ver >= MIN_ENGINE and (meta.get("dacan") or (CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET)
+    elif ver >= MIN_ENGINE and (int(meta.get("dacan") or 0) >= DACAN_BUILD or
+                                (CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET)
                                 not in DACAN_ASSETS):
         return                                         # DACAN: an upstream engine of the same version is replaced
     try:                                               # a running engine cannot be replaced (Windows keeps it locked)
