@@ -203,8 +203,36 @@ def sha256(path: pathlib.Path, chunk: int = 1 << 24) -> str:
     return h.hexdigest()
 
 
-def build(gguf: pathlib.Path, out_dir: pathlib.Path, n_layers: int | None, skip_hash: bool) -> int:
+# The files the engine reads a pack's identity from (src/core/expert_source.cpp, the fingerprint): one of them in
+# --out means the directory already holds a pack, this tool's or iq_pack.py's.  experts.bin on its own does not:
+# build writes manifest.json last, so experts.bin without it is a build that did not finish, and is rebuilt.
+PACK_MARKERS = ("manifest.json", "index.txt", "native_experts.txt")
+
+
+def occupied(out_dir: pathlib.Path) -> pathlib.Path | None:
+    """The pack marker already in `out_dir`, or None when the directory is empty, absent or holds no pack."""
+    for name in PACK_MARKERS:
+        if (out_dir / name).exists():
+            return out_dir / name
+    return None
+
+
+def build(gguf: pathlib.Path, out_dir: pathlib.Path, n_layers: int | None, skip_hash: bool, force: bool = False) -> int:
+    # refused before anything is opened or written: build used to mkdir(exist_ok=True) and overwrite experts.bin,
+    # dense.bin, embd.bin and manifest.json of whatever pack was there, with nothing said
+    marker = None if force else occupied(out_dir)   # --force: setup rebuilding a pack that lost index.txt or experts.bin
+    if marker is not None:
+        print("%s already holds a pack (%s is there) - refusing to build; delete the directory, pass another "
+              "--out, or --force to rebuild it" % (out_dir, marker.name))
+        return 1
     out_dir.mkdir(parents=True, exist_ok=True)
+    if force:
+        # the old pack's markers go before a byte is written, so a forced build that stops part-way leaves an
+        # unfinished build (experts.bin without a manifest.json), which the next build or setup makes again - not
+        # the old manifest.json and index.txt over partly new experts, which setup's "index.txt and experts.bin are
+        # there" check would hand to the engine.  The data files need no removing: the build rewrites each one.
+        for name in PACK_MARKERS:
+            (out_dir / name).unlink(missing_ok=True)
     g = G.GGUFFile(gguf)
     head, flen = open_shard(gguf)
     data_off = data_section_offset(g, flen)
@@ -338,6 +366,15 @@ def verify_experts(gguf: pathlib.Path, out_dir: pathlib.Path, man: dict, every: 
 def verify(gguf: pathlib.Path, out_dir: pathlib.Path, limit: int | None, expert_every: int) -> int:
     """P1.T3 over the pack: decode it from disk and compare with the source, bit for bit."""
     man = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    # A full verify also reads back the source hash build recorded (absent after --skip-hash, which is how setup
+    # builds): a pack compared against a different shard than it was built from is a mismatch, not a decode bug.
+    want = (man.get("source") or {}).get("shard1_sha256")
+    if want and limit is None:
+        got = sha256(gguf)
+        if got != want:
+            print("%s: sha256 %s, but the pack was built from %s" % (gguf.name, got, want))
+            print("tools/strata_pack.py verify FAIL")
+            return 1
     g = G.GGUFFile(gguf)
     head, flen = open_shard(gguf)
     data_off = data_section_offset(g, flen)
@@ -393,6 +430,7 @@ def main() -> int:
     b.add_argument("--out", required=True)
     b.add_argument("--layers", type=int, default=None, help="expert layers to emit (default 48)")
     b.add_argument("--skip-hash", action="store_true")
+    b.add_argument("--force", action="store_true", help="build into a directory that already holds a pack, unmaking that pack first (#634)")
     v = sub.add_parser("verify")
     v.add_argument("--gguf", required=True)
     v.add_argument("--out", required=True)
@@ -404,7 +442,7 @@ def main() -> int:
     n.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.cmd == "build":
-        return build(pathlib.Path(args.gguf), pathlib.Path(args.out), args.layers, args.skip_hash)
+        return build(pathlib.Path(args.gguf), pathlib.Path(args.out), args.layers, args.skip_hash, args.force)
     if args.cmd == "verify":
         return verify(pathlib.Path(args.gguf), pathlib.Path(args.out), args.limit, args.expert_every)
     return info(pathlib.Path(args.out))

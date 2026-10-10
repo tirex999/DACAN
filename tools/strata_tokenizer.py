@@ -106,10 +106,15 @@ class Tokenizer:
                 if ty in (3, 4):
                     self.special_tokens[tokens[i]] = i
         always = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 4]
+        self.control_tokens = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 3]
         # Longest literal first, or `<|im_end|>` could match a shorter prefix of itself.  `regex.escape` so a
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
+        # Initialize once, rather than allocating a default dict and looking it up
+        # through __dict__.setdefault on each encoded segment or decoded token.
+        self._piece_ids: dict[str, list[int]] = {}
+        self._bytes_cache: dict[int, bytes] = {}
 
     @staticmethod
     def _alt(literals: list[str]):
@@ -142,12 +147,23 @@ class Tokenizer:
 
         Applying merges in list order rather than rank order is the classic BPE bug: it produces a different
         segmentation and a plausible token count.
+
+        A word longer than HEAP_MIN symbols (a long CJK run, a minified blob: one pre-token piece of thousands of
+        bytes) goes to _bpe_heap, which applies the same merges in the same order without rescanning every pair
+        after each merge (#268: that rescan is O(n^2) and took seconds on an 8K-character CJK run).
         """
+        if len(word) > self.HEAP_MIN:
+            return self._bpe_heap(word)
+        # `self` is read ONCE, here.  #1385: an interpreter (CPython 3.14.4) was seen handing this frame an int
+        # for `self` partway through the scan (`'int' object has no attribute 'ranks'`).  Nothing in this class
+        # can do that (no cache, decorator, slots or callback; a thread hammering test cannot make it happen),
+        # so the scan below works on a local and no longer re-reads `self` once per symbol pair.
+        ranks_get = self.ranks.get
         parts = list(word)
         while len(parts) > 1:
             best, best_rank = None, None
             for i in range(len(parts) - 1):
-                r = self.ranks.get((parts[i], parts[i + 1]))
+                r = ranks_get((parts[i], parts[i + 1]))
                 if r is not None and (best_rank is None or r < best_rank):
                     best, best_rank = i, r
             if best is None:
@@ -155,56 +171,136 @@ class Tokenizer:
             parts[best:best + 2] = [parts[best] + parts[best + 1]]
         return parts
 
+    HEAP_MIN = 64       # words up to this many symbols keep the scan above, unchanged
+
+    def _bpe_heap(self, word: str) -> list[str]:
+        """_bpe's result in O(n log n): the symbols as a linked list, every adjacent pair with a rank in a heap
+        keyed (rank, position).  Popping the lowest rank and then the lowest position is exactly the order the
+        scan picks (its strict `<` keeps the leftmost of equal ranks), and a symbol's position is where it starts
+        in the word, which only its left neighbour's merge can change - so a popped pair whose two symbols are
+        no longer the ones it was pushed with is stale and skipped."""
+        import heapq
+        parts = list(word)
+        n = len(parts)
+        nxt = list(range(1, n)) + [-1]
+        prv = list(range(-1, n - 1))
+        ranks = self.ranks
+        heap = []
+        for i in range(n - 1):
+            r = ranks.get((parts[i], parts[i + 1]))
+            if r is not None:
+                heap.append((r, i, parts[i], parts[i + 1]))
+        heapq.heapify(heap)
+        while heap:
+            r, i, left, right = heapq.heappop(heap)
+            j = nxt[i]
+            if parts[i] != left or j < 0 or parts[j] != right:
+                continue                                # stale: one of its symbols has merged since
+            parts[i] = left + right
+            parts[j] = None                             # j is gone: i takes its place in the list
+            k = nxt[j]
+            nxt[i] = k
+            if k >= 0:
+                prv[k] = i
+                r2 = ranks.get((parts[i], parts[k]))
+                if r2 is not None:
+                    heapq.heappush(heap, (r2, i, parts[i], parts[k]))
+            p = prv[i]
+            if p >= 0:
+                r2 = ranks.get((parts[p], parts[i]))
+                if r2 is not None:
+                    heapq.heappush(heap, (r2, p, parts[p], parts[i]))
+        return [s for s in parts if s is not None]
+
+    PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered (an agent resends its whole history every turn)
+
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []
+        # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
+        # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
+        cache = self._piece_ids
         for piece in self._re.findall(text):
-            mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
-            for tok in self._bpe(mapped):
-                i = self.ids.get(tok)
-                if i is None:
-                    raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
-                out.append(i)
+            got = cache.get(piece)
+            if got is None:
+                mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
+                got = []
+                for tok in self._bpe(mapped):
+                    i = self.ids.get(tok)
+                    if i is None:
+                        raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+                    got.append(i)
+                if len(cache) < self.PIECE_CACHE_MAX:
+                    cache[piece] = got
+            out.extend(got)
         return out
 
-    def _encode_matching(self, text: str, pat) -> list[int]:
+    def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
         """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest.
 
         The split happens on the RAW text, before the byte mapping, because a special token's string is a
         literal to match rather than bytes to decompose.  Everything between the matches is tokenized
-        normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.
+        normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.  A match that starts
+        inside one of the `plain` (start, end) spans is left to the text around it (#537).
         """
         if pat is None:
             return self._encode_plain(text)
         out: list[int] = []
         pos = 0
+        # Matches arrive in text order. For reusable span sequences, consume each
+        # span once instead of scanning the entire list for every literal match.
+        # Sorting a copy handles unsorted/overlapping input without mutating it.
+        # Other iterables keep the original consumption semantics below.
+        span_sequence = isinstance(plain, (list, tuple)) and bool(plain)
+        if span_sequence:
+            spans = iter(sorted(plain))
+            upcoming = next(spans, None)
+            plain_end = 0
         for m in pat.finditer(text):
-            if m.start() > pos:
-                out.extend(self._encode_plain(text[pos:m.start()]))
+            start = m.start()
+            if span_sequence:
+                while upcoming is not None and upcoming[0] <= start:
+                    plain_end = max(plain_end, upcoming[1])
+                    upcoming = next(spans, None)
+                if start < plain_end:
+                    continue
+            elif plain and any(a <= start < b for a, b in plain):
+                continue
+            if start > pos:
+                out.extend(self._encode_plain(text[pos:start]))
             out.append(self.special_tokens[m.group(0)])
             pos = m.end()
         if pos < len(text):
             out.extend(self._encode_plain(text[pos:]))
         return out
 
-    def encode(self, text: str, parse_special: bool = False) -> list[int]:
+    def encode(self, text: str, parse_special: bool = False, plain=()) -> list[int]:
         """Tokenize `text`.
 
         `parse_special` controls only the type-3 CONTROL literals such as `<|im_end|>`; the type-4
         USER_DEFINED ones such as `<think>` are matched either way.  See the note in `__init__`.
+        `plain`: (start, end) spans of `text` that are ordinary text even where they spell a literal - a
+        `</think>` quoted in a message (#537) - and are tokenized with the text around them.
         """
-        return self._encode_matching(text, self._special_re if parse_special else self._always_re)
+        return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain)
 
-    def decode(self, ids: list[int], errors: str = "replace") -> str:
-        raw = bytearray()
-        for i in ids:
+    def token_bytes(self, i: int) -> bytes:
+        """The raw bytes of one token (a multi-byte character can be split across tokens)."""
+        cache = self._bytes_cache
+        b = cache.get(i)
+        if b is None:
             if i < 0 or i >= len(self.tokens):
                 raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+            raw = bytearray()
             for ch in self.tokens[i]:
-                b = UNICODE_TO_BYTE.get(ch)
-                if b is None:
+                v = UNICODE_TO_BYTE.get(ch)
+                if v is None:
                     raise KeyError("token %d contains a character outside the byte alphabet: %r" % (i, ch))
-                raw.append(b)
-        return raw.decode("utf-8", errors=errors)
+                raw.append(v)
+            b = cache[i] = bytes(raw)
+        return b
+
+    def decode(self, ids: list[int], errors: str = "replace") -> str:
+        return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
 
 
 # ------------------------------------------------------------------ the pack's tokenizer/ directory
