@@ -65,6 +65,10 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 
+# A reply shorter than this is mostly its first step (the prompt's last chunk, the first draft window): its
+# tokens/s is not the decode speed, so it is not reported as one (the monitor showed 37 tok/s for a
+# 3-token reply while the decode ran at 67-72).
+MIN_DECODE_TOKENS = 32
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 
@@ -3957,7 +3961,7 @@ class Service:
                                 "engine_generated": last.get("generated"),
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
-                                if n and last.get("generated") and last.get("decode_ms") else None,
+                                if n >= MIN_DECODE_TOKENS and last.get("generated") and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)

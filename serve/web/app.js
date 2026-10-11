@@ -266,13 +266,22 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("state-bar").style.width = `${pct}%`;
 
   // the eight cards
-  const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
+  // the decode speed of the last answer long enough to measure it (MIN_DECODE_TOKENS in server.py): a reply of
+  // a few tokens is mostly its first step and has none
+  const lastDec = (requests || []).find((r) => r.decode_tok_s != null);
+  const speed = live.state === "generating" ? live.tok_s : lastDec ? lastDec.decode_tok_s : null;
   setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-            live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
+            live.state === "generating" ? "Decode now" : lastDec ? `Decode last answer · ${fmt(lastDec.output_tokens)} tokens` : "Decode");
+  // the prompt read of the last request that read enough fresh tokens to measure it: a few tokens take the engine's
+  // fixed start-up time, not reading time
+  const MIN_PREFILL_TOKENS = 512;
+  const freshOf = (r) => Math.max(0, (r.prompt_tokens || 0) - (r.reused || 0));
+  const lastRead = (requests || []).find((r) => r.prompt_ms > 0 && freshOf(r) >= MIN_PREFILL_TOKENS);
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
-                : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
+                : lastRead ? freshOf(lastRead) / (lastRead.prompt_ms / 1000) : null;
   setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
-            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
+            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request"
+            : lastRead ? `Prefill last read · ${fmt(freshOf(lastRead))} new tokens` : "Prefill");
   spark("sp-speed", h.tok_s);
   spark("sp-prefill", h.prefill_tok_s_mean);
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
@@ -342,7 +351,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
         (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
       // Reused tokens are not prefetched again. Match the Monitor's existing Prefill metric.
       const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
-      const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
+      const prefillRate = fresh >= 512 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;   // MIN_PREFILL_TOKENS
       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
         <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
@@ -851,7 +860,7 @@ async function send() {
   const n = usage ? usage.completion_tokens : null;
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
-    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
+    m.meta = `${fmt(n)} tokens${n >= 32 && secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
              (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
   } else if (m.stopped) {
     m.meta = "Stopped";
