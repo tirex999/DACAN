@@ -42,8 +42,8 @@ import gguf_reader as G                                    # noqa: E402
 from gguf_writer import dequantize_q2_0                    # noqa: E402
 from load import _dequant_flat                             # noqa: E402
 
-# default: $STRATA_SHARD1, else the development layout (<Strata>/Q2_0 beside <Strata>/Public/Engine)
-SHARD1 = os.environ.get("STRATA_SHARD1") or os.path.join(os.path.dirname(os.path.dirname(REPO)), "Q2_0",
+# default: $DACAN_SHARD1, else the development layout (<DACAN>/Q2_0 beside <DACAN>/Public/Engine)
+SHARD1 = os.environ.get("DACAN_SHARD1") or os.path.join(os.path.dirname(os.path.dirname(REPO)), "Q2_0",
                                                           "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf")
 
 QK = 64          # Q2_0 block: 64 elements

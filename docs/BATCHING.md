@@ -1,6 +1,6 @@
 # Several requests at once (batch slots)
 
-By default Strata serves **one request at a time**: the others wait in the server's queue. With `"parallel": N`
+By default DACAN serves **one request at a time**: the others wait in the server's queue. With `"parallel": N`
 (the engine's `--batch N`, also spelled `--slots N`) the engine keeps up to N conversations open and decodes them
 **together**: every verify window then carries one token of each conversation, so the dense weights, the shared
 expert, the head and every routed expert two conversations share are read once per window for all of them.
@@ -11,7 +11,7 @@ It is opt-in and changes nothing when the options are absent (#465; the engine p
 
 ## Turning it on
 
-One GPU: add `"parallel": 2` to the model's config (`strata-<model>.json`) and restart, or run setup with
+One GPU: add `"parallel": 2` to the model's config (`dacan-<model>.json`) and restart, or run setup with
 `--parallel 2`. Setup recommends it only where it does not cost speed (below); any number you ask for is kept as
 asked, with a note when it is more than setup would recommend.
 
@@ -19,7 +19,7 @@ asked, with a note when it is more than setup would recommend.
 "parallel": 2
 ```
 
-With MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args`, or `STRATA_BATCH_MTP=1` in the server's
+With MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args`, or `DACAN_BATCH_MTP=1` in the server's
 environment) lets each batch slot verify one MTP proposal per window. It is opt-in; without it the batch behaviour
 described below is exactly the one without MTP. It needs VRAM per slot for the draft state and buffers, so check the
 engine's free-memory log before using it on a smaller card. If it cannot run (one slot, no `--mtp`, a layer split with
@@ -61,7 +61,7 @@ read at 2508 tok/s with pipelined groups and 1217 tok/s in serial windows, and t
 (25.0 against 18.0 tok/s over its whole run); `--batch-mtp` does not change that. So it pays where concurrent decodes
 dominate; with long reads arriving beside decodes the pipelined groups can be the better choice. Not measured: more
 than two stages (the report on #1253 found no gain at four stages), more than two slots, sampled decoding, an
-upstream-main binary (the pipelined arm is our build, started with the flags 0.1.41 resolves to).
+older engine build (the pipelined arm was started with the flags 0.1.41 resolves to).
 
 Our measurement of `--batch-mtp` on a layer split with 2x R9700 and all experts in VRAM: 80.2 -> 62.7 tok/s (-21.9%, 0/5 pairs faster) against the pipelined default, so it pays only when the experts do not all fit in VRAM.
 
@@ -87,7 +87,7 @@ With a layer split, the engine options go into the config's `args`:
 | `"parallel": N` / `--batch N` / `--slots N` (2..8 normally) | up to N conversations have batch slots; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. With grouped MTP, more than 8 slots can rotate through eight-row windows if memory permits. |
 | `--batch-groups G` | with a layer split (default: auto, below): the N slots in G groups that flow through the GPUs as a pipeline (GPU k runs one group while GPU k+1 runs another). G must divide N. 1 = all slots in one window, GPU after GPU. |
 | `--batch-groups auto` | the default on a layer split since 0.1.41 (give no `--batch-groups`): the engine pipelines one group per GPU stage (the most that divide the slots; 8 slots on 4 GPUs = 4 groups of 2) and says so (`INFO batch_groups=G`). `--batch-groups 1` turns it off (all slots in one window, GPU after GPU). Measured, 8 clients, total tok/s against one group: 4 x R9700 166 against 86, 2 GPUs 109 against 78, 3 GPUs 110 against 78. With `--batch-mtp` or `--adapt-async 1` and no `--batch-groups` the default is one group (the slots' MTP drafts and the adaptive tier between batch windows do not run in pipelined groups) and the log says so; `--batch-groups G` or `--batch-groups auto` given with `--batch-mtp` pipelines the groups and turns `--batch-mtp` off, and given with `--adapt-async 1` pipelines the groups and turns `--adapt-async` off (the pipelined path does not adapt). |
-| `--trim-stage-weights` | with an **explicit** `--layer-split` (e.g. `12,24,36`, not `auto`): every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `STRATA_STAGE_TRIM=1`, PR #639). The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
+| `--trim-stage-weights` | with an **explicit** `--layer-split` (e.g. `12,24,36`, not `auto`): every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `DACAN_STAGE_TRIM=1`, PR #639). The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can - at most 8 slots by
 default (a window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit. The server reads
@@ -118,7 +118,7 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
   With `--batch-mtp`, each slot verifies one MTP proposal alongside its current token.
 - **A request left alone in a slot** (the others finished, nobody waits) goes back to the solo path: the slot is
   stopped, the engine copies its sessions back and decodes with MTP drafts again (at most twice per request; with
-  `--prompt-cache 0` it stays in the slot; `STRATA_PARALLEL_SOLO=0` turns it off). The draft layer's own K/V was
+  `--prompt-cache 0` it stays in the slot; `DACAN_PARALLEL_SOLO=0` turns it off). The draft layer's own K/V was
   built for another conversation then, but measured it accepted as many drafts (140 of 172) as a draft layer that
   read the conversation (140 of 173).
 - **More requests than slots** wait for a free one (`/metrics` -> `live.slots` shows each slot: idle, reading or
@@ -126,7 +126,7 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
 - **Each admission** reads the request's prompt through the usual prompt path (prompt cache and conversation
   checkpoints included) and produces its first token there; the state is then copied into the slot. Admissions
   are taken one at a time, and **the slots decode between the prompt's chunks**: after each chunk (`--prefill`,
-  2048-8192 tokens) they decode for half as long as the chunk took (`STRATA_BATCH_DECODE_SHARE`, default 0.5), so
+  2048-8192 tokens) they decode for half as long as the chunk took (`DACAN_BATCH_DECODE_SHARE`, default 0.5), so
   a long prompt slows the others down instead of stopping them. The chunks are the ones one uninterrupted read
   takes, so the prompt's arithmetic is unchanged.
 - **A long prompt gives way to a short one** (#656's cooperative preemption): when a request with a prompt under
@@ -148,7 +148,7 @@ most-routed experts that are not in VRAM into the cache in place of the least-ro
 solo path uses (`--adapt-swaps` and `--adapt-decay` apply too; on a layer split every GPU's cache adapts). It runs when the
 tier is not the whole model and both `--adapt-every` and `--adapt-swaps` are above 0. By default the round runs beside the
 window's commit and drafts and has landed before the next window starts. It stands still while a long prompt is read
-between decoding windows (the prompt may hold a loan of cache slots). The `strata batch:` log line shows the rounds and swaps, each stage's
+between decoding windows (the prompt may hold a loan of cache slots). The `dacan batch:` log line shows the rounds and swaps, each stage's
 GPU-reach wait and pool time, and how many routed entries the VRAM tier, the PCIe share and the CPU served per window.
 Swaps move experts between the GPU and the CPU, which round differently, so greedy outputs can differ from run to run;
 `--adapt-every 1000000` keeps the tier fixed (as in the exactness settings below). The pipelined `--batch-groups` path
@@ -176,8 +176,8 @@ tok/s added, median of 20 measurements per restart):
 The switch changes the tier in the solo path as well (there is no switch for batch windows alone), so the table
 compares the tier as a whole, not "batch windows only": the solo decode speed moves the same way (81.7, 66.3, 69.0 and
 43.1 tok/s). The prompts are the benchmark's own, eight topics that repeat, which the tier learns quickly, so on a
-more varied workload the gain may be smaller (not measured). Upstream main runs no tier in batch windows, and this
-was not measured against an upstream binary.
+more varied workload the gain may be smaller (not measured). Earlier engines ran no tier in batch windows, and this
+was not measured against one.
 
 ## Exactness
 
@@ -189,7 +189,7 @@ slot (from all it holds, and from its turn checkpoint without the reply's thinki
 its slot and continued on the solo path (`tools/batch_interleave_test.py`). These
 settings make the comparison exact:
 
-- `STRATA_IQ_MT_MIN=1` (the multi-token CPU expert kernels for every group, as for the solo path's own
+- `DACAN_IQ_MT_MIN=1` (the multi-token CPU expert kernels for every group, as for the solo path's own
   exactness tests: by default an expert's rows round differently alone than in a group, so the output depends on
   how many rows of a window share an expert - which differs between a batch and a request alone),
 - `--pcie-frac 0`: the PCIe share of the missed experts is chosen per window from the window's misses, so the
@@ -242,7 +242,7 @@ On this card the slots buy **waiting time, not speed**: the fourth of four reque
 11.2 s, but together they decode 11-24 % slower than one after the other, and a request alone loses 11 % (2 slots)
 or 24 % (4 slots), because the slots' sessions (0.56 GiB each) come out of the expert cache and most experts run
 on the CPU: a batch window over 4 conversations reads 24 CPU experts per layer against ~8 for one, so it costs about
-what the 4 tokens cost one after the other (`strata batch:` in the engine log: 54 ms per 4-row window, ~20 ms per
+what the 4 tokens cost one after the other (`dacan batch:` in the engine log: 54 ms per 4-row window, ~20 ms per
 1-row window). This is why setup leaves a 12 GB card at one at a time. Cards that hold most experts in VRAM, and a
 layer split, are where the slots also add speed (below).
 
@@ -282,23 +282,23 @@ tests the server's side with a scripted engine (no GPU).
 | `tools/parking_test.py` | a follow-up to a conversation decodes the same tokens whether its state stayed live or came back from the parking cache (with a layer split: every stage's image). |
 | `tools/early_close_test.py` | a client that stops reading a streamed answer early (alone, and with a second request running) does not leave its tokens to the next request (server). |
 
-For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000` (and the scripts set `STRATA_IQ_MT_MIN=1`):
+For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000` (and the scripts set `DACAN_IQ_MT_MIN=1`):
 
 ```
-python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 8 --n 8 \
+python3 tools/batch_test.py --exe engine/dacan --config dacan-<model>.json --batch 8 --n 8 \
     --extra "--layer-split 12,24,36 --trim-stage-weights --batch-groups 4 --pcie-frac 0 --adapt-every 1000000"
-python3 tools/batch_interleave_test.py --exe engine/strata --config strata-<model>.json \
+python3 tools/batch_interleave_test.py --exe engine/dacan --config dacan-<model>.json \
     --extra "--pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow"
-python3 tools/parking_test.py --exe engine/strata --config strata-<model>.json \
+python3 tools/parking_test.py --exe engine/dacan --config dacan-<model>.json \
     --extra "--layer-split 12,24,36 --conversation-cache-mib 8192 --conversation-cache-slots 4 --pcie-frac 0"
-STRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8080
+DACAN_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8080
 ```
 
 For single-GPU `--batch-mtp`, use a model with `rt/draft_vocab.bin` to exercise admission with a
 shared draft-vocabulary head. This compares both slots' output against solo decoding:
 
 ```
-python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 2 --n 2 --max-new 64 \
+python3 tools/batch_test.py --exe engine/dacan --config dacan-<model>.json --batch 2 --n 2 --max-new 64 \
     --extra "--batch-mtp --pcie-frac 0 --adapt-every 1000000"
 ```
 

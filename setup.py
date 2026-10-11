@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strata one-click setup and start (Windows and Linux, NVIDIA or AMD GPUs).
+"""DACAN one-click setup and start (Windows and Linux, NVIDIA or AMD GPUs).
 
     START-HERE.bat  (Windows)   /   ./setup.sh  (Linux)      - they install Python if needed and run this file
 
@@ -13,11 +13,11 @@ What the first run does (each step is skipped when it is already done):
   1. checks your PC: NVIDIA or AMD GPU and driver, RAM, CPU, free disk space
   2. asks the questions
   3. installs the Python packages it needs into .venv (numpy, jinja2, ..., and NVIDIA's CUDA libraries)
-  4. gets the Strata engine: a ready-made build for RTX 20/30/40/50 cards (no compiler needed); if none fits your PC,
+  4. gets the DACAN engine: a ready-made build for RTX 20/30/40/50 cards (no compiler needed); if none fits your PC,
      it installs the build tools (asks first) and compiles the engine for your GPU.  AMD (--backend hip, chosen by
      itself on a PC with no usable NVIDIA card): the ready-made HIP engine on Windows, compiled here on Linux
   5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images
-  6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
+  6. prepares the model for DACAN and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.bat / run-<model>.sh and starts the model
 
 Options: --family qwen|swift, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768, --rope-scaling none|linear|yarn
@@ -94,12 +94,12 @@ def hf_unpinned(url: str) -> str:
 # sizes, and is reachable from mainland China where huggingface.co often is not.  It serves a repository's current
 # files (no pinned revision), so a file from it is checked against the SHA-256 ModelScope publishes for it, and the
 # MTP tensors against the pinned checkpoint's own hashes (tools/mtp_fetch.py).
-# --source / STRATA_SOURCE: huggingface (what auto means), or modelscope: only when asked for (a different host
+# --source / DACAN_SOURCE: huggingface (what auto means), or modelscope: only when asked for (a different host
 # serving current files, not our pinned revision: setup never switches to it by itself, it recommends it, #908).
 MS_DEFAULT = "https://www.modelscope.cn"
 SOURCES = ("auto", "modelscope", "huggingface")
 HF_FILE = re.compile(r"^https?://[^/]+/(?P<repo>[^/]+/[^/]+)/resolve/[^/]+/(?P<path>.+)$")
-_sources = {}                                      # model_source()'s answer per (STRATA_SOURCE, HF_ENDPOINT, host)
+_sources = {}                                      # model_source()'s answer per (DACAN_SOURCE, HF_ENDPOINT, host)
 _ms_files = {}
 
 
@@ -110,7 +110,7 @@ def ms_endpoint() -> str:
 def reachable(url: str, timeout: float = 5.0) -> bool:
     """Whether `url` answers a HEAD request with success (2xx, after redirects) within `timeout` seconds."""
     try:
-        urllib.request.urlopen(urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"}),
+        urllib.request.urlopen(urllib.request.Request(url, method="HEAD", headers={"User-Agent": "dacan-setup"}),
                                timeout=timeout).close()
         return True
     except OSError:                                    # HTTPError too: an error page is not the file
@@ -118,10 +118,10 @@ def reachable(url: str, timeout: float = 5.0) -> bool:
 
 
 def model_source() -> str:
-    """"modelscope" or "huggingface".  ModelScope only when --source modelscope / STRATA_SOURCE=modelscope asks for it;
+    """"modelscope" or "huggingface".  ModelScope only when --source modelscope / DACAN_SOURCE=modelscope asks for it;
     everything else (auto, a HF_ENDPOINT mirror chosen on purpose, #495) is Hugging Face.  Setup does not switch hosts
     by itself (#908): ModelScope serves a repository's current files, not our pinned revision."""
-    want = (os.environ.get("STRATA_SOURCE") or "auto").strip().lower()
+    want = (os.environ.get("DACAN_SOURCE") or "auto").strip().lower()
     key = (want, os.environ.get("HF_ENDPOINT") or "", ms_endpoint())
     if key not in _sources:
         _sources[key] = "modelscope" if want in ("ms", "modelscope") else "huggingface"
@@ -153,7 +153,7 @@ def ms_meta(repo: str, path: str):
     if repo not in _ms_files:
         try:
             api = f"{ms_endpoint()}/api/v1/models/{repo}/repo/files?Recursive=true"
-            with urllib.request.urlopen(urllib.request.Request(api, headers={"User-Agent": "strata-setup"}),
+            with urllib.request.urlopen(urllib.request.Request(api, headers={"User-Agent": "dacan-setup"}),
                                         timeout=60) as r:
                 files = json.loads(r.read())["Data"]["Files"]
             _ms_files[repo] = {f["Path"]: (int(f.get("Size") or 0), (f.get("Sha256") or "").lower()) for f in files}
@@ -166,44 +166,45 @@ HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
 
-# The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json, built
+# The ready-made engine: <PREBUILT_URL><asset>, a zip with dacan(.exe), dacan-vision(.exe) and BUILD.json, built
 # by tools/make_release.py.  Set this to the GitHub release download folder when publishing, e.g.
-# "https://github.com/<you>/Strata/releases/latest/download/" (or pass --prebuilt / set STRATA_PREBUILT_URL).
+# "https://github.com/<you>/DACAN/releases/latest/download/" (or pass --prebuilt / set DACAN_PREBUILT_URL).
 # With the default, the release of this checkout's own version (PREBUILT_TAG_URL, CMakeLists.txt's version) is
 # tried first and the latest release is the fallback (#214): an older checkout keeps the engine it shipped with.
-# DACAN: the ready-made CUDA 13 Windows engine comes from DACAN's own releases (DACAN_ASSETS); the engines DACAN
-# does not publish (CUDA 12 for Pascal / Volta, AMD HIP, Linux) are upstream's of the same version (UPSTREAM_TAG_URL).
+# DACAN: the ready-made CUDA 13 engines (Windows and Linux x64) come from DACAN's own releases (DACAN_ASSETS); DACAN
+# runs on NVIDIA RTX 20 and newer, other GPUs are not supported (NOT_SUPPORTED).
 PREBUILT_URL = "https://github.com/tirex999/DACAN/releases/latest/download/"
 # The repository the release assets and their SHA-256 come from; `engine_digest` reads the API here even
 # when --prebuilt points the download somewhere else, because the hash is only worth having if it comes
 # from somewhere the download does not.
 REPO = "tirex999/DACAN"
 PREBUILT_TAG_URL = "https://github.com/tirex999/DACAN/releases/download/v{version}/"
-UPSTREAM_TAG_URL = "https://github.com/Niko1221/Strata/releases/download/v{version}/"
-UPSTREAM_VERSION = "0.1.42"                     # the upstream Strata release this DACAN is built on
-PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
+ENGINE_VERSION = "0.1.42"                       # the DACAN engine version of this release
+PREBUILT_ASSET = "dacan-windows-x64.zip" if WIN else "dacan-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
 # Older NVIDIA GPUs (experimental): CUDA 13 dropped Pascal (sm_60/61) and Volta (sm_70), so a model whose GPUs include
-# one runs a second engine, built with CUDA 12.9 (-DSTRATA_EXPERIMENTAL_SM60=ON) and kept in its own folder: the
+# one runs a second engine, built with CUDA 12.9 (-DDACAN_EXPERIMENTAL_SM60=ON) and kept in its own folder: the
 # ready-made one is CUDA12_ASSET (Windows; on Linux it is compiled here with a CUDA 12.x toolkit).  One engine runs per
 # model, so the choice is per model config, by its oldest GPU; --cuda 12|13 overrides it (docs/OLDER_GPUS.md).
 CUDA13_MIN_ARCH = 75                   # the oldest compute capability CUDA 13 compiles for (sm_75, RTX 20)
-CUDA12_ASSET = "strata-windows-x64-cuda12.zip" if WIN else "strata-linux-x64-cuda12.zip"
-DACAN_ASSETS = ("strata-windows-x64.zip", "strata-linux-x64.zip")   # DACAN's own ready-made engines
-DACAN_BUILD = 2       # BUILD.json "dacan" of the current DACAN engine; a lower one (true = 1) is replaced
+CUDA12_ASSET = "dacan-windows-x64-cuda12.zip" if WIN else "dacan-linux-x64-cuda12.zip"
+DACAN_ASSETS = ("dacan-windows-x64.zip", "dacan-linux-x64.zip")   # DACAN's own ready-made engines
+DACAN_BUILD = 3       # BUILD.json "dacan" of the current DACAN engine; a lower one (true = 1) is replaced
                       # 2: scaled (NVFP4) packs load on Windows
+                      # 3: the engine named dacan / dacan-vision, the Linux x64 engine
 DACAN_NO_SOURCE = ("DACAN ships its engine ready-made: this folder has no engine source to compile",
                    "run UPDATE.bat (Windows) or ./update.sh (Linux) with internet: the engine comes from "
-                   "https://github.com/tirex999/DACAN/releases. A GPU older than RTX 20 or an AMD card: use upstream "
-                   "Strata (https://github.com/Niko1221/Strata)")
+                   "https://github.com/tirex999/DACAN/releases (NVIDIA RTX 20 and newer, driver 580+)")
+NOT_SUPPORTED = ("DACAN runs on NVIDIA RTX 20 and newer (CUDA 13, driver 580+) under Windows x64 or Linux x64",
+                 "this GPU or system is not supported")
 CUDA12_WHEELS = ["nvidia-cublas-cu12==12.9.1.4", "nvidia-cuda-runtime-cu12==12.9.79"]
 # CUDA 12.x minor-version compatibility (NVIDIA's table: Linux 525.60.13, Windows 527.41); the wheels match the 12.9.1
 # toolkit the CUDA 12 zip is built with (cuBLAS 12.9.1.4, runtime 12.9.79).  Not tested on such an old driver here.
 CUDA12_MIN_DRIVER = 528 if WIN else 525
 ENGINE12_DIR = "engine-cuda12"
-MIN_ENGINE = (0, 1, 42)                # versions compare all numbers; v0.1.42: STRATA_ROUTE_TAIL_SKIP=7 default on CUDA (+13-16% decode), the AMD 2-GPU checkpoint fix (H13), Phase 2 fixes and opt-ins; v0.1.41.1 (folded into 0.1.42): the #1576 card order, #1616 stage size, #1595 CPU share, #1630/#1607 Windows HIP chunk cap and commit-limit warning, #1603 parallel-request bookkeeping; v0.1.41: CPU prefill share on by default (NVIDIA, chunks < 1024), --batch-groups auto, the file tier read in batches on Windows, Pascal decode fix, per-arch tables; v0.1.40.3: the #1357 MTP router guard, the #1376 Windows HIP cache floor, #461 runtime DLLs, Intel A750 first-request fix; v0.1.40.2: F4 verify windows, the Linux file tier (#1194), the stager wait (#1057), #1264/#1201/#1139 fixes, opt-in CPU share (#1282), Intel Arc; v0.1.40: --resident-experts on a layer split with the split+resident variant (#848), --kv k8v4 with KV streaming (#711); v0.1.39: the #577 file-tier regression fixed, the OpenAI Responses API (#451, Codex), a reply stuck on one token ended (#606), the head before the arena (#620), effort_position (#458), --vram-reserve hot resize opt-in (#533), PR batch; v0.1.38: prompts faster (one gather per expert group #372, the first chunk's PLE rows beside layer 0 #374, DeltaNet three heads per thread #413), --kv q4_0 prompts on tensor cores (#452), Q5_0 experts on the GPU (#473), IQ4_XS on AVX-2 (#415), unbuffered expert loading on Windows (#357 #362), --peer-device (#531), a 6 GB card starts (#496), PR batch; v0.1.37: a silent engine is restarted (#481), Windows AMD counts the desktop's VRAM (#380 #377 #497), a steadier PCIe probe (#485), fixes #496 #495 #498 #505 #493; v0.1.36: a cancelled prompt logged as read so far (#471), the draft-head hint (#474), UPDATE.bat (#475), --expert-profile-save (#477); v0.1.35: Windows AMD uses its bundled HIP runtime (#468 #461), the low-RAM resident mode on Windows 32 GB (#467), fixes #460 #459 #446 #447 #457 #448 #444; v0.1.34: AMD on Windows (a ready-made HIP engine), an MCP server for AI assistants (tools/strata_mcp.py), a shorter README; v0.1.33: a portable image encoder again (#411 #412), setup recommends instead of forcing (#406 #403 #364 #384), fixes #352 #365 #369 #371 #375 #393 #408 #414; v0.1.32: split prompts faster (#340), AMD router +12%, Unsloth Q4 in setup, faster Q4 prompts, #326/#327/#342/#344 fixes, PR batch; v0.1.31: Unsloth UD-Q4_K_XL (experimental), GGUF-in-place low-RAM mode, Windows GGUF load 2x, server race + tokenizer fixes, AMD intrinsics; v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
+MIN_ENGINE = (0, 1, 42)                # versions compare all numbers; v0.1.42: DACAN_ROUTE_TAIL_SKIP=7 default on CUDA (+13-16% decode), the AMD 2-GPU checkpoint fix (H13), Phase 2 fixes and opt-ins; v0.1.41.1 (folded into 0.1.42): the #1576 card order, #1616 stage size, #1595 CPU share, #1630/#1607 Windows HIP chunk cap and commit-limit warning, #1603 parallel-request bookkeeping; v0.1.41: CPU prefill share on by default (NVIDIA, chunks < 1024), --batch-groups auto, the file tier read in batches on Windows, Pascal decode fix, per-arch tables; v0.1.40.3: the #1357 MTP router guard, the #1376 Windows HIP cache floor, #461 runtime DLLs, Intel A750 first-request fix; v0.1.40.2: F4 verify windows, the Linux file tier (#1194), the stager wait (#1057), #1264/#1201/#1139 fixes, opt-in CPU share (#1282), Intel Arc; v0.1.40: --resident-experts on a layer split with the split+resident variant (#848), --kv k8v4 with KV streaming (#711); v0.1.39: the #577 file-tier regression fixed, the OpenAI Responses API (#451, Codex), a reply stuck on one token ended (#606), the head before the arena (#620), effort_position (#458), --vram-reserve hot resize opt-in (#533), PR batch; v0.1.38: prompts faster (one gather per expert group #372, the first chunk's PLE rows beside layer 0 #374, DeltaNet three heads per thread #413), --kv q4_0 prompts on tensor cores (#452), Q5_0 experts on the GPU (#473), IQ4_XS on AVX-2 (#415), unbuffered expert loading on Windows (#357 #362), --peer-device (#531), a 6 GB card starts (#496), PR batch; v0.1.37: a silent engine is restarted (#481), Windows AMD counts the desktop's VRAM (#380 #377 #497), a steadier PCIe probe (#485), fixes #496 #495 #498 #505 #493; v0.1.36: a cancelled prompt logged as read so far (#471), the draft-head hint (#474), UPDATE.bat (#475), --expert-profile-save (#477); v0.1.35: Windows AMD uses its bundled HIP runtime (#468 #461), the low-RAM resident mode on Windows 32 GB (#467), fixes #460 #459 #446 #447 #457 #448 #444; v0.1.34: AMD on Windows (a ready-made HIP engine), an MCP server for AI assistants (tools/dacan_mcp.py), a shorter README; v0.1.33: a portable image encoder again (#411 #412), setup recommends instead of forcing (#406 #403 #364 #384), fixes #352 #365 #369 #371 #375 #393 #408 #414; v0.1.32: split prompts faster (#340), AMD router +12%, Unsloth Q4 in setup, faster Q4 prompts, #326/#327/#342/#344 fixes, PR batch; v0.1.31: Unsloth UD-Q4_K_XL (experimental), GGUF-in-place low-RAM mode, Windows GGUF load 2x, server race + tokenizer fixes, AMD intrinsics; v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 # KV bytes per context token and attention layer: 8-bit 1056, rotated 4-bit 576, hybrid K8V4 (8-bit K, 4-bit V) 816
 KV_CELL_BYTES = {"q4_0": 576, "k8v4": 816}
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
@@ -317,8 +318,8 @@ ESP_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Ne
 VISION_GPU_SMALL_RESERVE_MIB = 1000    # the tip for images on a <= 12 GB card (the engine's LOW line asked ~1003)
 VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
-EXE = "strata.exe" if WIN else "strata"
-VEXE = "strata-vision.exe" if WIN else "strata-vision"
+EXE = "dacan.exe" if WIN else "dacan"
+VEXE = "dacan-vision.exe" if WIN else "dacan-vision"
 
 
 # ------------------------------------------------------------------------------------------------ output
@@ -716,7 +717,7 @@ def two_socket_note(sockets) -> list[str]:
 
 
 def cpu_info():
-    """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
+    """(name, avx2, avx512): avx512 means everything DACAN's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
     the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
     name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
     if WIN:
@@ -761,9 +762,9 @@ def _cpuid_floor() -> str:
 
 def cpu_floor(avx2: bool) -> str:
     """The experimental older-CPU build this PC needs (#394 #595 #623): "" with AVX2 (the normal engine), "avx" (Sandy /
-    Ivy Bridge, AMD Bulldozer), "none" (SSE4.2 + POPCNT: Nehalem, Westmere), or "unsupported".  STRATA_ISA_FLOOR=avx|
+    Ivy Bridge, AMD Bulldozer), "none" (SSE4.2 + POPCNT: Nehalem, Westmere), or "unsupported".  DACAN_ISA_FLOOR=avx|
     none asks for that build on any PC (testing it on a newer one)."""
-    forced = os.environ.get("STRATA_ISA_FLOOR", "").strip().lower()
+    forced = os.environ.get("DACAN_ISA_FLOOR", "").strip().lower()
     if forced in ("avx", "none"):
         return forced
     if avx2:
@@ -874,7 +875,7 @@ def compute_mode_warning(index: int, mode: str) -> str | None:
     """#1445: the warning for a card that is not in the Default compute mode, or None.  In Exclusive_Process only one
     process may hold a CUDA context, so the engine, the vision encoder and the tuning run cannot share the card
     ("CUDA-capable device(s) is/are busy or unavailable"); Prohibited allows none.  A warning only: it is the
-    administrator's setting, Strata never changes it."""
+    administrator's setting, DACAN never changes it."""
     if not mode or mode.lower() == "default" or mode.lower().startswith("n/a") or mode.lower().startswith("[n/a"):
         return None
     return (f"GPU {index} is in the compute mode {mode}, not Default: a second process cannot use the card while "
@@ -934,10 +935,10 @@ OLD_GPUS = None       # why Pascal / Volta cards are admitted in this run (old_g
 
 
 def experimental_sm60() -> bool:
-    """#295: STRATA_EXPERIMENTAL_SM60=1 admits Pascal (6.x) and Volta (7.0) cards, run by the experimental CUDA 12
-    engine (-DSTRATA_EXPERIMENTAL_SM60=ON).  So does naming such a card (--gpu N / --gpus), --cuda 12, or a PC that
+    """#295: DACAN_EXPERIMENTAL_SM60=1 admits Pascal (6.x) and Volta (7.0) cards, run by the experimental CUDA 12
+    engine (-DDACAN_EXPERIMENTAL_SM60=ON).  So does naming such a card (--gpu N / --gpus), --cuda 12, or a PC that
     has no newer card (old_gpus_opt_in)."""
-    return os.environ.get("STRATA_EXPERIMENTAL_SM60", "").strip() == "1" or OLD_GPUS is not None
+    return os.environ.get("DACAN_EXPERIMENTAL_SM60", "").strip() == "1" or OLD_GPUS is not None
 
 
 def sm60_card(arch) -> bool:
@@ -946,14 +947,14 @@ def sm60_card(arch) -> bool:
 
 def old_gpus_opt_in(found, named=(), cuda=None, other=False):
     """Why this run may use Pascal / Volta cards (the experimental CUDA 12 engine), or None.  The cards are an opt-in:
-    the user named one (`named`: --gpu / --gpus), asked for --cuda 12, set STRATA_EXPERIMENTAL_SM60=1, or the PC has
+    the user named one (`named`: --gpu / --gpus), asked for --cuda 12, set DACAN_EXPERIMENTAL_SM60=1, or the PC has
     no card the ready-made engine runs on and no supported AMD card (`other`; it used to stop there).  A PC with a
     newer card keeps recommending it."""
     old = [g for g in found if sm60_card(g["arch"])]
     if not old:
         return None
-    if os.environ.get("STRATA_EXPERIMENTAL_SM60", "").strip() == "1":
-        return "STRATA_EXPERIMENTAL_SM60=1"
+    if os.environ.get("DACAN_EXPERIMENTAL_SM60", "").strip() == "1":
+        return "DACAN_EXPERIMENTAL_SM60=1"
     if str(cuda) == "12":
         return "--cuda 12"
     picked = [g for g in old if g["index"] in set(named)]
@@ -1003,9 +1004,9 @@ def config_toolkit(cfg: dict) -> int:
 
 
 def gpu_problem(g, together=False):
-    """Why Strata cannot use this card, in plain words (None: it can)."""
+    """Why DACAN cannot use this card, in plain words (None: it can)."""
     if int(g["arch"]) < 75 and not (sm60_card(g["arch"]) and experimental_sm60()):
-        return (f"not supported - older than the RTX 20 series (compute capability {cc(g)}; Strata needs 7.5 or "
+        return (f"not supported - older than the RTX 20 series (compute capability {cc(g)}; DACAN needs 7.5 or "
                 "newer" + ("; experimental: choose it with --gpu " + str(g["index"]) + " (the CUDA 12 engine, "
                           "docs/OLDER_GPUS.md)" if sm60_card(g["arch"]) else "") + ")")
     if together and g["vram_gb"] < SPLIT_MIN_VRAM_GB - 0.5:
@@ -1057,7 +1058,7 @@ def parse_gpus(text, found) -> list:
         sel = [g["index"] for g in together_ok(found)]
         if not sel:
             gpu_table(found)
-            fail("--gpus all: this PC does not have two GPUs Strata can use together")
+            fail("--gpus all: this PC does not have two GPUs DACAN can use together")
         return sel
     try:
         sel = [int(x) for x in str(text).split(",") if x.strip()]
@@ -1078,7 +1079,7 @@ def check_gpus(sel, found, what="", yes=False, named=False) -> None:
         p = "not found on this PC" if g is None else gpu_problem(g, together)
         if p is None:
             continue
-        if named and g is not None and gpu_problem(g) is None:     # it runs Strata; only its VRAM is small
+        if named and g is not None and gpu_problem(g) is None:     # it runs DACAN; only its VRAM is small
             confirm_risk(f"GPU {i} ({g['name']}) has {g['vram_gb']:.0f} GB of VRAM: a card sharing the model needs "
                          f"{SPLIT_MIN_VRAM_GB} GB or more (it holds the dense weights of its layers and its own prompt "
                          "buffers), so the model may not start, or run slower than without it", True, yes,
@@ -1093,7 +1094,7 @@ def check_gpus(sel, found, what="", yes=False, named=False) -> None:
         ones = " or ".join(f"--gpu {x['index']}" for x in single)
         both = "--gpus " + ",".join(str(x["index"]) for x in can) if can else ""
         hint = ((f"use these together: {both}" + (f" (or one card: {ones})" if not together else "")) if can else
-                f"use one card: {ones}" if single else "Strata needs an NVIDIA RTX 20 series or newer card")
+                f"use one card: {ones}" if single else "DACAN needs an NVIDIA RTX 20 series or newer card")
         fail(f"GPU {i}{'' if g is None else ' (' + g['name'] + ')'} {what}cannot be used: {p}", hint)
 
 
@@ -1126,7 +1127,7 @@ def engine_runs_on(g, toolkit=13) -> bool:
 
 def start_gpus(text):
     """--gpus when starting an installed model: NVIDIA cards as nvidia-smi numbers them, or on a PC whose AMD cards
-    are the ones Strata can use, AMD cards as setup lists them ("all": every supported AMD card)."""
+    are the ones DACAN can use, AMD cards as setup lists them ("all": every supported AMD card)."""
     if not text:
         return None
     found = gpus()
@@ -1154,12 +1155,12 @@ def choose_gpus(a, found) -> list:
     single = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
     if not single:
         gpu_table(found)
-        fail("none of your GPUs can run Strata", "it needs an NVIDIA RTX 20 series or newer (compute capability 7.5+)")
+        fail("none of your GPUs can run DACAN", "it needs an NVIDIA RTX 20 series or newer (compute capability 7.5+)")
     can = together_ok(found)
     if not can:
         return [single[0]["index"]]
     say()
-    say(f"  Strata can run the model on one GPU, or share it across {'these' if len(can) > 2 else 'both'}: then each"
+    say(f"  DACAN can run the model on one GPU, or share it across {'these' if len(can) > 2 else 'both'}: then each"
         " card holds the")
     say("  experts of its own layers, so together they hold about twice as many, and prompts are read about 20%")
     say("  faster (details: docs/MULTI_GPU.md). A much slower extra card can also make it slower.")
@@ -1309,7 +1310,7 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
     # #642: the engines from RESIDENT_SPLIT_ENGINE keep it on both cards, so they are offered as for any config
     resident = "--resident-experts" in cfg.get("args", []) and not resident_split()
     say()
-    say("  This PC has " + " and ".join(gpu_name(g) for g in pair) + ": Strata can share the model across both.")
+    say("  This PC has " + " and ".join(gpu_name(g) for g in pair) + ": DACAN can share the model across both.")
     say("  Together they hold about twice the model's experts and read prompts about 20% faster (docs/MULTI_GPU.md).")
     if resident:
         say("  This model runs in the low-RAM mode with its experts kept in RAM, on one GPU (recommended: steady RAM")
@@ -1346,7 +1347,7 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
 
 
 def gpu_info(pick=None):
-    """The GPU Strata runs on: `pick` (nvidia-smi's number) if given, else the one with the most VRAM (ties: the
+    """The GPU DACAN runs on: `pick` (nvidia-smi's number) if given, else the one with the most VRAM (ties: the
     lower number).  None when there is no NVIDIA GPU.  The dict also says how many there are ("count")."""
     found = gpus()
     if not found:
@@ -1363,17 +1364,17 @@ def gpu_info(pick=None):
 
 def find_nvcc(below=None):
     """The newest CUDA toolkit's nvcc and its (major, minor); with `below`, the newest older than that version.
-    #601: STRATA_NVCC=<path to nvcc> is the only one considered (a newer toolkit beside it that cannot build on this
+    #601: DACAN_NVCC=<path to nvcc> is the only one considered (a newer toolkit beside it that cannot build on this
     PC - CUDA 12.9 with glibc 2.43 - is not taken instead)."""
-    pick = os.environ.get("STRATA_NVCC")
+    pick = os.environ.get("DACAN_NVCC")
     if pick:
         if not Path(pick).exists():
-            warn(f"STRATA_NVCC={pick}: no such file; looking for a CUDA toolkit as usual")
+            warn(f"DACAN_NVCC={pick}: no such file; looking for a CUDA toolkit as usual")
         else:
             v = re.search(r"release (\d+)\.(\d+)", out([pick, "--version"]))
             ver = (int(v.group(1)), int(v.group(2))) if v else None
             if ver and below is not None and ver >= below:
-                warn(f"STRATA_NVCC={pick} is CUDA {ver[0]}.{ver[1]}; this build needs one older than "
+                warn(f"DACAN_NVCC={pick} is CUDA {ver[0]}.{ver[1]}; this build needs one older than "
                      f"{below[0]}.{below[1]}")
                 return (None, None)
             return (pick, ver) if ver else (None, None)
@@ -1405,9 +1406,9 @@ def find_vcvars(cuda_v=None):
     The version range is CUDA's requirement alone, so a caller with no CUDA (`cuda_v is None`) asks vswhere for no
     range at all: the CPU image encoder is built by MSVC, which is happy with any version (tools/hip/build_windows.bat
     already calls vswhere that way).  With the range applied to every caller, a machine whose only C++ tools are
-    Visual Studio 2026 gets None back and nothing can be built there (#881).  STRATA_VCVARS=<vcvars64.bat> picks one
+    Visual Studio 2026 gets None back and nothing can be built there (#881).  DACAN_VCVARS=<vcvars64.bat> picks one
     by hand, for an install vswhere cannot use."""
-    override = os.environ.get("STRATA_VCVARS")
+    override = os.environ.get("DACAN_VCVARS")
     if override:
         v = Path(override)
         return v if v.exists() else None
@@ -1483,7 +1484,7 @@ def download(url, dst: Path, what=None):
     total = 0
     for attempt in range(5):
         try:
-            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "dacan-setup"})
             total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
             break
         except urllib.error.HTTPError as e:
@@ -1510,7 +1511,7 @@ def download(url, dst: Path, what=None):
         if total and have >= total:                    # stopped after the last byte, before the rename: nothing to
             break                                      # ask for (a range past the end is a 416, retried 30 times)
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={have}-"})
+            req = urllib.request.Request(url, headers={"User-Agent": "dacan-setup", "Range": f"bytes={have}-"})
             with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
                 if have and r.status != 206:                     # the server ignored the range: start over
                     f.seek(0)
@@ -1587,14 +1588,14 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
 # #444: the quantization in a GGUF's name (Unsloth's UD-IQ3_XXS, a K-quant's Q2_K_XL, a GSQ-RCO IQ3_S, ...)
 GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32))"
                         r"(?=-\d{5}-of-\d{5}\.gguf$|\.gguf$)", re.I)
-SUPPORTED_GGUFS = ("Strata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
+SUPPORTED_GGUFS = ("DACAN runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
                    "1.5's; the Coder's IQ1_M) and Unsloth's UD-Q4_K_XL and UD-IQ4_XS only: other GGUFs (Unsloth's "
                    "UD-IQ3_XXS or "
                    "UD-Q2_K_XL, K-quants) cannot be used")
 
 
 def gguf_unsupported(name: str) -> str | None:
-    """#444: the quantization a GGUF's name says, when it is one Strata cannot run (not a setup size); else None."""
+    """#444: the quantization a GGUF's name says, when it is one DACAN cannot run (not a setup size); else None."""
     m = GGUF_QUANT.search(name)
     return m.group(1) if m and m.group(1).upper() not in MODELS and not name.lower().startswith("mmproj") else None
 
@@ -1611,12 +1612,12 @@ def gguf_choice(name: str) -> tuple | None:
 
 def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple | None:
     """#444: (message, hint) when --gguf-dir has no file setup can use for this choice: the chosen shard is a GGUF
-    Strata cannot run (Unsloth's UD-IQ3_XXS taken for IQ3_XXS by its name), or it is missing and the folder holds
+    DACAN cannot run (Unsloth's UD-IQ3_XXS taken for IQ3_XXS by its name), or it is missing and the folder holds
     other GGUFs - then the hint names the --family/--model of the usable ones.  None otherwise (a missing shard in a
     folder without GGUFs stays check_shards' "missing")."""
     bad = gguf_unsupported(first.name) if first.exists() else None
     if bad:
-        return f"{first.name} is {bad}, a GGUF Strata cannot run", SUPPORTED_GGUFS
+        return f"{first.name} is {bad}, a GGUF DACAN cannot run", SUPPORTED_GGUFS
     if first.exists():
         return None
     firsts = sorted(p.name for p in folder.glob("*.gguf")
@@ -1735,7 +1736,7 @@ def get_llama_cpp():
     try:
         with zipfile.ZipFile(z) as f:
             # llama.cpp's own web UI (tools/ui) is not used, and its deep paths passed Windows' 260-character limit in a
-            # folder like Downloads\Strata-main\Strata-main (#206)
+            # folder like Downloads\DACAN-main\DACAN-main (#206)
             f.extractall(tmp, [m for m in f.namelist() if "/tools/ui/" not in m])
     except zipfile.BadZipFile:
         # #1797: do not let the .done mark make every later run reuse a damaged source archive.
@@ -1792,7 +1793,7 @@ def pip_install(packages, what):
     """pip install into .venv, skipped when the same list was installed before.  An install from before the pinned
     requirements (#214) recorded bare names: those packages are kept as they are (nothing is reinstalled), and the
     pinned dependencies it already has count as installed."""
-    stamp = Path(sys.prefix) / ".strata-pip.json"
+    stamp = Path(sys.prefix) / ".dacan-pip.json"
     have = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else []
     bare = {p.lower() for p in have if req_name(p) == p.lower()}
     need = [p for p in packages if p not in have and req_name(p) not in bare
@@ -1836,22 +1837,22 @@ ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   
                 "gfx1030": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1031": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1151": "https://rocm.nightlies.amd.com/v2/gfx1151/",       # Strix Halo (docs/STRIX_HALO.md)
-                "gfx1103": "https://rocm.nightlies.amd.com/v2/gfx110X-all/"}   # Radeon 780M: only with STRATA_EXPERIMENTAL_GFX1103=1
+                "gfx1103": "https://rocm.nightlies.amd.com/v2/gfx110X-all/"}   # Radeon 780M: only with DACAN_EXPERIMENTAL_GFX1103=1
 # The TheRock nightly indexes are pruned and move on, and each GPU family's index holds its own range (#1103: gfx103X-all
 # starts at 7.13.0a20260422 and has no 7.10; #1267: the 7.10 wheel segfaults on a Strix Halo with kernel 7.2.8), so one
 # version for every card cannot work.  The wheel is chosen per index (the family): a preferred version, tried first; when
 # the index no longer offers it, the newest one of the same 7.x line, else of the same major, with a warning (rocm_pick).
-# STRATA_ROCM_VERSION still forces one exact version (no lookup).
-ROCM_VERSION_DEFAULT = "7.10.0a20251120"                 # what Strata's HIP build was tested with (gfx120X, gfx110X)
+# DACAN_ROCM_VERSION still forces one exact version (no lookup).
+ROCM_VERSION_DEFAULT = "7.10.0a20251120"                 # what DACAN's HIP build was tested with (gfx120X, gfx110X)
 ROCM_FAMILY_PINS = {"gfx103X-all": "7.13.0a20260515",    # #1103: 7.13.0a20260515 runs; the 7.14 nightlies time out
                     "gfx110X-all": "7.10.0a20251121",    # the experimental gfx1103: this index has no ...20251120
                     "gfx1151": "7.14.0a20260608"}        # #1267: 7.14.0a20260529 to 20260608 run on kernel 7.2.8; the 7.10 wheel segfaults
-ROCM_VERSION_OVERRIDE = os.environ.get("STRATA_ROCM_VERSION") or None
+ROCM_VERSION_OVERRIDE = os.environ.get("DACAN_ROCM_VERSION") or None
 ROCM_VERSION = ROCM_VERSION_OVERRIDE or ROCM_VERSION_DEFAULT   # kept for callers that read one version
 ROCM_SYSTEM_MIN = (7, 0)       # an older system ROCm is passed over for the wheels (gfx1201 needs ROCm 6.4 or newer)
-# STRATA_EXPERIMENTAL_GFX1103=1 (opt-in, unsupported): the Radeon 780M / 760M / 740M iGPU (Ryzen 7040 / 8040, gfx1103) is taken
+# DACAN_EXPERIMENTAL_GFX1103=1 (opt-in, unsupported): the Radeon 780M / 760M / 740M iGPU (Ryzen 7040 / 8040, gfx1103) is taken
 # as a unified-memory AMD card like Strix Halo, with the portable kernels (no WMMA) (measured on one machine: Ryzen 7 255).  Unset: unchanged.
-GFX1103_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1103") == "1"
+GFX1103_OPT_IN = os.environ.get("DACAN_EXPERIMENTAL_GFX1103") == "1"
 AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151") + (("gfx1103",) if GFX1103_OPT_IN else ())
 AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs has no product name
              "gfx1101": "AMD Radeon RX 7800 XT / 7700 XT (gfx1101)",
@@ -1872,7 +1873,7 @@ AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), RX
 
 
 def rocm_index(arch):
-    return os.environ.get("STRATA_ROCM_INDEX") or ROCM_INDEXES[arch]
+    return os.environ.get("DACAN_ROCM_INDEX") or ROCM_INDEXES[arch]
 
 
 def rocm_family(index):
@@ -1904,9 +1905,9 @@ def rocm_pick(available, preferred):
         if hits:
             got = max(hits, key=rocm_vkey)
             return got, (f"ROCm {preferred} is not on this index any more: using {got}, the newest of the same {what} "
-                         f"(set STRATA_ROCM_VERSION to choose another)")
+                         f"(set DACAN_ROCM_VERSION to choose another)")
     return preferred, (f"ROCm {preferred} is not on this index and nothing of its major version is: "
-                       f"{available[0]} to {available[-1]} are (set STRATA_ROCM_VERSION to one of them)")
+                       f"{available[0]} to {available[-1]} are (set DACAN_ROCM_VERSION to one of them)")
 
 
 def rocm_wanted(index, listing=None):
@@ -1918,7 +1919,7 @@ def rocm_wanted(index, listing=None):
         preferred = ROCM_FAMILY_PINS.get(rocm_family(index), ROCM_VERSION_DEFAULT)
         if listing is None:
             try:
-                req = urllib.request.Request(index.rstrip("/") + "/rocm/", headers={"User-Agent": "strata-setup"})
+                req = urllib.request.Request(index.rstrip("/") + "/rocm/", headers={"User-Agent": "dacan-setup"})
                 with urllib.request.urlopen(req, timeout=30) as r:
                     listing = r.read().decode("utf-8", "replace")
             except (OSError, ValueError):
@@ -1948,7 +1949,7 @@ UMA_OS_LEFT_GB = 6             # the share of the unified memory kept for the OS
 
 
 def gfx_arch_is(arch, name) -> bool:
-    """include/strata/kernels/gfx_arch.hpp's gfx_arch_is: `arch` (gcnArchName, "gfx1151" or "gfx1151:sramecc-:xnack-")
+    """include/dacan/kernels/gfx_arch.hpp's gfx_arch_is: `arch` (gcnArchName, "gfx1151" or "gfx1151:sramecc-:xnack-")
     is exactly `name`, never a prefix: gfx1150 and gfx1152 are not gfx1151 (and gfx1151 is not gfx115)."""
     arch = str(arch or "")
     return arch == name or arch.startswith(name + ":")
@@ -2016,12 +2017,12 @@ def amd_device_access_problem(dev="/dev", access=os.access, listing=glob.glob) -
 
 def gfx1103_notes(gpu, ram) -> list[str]:
     """What setup tells the owner of a Radeon 780M / 760M / 740M (Phoenix / Hawk Point, gfx1103, unified memory): never
-    the Strix Halo text, which is about another chip (gfx1151).  Opt-in only (STRATA_EXPERIMENTAL_GFX1103=1)."""
+    the Strix Halo text, which is about another chip (gfx1151).  Opt-in only (DACAN_EXPERIMENTAL_GFX1103=1)."""
     notes = [f"  Radeon 780M / 760M class (gfx1103, Ryzen 7040 / 8040): the CPU and the GPU share one memory pool ({ram:.0f} GB "
              f"seen by the OS + a {gpu.get('dedicated_gb', 0.0):.1f} GB BIOS carve-out), so the model's experts live in "
              "that pool and the expert cache is sized from the memory the OS can give back."]
     notes.append("  " + ("The engine is compiled here for gfx1103" if not WIN else "This GPU has no ready-made Windows engine")
-                 + " (experimental opt-in, STRATA_EXPERIMENTAL_GFX1103=1; measured on one machine, not validated on a real "
+                 + " (experimental opt-in, DACAN_EXPERIMENTAL_GFX1103=1; measured on one machine, not validated on a real "
                  "card): see docs/AMD_HIP.md. This is not a Strix Halo.")
     if not WIN and gpu.get("shared_gb", 0) < 0.75 * ram - 1:
         notes.append(f"!the GPU can reach {gpu.get('shared_gb', 0):.0f} GB of shared memory (the GTT pool; the kernel's "
@@ -2148,7 +2149,7 @@ def amd_gpus(sysfs="/sys"):
 
 def amd_problem(g):
     if g["arch"] not in AMD_ARCHS:
-        return (f"not supported - Strata's AMD backend runs on {AMD_CARDS} only, this is {g['arch']}"
+        return (f"not supported - DACAN's AMD backend runs on {AMD_CARDS} only, this is {g['arch']}"
                 + (" (an integrated Radeon, not Strix Halo)" if g["arch"] in ("gfx1150", "gfx1152", "gfx1103") else ""))
     if g.get("cannot_run"):                            # Windows: the installed engine's own check (--list-devices)
         return g["cannot_run"]
@@ -2174,7 +2175,7 @@ def amd_gpus_win() -> list[dict]:
 
 def amd_parse_gpus(text, amd) -> list:
     """--gpus with AMD cards, numbered as HIP numbers them (setup's list): "1,0", or "all" (every supported card, the
-    most VRAM first).  Every chosen card must be one Strata supports (AMD_ARCHS; they may be of different
+    most VRAM first).  Every chosen card must be one DACAN supports (AMD_ARCHS; they may be of different
     architectures: the engine is compiled for each).  Returns the cards, the main one first."""
     usable = [g for g in amd if amd_problem(g) is None]
     if str(text).strip().lower() == "all":
@@ -2186,7 +2187,7 @@ def amd_parse_gpus(text, amd) -> list:
             fail(f"--gpus takes AMD GPU numbers as setup lists them, e.g. --gpus 1,0 (or --gpus all), not {text!r}")
     if len(sel) < 2 or len(set(sel)) != len(sel):
         fail("--gpus takes two or more different GPUs, e.g. --gpus 1,0 (one GPU: --gpu 1)",
-             "this PC has " + (f"{len(usable)} AMD card{'s' if len(usable) != 1 else ''} Strata can use"
+             "this PC has " + (f"{len(usable)} AMD card{'s' if len(usable) != 1 else ''} DACAN can use"
                                + (": " + ", ".join(f"GPU {g['index']} ({g['name']})" for g in usable) if usable else "")))
     byid = {g["index"]: g for g in amd}
     for i in sel:
@@ -2202,11 +2203,11 @@ def amd_parse_gpus(text, amd) -> list:
 # ------------------------------------------------------------------------------------------------ AMD on Windows
 # Windows has no KFD topology: the cards are found from the display adapters (Win32_VideoController: the ones present,
 # with their PCI ids) and the display-class registry (each adapter's 64-bit VRAM size), before any AMD software is
-# needed.  The engine is the ready-made HIP one (WIN_HIP_ASSET: strata.exe, strata-device.exe and the ROCm libraries it
+# needed.  The engine is the ready-made HIP one (WIN_HIP_ASSET: dacan.exe, dacan-device.exe and the ROCm libraries it
 # loads, built by tools/hip/build_windows.bat); it needs only the AMD driver.  Once it is installed, the cards are
-# numbered as the HIP runtime numbers them (`strata-device --list-devices`): an integrated Radeon takes HIP's device 0
+# numbered as the HIP runtime numbers them (`dacan-device --list-devices`): an integrated Radeon takes HIP's device 0
 # and pushes the discrete card to 1, which the display-adapter order does not show (#325).
-WIN_HIP_ASSET = "strata-windows-x64-hip.zip"
+WIN_HIP_ASSET = "dacan-windows-x64-hip.zip"
 WIN_HIP_MIN_ENGINE = max(MIN_ENGINE, (0, 1, 33))         # the first release with a Windows HIP engine
 WIN_AMD_DRIVER = "https://www.amd.com/en/support/download/drivers.html"
 # PCI device ids (VEN_1002) of the cards the AMD backend knows; the names below cover a card whose id is not listed
@@ -2284,7 +2285,7 @@ def _pci_device_id(text: str) -> int | None:
 
 
 def win_amd_arch(device_id: int | None, name: str) -> str:
-    """A Windows AMD adapter's architecture from its PCI device id, else its name; "" when it is none Strata knows
+    """A Windows AMD adapter's architecture from its PCI device id, else its name; "" when it is none DACAN knows
     (an integrated Radeon, an older card)."""
     if device_id in _WIN_AMD_DID:
         return _WIN_AMD_DID[device_id]
@@ -2293,7 +2294,7 @@ def win_amd_arch(device_id: int | None, name: str) -> str:
 
 def amd_gpus_windows(adapters=None, registry=None) -> list[dict]:
     """The AMD display adapters present, in display-adapter order (setup's numbering until the HIP engine is
-    installed), with the arch Strata would run them as ("" = unknown: listed, not supported).  adapters / registry:
+    installed), with the arch DACAN would run them as ("" = unknown: listed, not supported).  adapters / registry:
     tools/test_setup_amd.py passes mocked ones."""
     adapters = _win_display_adapters() if adapters is None else adapters
     registry = _win_display_registry() if registry is None else registry
@@ -2330,10 +2331,10 @@ def amd_gpus_windows(adapters=None, registry=None) -> list[dict]:
 
 def hip_devices(probe: Path | None = None, text: str | None = None) -> list[dict] | None:
     """The GPUs the HIP runtime enumerates, numbered as HIP_VISIBLE_DEVICES numbers them, from the installed engine's
-    `strata-device --list-devices`; None when there is no HIP engine here or it does not answer.  text: its output
+    `dacan-device --list-devices`; None when there is no HIP engine here or it does not answer.  text: its output
     (tests)."""
     if text is None:
-        probe = probe or ROOT / "engine" / ("strata-device.exe" if WIN else "strata-device")
+        probe = probe or ROOT / "engine" / ("dacan-device.exe" if WIN else "dacan-device")
         try:
             hip_engine = json.loads((probe.parent / "BUILD.json").read_text(encoding="utf-8")).get("backend") == "hip"
         except (OSError, ValueError):
@@ -2382,7 +2383,7 @@ def hip_lib_dirs(eng: Path) -> list[Path]:
     return [eng / d for d in rel if (eng / d).is_dir()]
 
 
-# #468 #461: the HIP runtime the ready-made engine was built with, next to strata.exe.  Windows looks for an imported
+# #468 #461: the HIP runtime the ready-made engine was built with, next to dacan.exe.  Windows looks for an imported
 # DLL in the exe's folder, then System32, and only then on PATH (where rocm/bin is): an AMD driver that installs its own
 # amdhip64_7.dll in System32 won, and the bundled rocBLAS/hipBLAS ran on that runtime - an access violation (W7900) or
 # hipErrorInvalidDeviceFunction (7900 XTX) on the first prompt.  Only the runtime and the compiler it loads by name:
@@ -2393,7 +2394,7 @@ HIP_RUNTIME_DLLS = ("amdhip64_*.dll", "amd_comgr*.dll")
 def hip_runtime_closure(d: Path) -> list[str]:
     """The DLLs of `d` (the engine's rocm/bin) that amdhip64_7.dll and amd_comgr.dll need, the two included, read from
     their PE import tables and followed recursively (tools/hip/dll_closure.py).  #461: amdhip64_7.dll imports
-    rocm_kpack.dll, which imports the MSVC runtime; with only the two DLLs beside strata.exe the full-path load fails
+    rocm_kpack.dll, which imports the MSVC runtime; with only the two DLLs beside dacan.exe the full-path load fails
     (error 126), Windows falls back to System32's copy of the runtime, and the first big prompt dies with
     hipErrorInvalidDeviceFunction.  Falls back to the names above when the helper cannot be read."""
     roots = sorted({p.name for pat in HIP_RUNTIME_DLLS for p in d.glob(pat)})
@@ -2423,7 +2424,7 @@ def hip_runtime_beside_exe(eng: Path) -> None:
                 shutil.copy2(src, dst)
             except OSError as e:                   # e.g. the engine is running and holds the old copy
                 warn(f"could not put {src.name} next to the AMD engine ({e}); if the engine stops on its first "
-                     "request, close Strata and run START-HERE.bat again")
+                     "request, close DACAN and run START-HERE.bat again")
 
 
 def hip_match(card: dict, listed: list[dict], hip: list[dict]) -> dict | None:
@@ -2439,9 +2440,9 @@ def hip_card(eng: Path, gpu: dict, listed: list[dict]) -> dict:
     """Windows: setup's chosen AMD card as the installed HIP engine numbers it (HIP_VISIBLE_DEVICES), checked by the
     engine itself before the model download: an integrated Radeon is HIP's device 0 (#325), and a PC without a
     working AMD driver stops here with what to install."""
-    hip = hip_devices(eng / "strata-device.exe")
+    hip = hip_devices(eng / "dacan-device.exe")
     hint = (f"install or update the AMD driver (AMD Software: Adrenalin Edition) from {WIN_AMD_DRIVER}, restart the "
-            f"PC and run this again; {eng / 'strata-device.exe'} --list-devices shows what the HIP runtime sees")
+            f"PC and run this again; {eng / 'dacan-device.exe'} --list-devices shows what the HIP runtime sees")
     if not hip:
         fail("the AMD HIP runtime finds no GPU (the ready-made engine's device check)", hint)
     m = hip_match(gpu, listed, hip) if gpu.get("driver") != "hip" else \
@@ -2480,7 +2481,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
         if not base.startswith(("http://", "https://")):
             break
         try:
-            req = urllib.request.Request(base + WIN_HIP_ASSET, method="HEAD", headers={"User-Agent": "strata-setup"})
+            req = urllib.request.Request(base + WIN_HIP_ASSET, method="HEAD", headers={"User-Agent": "dacan-setup"})
             urllib.request.urlopen(req, timeout=60).close()
             break
         except OSError as e:
@@ -2489,8 +2490,8 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
                 continue
             warn(f"no ready-made AMD engine at {base} ({e})")
             return None
-    say("  Downloading the ready-made Strata engine for AMD GPUs (with the ROCm libraries it uses) ...")
-    download(base + WIN_HIP_ASSET, z, "Strata AMD engine")
+    say("  Downloading the ready-made DACAN engine for AMD GPUs (with the ROCm libraries it uses) ...")
+    download(base + WIN_HIP_ASSET, z, "DACAN AMD engine")
     try:
         verify_engine_archive(z, WIN_HIP_ASSET, base)
     except UnverifiedEngine as e:
@@ -2515,7 +2516,7 @@ def get_prebuilt_hip(url_base, gpu, updating=False) -> Path | None:
                "for runs from a self-build of the engine: see docs/AMD_HIP.md (--build)")   # #881
         if is_strix_halo(gpu):                         # never a zip without gfx1151 code: say so, and what to do
             why = (f"it is built for {', '.join(meta.get('archs', [])) or 'other GPUs'} and has no gfx1151 code: your "
-                   f"{gpu['name']} (Strix Halo) needs a ready-made engine from Strata 0.1.40 or newer, whose zip is "
+                   f"{gpu['name']} (Strix Halo) needs a ready-made engine from DACAN 0.1.40 or newer, whose zip is "
                    "built for gfx1151 too.  Until then: the Linux guide docs/STRIX_HALO.md, or compile the engine "
                    "here with tools\\hip\\build_windows.bat (its default list has gfx1151) and start setup with "
                    "--prebuilt <its dist folder>")
@@ -2563,7 +2564,7 @@ def rocm_root(archs):
         if (ver is None or ver >= ROCM_SYSTEM_MIN) and not missing:
             return sysroot, [str(sysroot / "lib")]
         if ver is not None and ver < ROCM_SYSTEM_MIN:
-            warn(f"the ROCm in {sysroot} is {ver[0]}.{ver[1]}; Strata needs {ROCM_SYSTEM_MIN[0]}.{ROCM_SYSTEM_MIN[1]} "
+            warn(f"the ROCm in {sysroot} is {ver[0]}.{ver[1]}; DACAN needs {ROCM_SYSTEM_MIN[0]}.{ROCM_SYSTEM_MIN[1]} "
                  "or newer: using AMD's wheels in .venv instead")
         else:                                          # #446: a runtime-only ROCm (no -dev packages): cmake would fail
             warn(f"the ROCm in {sysroot} has no HIP development files ({', '.join(missing)}): using AMD's wheels in "
@@ -2573,7 +2574,7 @@ def rocm_root(archs):
         fail(f"cards of two GPU families ({', '.join(archs)}) need a system ROCm 7 (in /opt/rocm): AMD's Python "
              "wheels come per family", "install ROCm 7 system-wide, or use cards of one family (--gpu N for one card)")
     index = indexes[0]
-    stamp = Path(sys.prefix) / ".strata-rocm.json"
+    stamp = Path(sys.prefix) / ".dacan-rocm.json"
     have = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
     wheel = None
     if have.get("index") == index and have.get("version") and not ROCM_VERSION_OVERRIDE \
@@ -2629,7 +2630,7 @@ def hipblaslt_table(arch, lib_dirs, ver=None):
     table = ROOT / "tools" / "hip" / f"{arch}-hipblaslt-{ver}.txt"
     if ver is not None and table.exists():
         head = table.read_text(encoding="utf-8").split("\n", 2)[:2]
-        if f"STRATA_HIPBLASLT_TUNING_V1 {arch} {ver}" in (h.strip() for h in head):
+        if f"DACAN_HIPBLASLT_TUNING_V1 {arch} {ver}" in (h.strip() for h in head):
             ok(f"hipBLASLt tuning table: {table.name} (faster prompts)")
             return table
     have = sorted(p.name for p in (ROOT / "tools" / "hip").glob(f"{arch}-hipblaslt-*.txt"))
@@ -2675,15 +2676,15 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
     say("  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
         if meta.get("backend") == "hip" and (eng / EXE).exists() and has_archs
-        else f"  Compiling the Strata engine for your AMD GPU{'s' if len(archs) > 1 else ''} ({', '.join(archs)}; "
+        else f"  Compiling the DACAN engine for your AMD GPU{'s' if len(archs) > 1 else ''} ({', '.join(archs)}; "
              "10-20 minutes, once) ...")
-    cmake_build(ROOT, ROOT / "build-hip", "strata",
-                ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
-                 "-DSTRATA_PREFILL_MMQ=ON", "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
+    cmake_build(ROOT, ROOT / "build-hip", "dacan",
+                ["-DDACAN_ENABLE_HIP=ON", "-DDACAN_ENABLE_CUDA=OFF", "-DDACAN_BUILD_TESTS=OFF",
+                 "-DDACAN_PREFILL_MMQ=ON", "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
                  f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                  f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
-                 f"-DSTRATA_GGML_DIR={llama}", *isa_floor_defs(floor, ROOT / "build-hip", meta)], None, "")
+                 f"-DDACAN_GGML_DIR={llama}", *isa_floor_defs(floor, ROOT / "build-hip", meta)], None, "")
     shutil.copy2(ROOT / "build-hip" / EXE, eng / EXE)
     meta = {"source": "local-hip", "backend": "hip", "version": source_version(), "archs": archs, "vision": "none",
             "lib_dirs": dirs, "src": src, **({"isa_floor": floor} if floor else {})}
@@ -2711,8 +2712,8 @@ def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
     """#304: the CPU image encoder beside the HIP engine (tools/vision without CUDA), recorded in its BUILD.json."""
     if not ((eng / VEXE).exists() and meta.get("vision_src") == vsrc):
         say("  Compiling the image encoder (for the CPU) ...")
-        cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision",
-                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_PORTABLE=OFF"],
+        cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "dacan-vision",
+                    [f"-DLLAMA_DIR={llama}", "-DDACAN_VISION_CUDA=OFF", "-DDACAN_PORTABLE=OFF"],
                     find_vcvars() if WIN else None,
                     "build-vision-cpu.bat" if WIN else "")   # #881: MSVC's environment on Windows, as the CUDA path has
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
@@ -2749,8 +2750,8 @@ def release_of(base: str) -> tuple[str, str | None] | None:
     against a release the user did not ask for, over the network, which is wrong twice over.
 
     The repository comes out of the URL when it names one, so a fork's own releases are checked against
-    the fork rather than against Niko1221/Strata (which never has the fork's tags, so the check would
-    always fail).
+    the fork rather than against DACAN's own repository (which never has the fork's tags, so the check
+    would always fail).
     """
     m = re.search(r"https?://(?:www\.)?github\.com/([^/]+)/([^/]+)/releases/(?:download/v([^/]+)|latest)/",
                   base)
@@ -2790,7 +2791,7 @@ def engine_digest(asset: str, base: str) -> tuple[int, str] | None:
     releases, tag = where
     url = f"{releases}/tags/v{tag}" if tag else f"{releases}/latest"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "strata-setup",
+        req = urllib.request.Request(url, headers={"User-Agent": "dacan-setup",
                                                    "Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(req, timeout=60) as r:
             rel = json.loads(r.read().decode("utf-8"))
@@ -2843,8 +2844,8 @@ def verify_engine_archive(z: Path, asset: str, base: str) -> None:
     to download the same file.  A mark that saves 0.8 s is not worth a class of hole - anything that
     changes the file after it was verified, at any length - so there is no mark here.
     """
-    if os.environ.get("STRATA_SKIP_SHA256") == "1":
-        warn(f"STRATA_SKIP_SHA256=1: NOT checking {asset} against its SHA-256. If the file is corrupt or "
+    if os.environ.get("DACAN_SKIP_SHA256") == "1":
+        warn(f"DACAN_SKIP_SHA256=1: NOT checking {asset} against its SHA-256. If the file is corrupt or "
              f"tampered with, it will be installed anyway. Unset it to get the check back.")
         return
     want = engine_digest(asset, base)          # one API call: this is a rate-limited API
@@ -2881,9 +2882,9 @@ def engine_refused(asset: str, e: Exception, updating: bool) -> None:
     catches what the download can throw.
     """
     if not updating:
-        fail(f"the downloaded Strata engine does not match GitHub's checksum: {e}",
+        fail(f"the downloaded DACAN engine does not match GitHub's checksum: {e}",
              "the bad download has been deleted (corrupt or tampered), so the next run fetches the "
-             "published file again. Set STRATA_SKIP_SHA256=1 only if you insist on installing it anyway")
+             "published file again. Set DACAN_SKIP_SHA256=1 only if you insist on installing it anyway")
         return
     warn(f"keeping the engine that is installed: {e}")
     say("       Nothing was replaced. The bad download was deleted; run setup again to fetch it afresh.")
@@ -2891,12 +2892,12 @@ def engine_refused(asset: str, e: Exception, updating: bool) -> None:
 
 def prebuilt_bases(url_base, asset=None) -> list[str]:
     """Where to look for the ready-made engine, in order (each ending in a slash).  The default: the release of this
-    checkout's version first, then the latest (#214); an explicit --prebuilt / STRATA_PREBUILT_URL: only that."""
+    checkout's version first, then the latest (#214); an explicit --prebuilt / DACAN_PREBUILT_URL: only that."""
     base = url_base if url_base.endswith(("/", "\\")) else url_base + "/"
     if base != PREBUILT_URL:
         return [base]
-    if asset not in DACAN_ASSETS:                      # DACAN: not published by DACAN - upstream's of the same version
-        return [UPSTREAM_TAG_URL.format(version=UPSTREAM_VERSION)]
+    if asset not in DACAN_ASSETS:                      # DACAN publishes CUDA 13 engines only
+        fail(*NOT_SUPPORTED)
     return [PREBUILT_TAG_URL.format(version=source_version()), base]
 
 
@@ -3008,7 +3009,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
         if not base.startswith(("http://", "https://")):
             break
         try:                                           # not published (yet), or no internet: compile instead
-            req = urllib.request.Request(base + asset, method="HEAD", headers={"User-Agent": "strata-setup"})
+            req = urllib.request.Request(base + asset, method="HEAD", headers={"User-Agent": "dacan-setup"})
             urllib.request.urlopen(req, timeout=60).close()
             break
         except OSError as e:
@@ -3017,8 +3018,8 @@ def get_prebuilt(url_base, gpu, vision, updating=False, toolkit=13) -> Path | No
                 continue
             warn(f"no ready-made engine at {base} ({e})" + ("" if updating else ": compiling instead"))
             return None
-    say("  Downloading the ready-made Strata engine" + (" (CUDA 12, experimental)" if int(toolkit) == 12 else "") + " ...")
-    download(base + asset, z, "Strata engine")
+    say("  Downloading the ready-made DACAN engine" + (" (CUDA 12, experimental)" if int(toolkit) == 12 else "") + " ...")
+    download(base + asset, z, "DACAN engine")
     try:
         verify_engine_archive(z, asset, base)
     except UnverifiedEngine as e:
@@ -3146,7 +3147,7 @@ def update_installed_engine(url_base, toolkit=None) -> None:
     elif ver >= MIN_ENGINE and (int(meta.get("dacan") or 0) >= DACAN_BUILD or
                                 (CUDA12_ASSET if int(toolkit) == 12 else PREBUILT_ASSET)
                                 not in DACAN_ASSETS):
-        return                                         # DACAN: an upstream engine of the same version is replaced
+        return                                         # an engine of an earlier DACAN build is replaced
     try:                                               # a running engine cannot be replaced (Windows keeps it locked)
         for x in (EXE, VEXE):
             if (eng / x).exists():
@@ -3205,23 +3206,23 @@ def nvcc_build(nvcc):
 
 def sm120_nvcc(nvcc, cuda_v, archs):
     """#892 / #968: CUDA 13.2.0 / 13.2.1's nvcc for an RTX 50 card (sm_120).  Returns (nvcc, cuda_v): an older 13.x toolkit
-    when one is installed and the user did not name a compiler (STRATA_NVCC), else the one found, with a warning that says
+    when one is installed and the user did not name a compiler (DACAN_NVCC), else the one found, with a warning that says
     what to do.  CUDA 13.2.2 (build 86 or newer) is fine.  Recommends, never forces: a user who picked 13.2 keeps it."""
     if not nvcc or cuda_v != CUDA_SM120_SUSPECT or max(archs) < 120:
         return nvcc, cuda_v
     build = nvcc_build(nvcc)
     if build is not None and build >= CUDA_SM120_FIXED_BUILD:
         return nvcc, cuda_v
-    if not os.environ.get("STRATA_NVCC"):
+    if not os.environ.get("DACAN_NVCC"):
         alt, alt_v = find_nvcc(below=CUDA_SM120_SUSPECT)
         if alt and alt_v and alt_v >= (13, 0):
             ok(f"CUDA {alt_v[0]}.{alt_v[1]} is used for the RTX 50 card (sm_120): CUDA 13.2.0 / 13.2.1's compiler made wrong "
-               "answers there (#892, #968); STRATA_NVCC=<nvcc> picks another")
+               "answers there (#892, #968); DACAN_NVCC=<nvcc> picks another")
             return alt, alt_v
     warn("CUDA 13.2.0 and 13.2.1's compiler (nvcc) made garbage prompts and answers for RTX 50 cards (sm_120) in two "
          "reports (#892, #968): the same source compiled with CUDA 13.0, 13.1 or 13.2.2 is right. If the engine answers "
          "with nonsense, update to CUDA 13.2.2 or install CUDA 13.0 next to it (https://developer.nvidia.com/cuda-toolkit-archive) "
-         "and set STRATA_NVCC to its nvcc; the ready-made engine is built with 13.0")
+         "and set DACAN_NVCC to its nvcc; the ready-made engine is built with 13.0")
     return nvcc, cuda_v
 
 
@@ -3241,7 +3242,7 @@ def install_build_tools(gpu, yes):
              f"Toolkit {need12[0]}.{need12[1]} or a newer 12.x (CUDA 13 cannot compile for these cards)" +
              (f"; found CUDA {cuda_v[0]}.{cuda_v[1]}" if nvcc else ""),
              "install CUDA 12.9 (it can sit next to a newer one) from https://developer.nvidia.com/cuda-toolkit-archive "
-             "and run it again (STRATA_NVCC=<its nvcc> picks one toolkit)")
+             "and run it again (DACAN_NVCC=<its nvcc> picks one toolkit)")
     # RTX 50 (sm_120): CUDA 13.0 - an engine built with 12.8 crashed in the prompt path on Linux (#220)
     need_cuda = need12 if old else (13, 0) if max(archs) >= 120 else (12, 0)
     vcvars = find_vcvars(cuda_v) if WIN else None
@@ -3345,11 +3346,11 @@ def source_hash(parts) -> str:
 
 
 def isa_floor_defs(floor: str, bdir: Path, meta: dict) -> list:
-    """The experimental older-CPU build's CMake definition (STRATA_ISA_FLOOR, CMakeLists.txt), none for the normal
+    """The experimental older-CPU build's CMake definition (DACAN_ISA_FLOOR, CMakeLists.txt), none for the normal
     build.  A build folder configured for another floor is configured afresh: ggml's CPU options are cached there."""
     if (meta.get("isa_floor") or "") != floor and (bdir / "CMakeCache.txt").exists():
         (bdir / "CMakeCache.txt").unlink()
-    return [f"-DSTRATA_ISA_FLOOR={floor}"] if floor else []
+    return [f"-DDACAN_ISA_FLOOR={floor}"] if floor else []
 
 
 def host_compiler_defs(cuda: bool) -> list:
@@ -3368,7 +3369,7 @@ def host_compiler_defs(cuda: bool) -> list:
 
 def toolkit_root_defs(nvcc) -> list:
     """CUDAToolkit_ROOT for the toolkit whose nvcc builds the engine.  Without it CMake can take cudart and cuBLAS from
-    another toolkit: with STRATA_NVCC=/opt/cuda-13.0/bin/nvcc on Ubuntu 24.04 that also has the distribution's CUDA
+    another toolkit: with DACAN_NVCC=/opt/cuda-13.0/bin/nvcc on Ubuntu 24.04 that also has the distribution's CUDA
     12.0 (nvidia-cuda-toolkit), the engine was compiled with the 13.0 headers but linked libcudart.so.12 from
     /usr/lib/x86_64-linux-gnu.  The distribution's own nvcc (/usr/bin) keeps CMake's search as before."""
     root = Path(nvcc).resolve().parent.parent
@@ -3378,7 +3379,7 @@ def toolkit_root_defs(nvcc) -> list:
 def engine_defs(archs, toolkit=13) -> list:
     """Extra CMake definitions for the engine: the experimental Pascal/Volta build (#295) for cards below sm_75, and
     for every CUDA 12 engine (the same build as the ready-made CUDA 12 one: it admits the older cards)."""
-    return ["-DSTRATA_EXPERIMENTAL_SM60=ON"] if min(int(x) for x in archs) < 75 or int(toolkit) == 12 else []
+    return ["-DDACAN_EXPERIMENTAL_SM60=ON"] if min(int(x) for x in archs) < 75 or int(toolkit) == 12 else []
 
 
 def prebuilt_vision(meta: dict, gpu: dict, vision: str) -> str:
@@ -3433,22 +3434,22 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
         say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) + " (a card it had no code for; "
             "10-20 minutes, once) ..." if new_arch else
             "  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
-            if local and (eng / EXE).exists() else "  Compiling the Strata engine for your GPU (10-20 minutes, once) ...")
-        cmake_build(ROOT, bdir, "strata",
-                    ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
-                     f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}",
+            if local and (eng / EXE).exists() else "  Compiling the DACAN engine for your GPU (10-20 minutes, once) ...")
+        cmake_build(ROOT, bdir, "dacan",
+                    ["-DDACAN_ENABLE_CUDA=ON", "-DDACAN_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
+                     f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DDACAN_GGML_DIR={llama}",
                      *host_compiler_defs(True), *engine_defs(archs, toolkit),
                      *isa_floor_defs(floor, bdir, meta)],
-                    vcvars, "build-strata-cuda12.bat" if t12 else "build-strata.bat")
+                    vcvars, "build-dacan-cuda12.bat" if t12 else "build-dacan.bat")
         shutil.copy2(bdir / EXE, eng / EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
-        defs = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}",
-                "-DSTRATA_PORTABLE=OFF", *host_compiler_defs(vision == "gpu")]   # native, like the engine
+        defs = [f"-DLLAMA_DIR={llama}", f"-DDACAN_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}",
+                "-DDACAN_PORTABLE=OFF", *host_compiler_defs(vision == "gpu")]   # native, like the engine
         if vision == "gpu":
             defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
                      *toolkit_root_defs(nvcc)]
-        cmake_build(ROOT / "tools" / "vision", vdir, "strata-vision", defs, vcvars,
+        cmake_build(ROOT / "tools" / "vision", vdir, "dacan-vision", defs, vcvars,
                     "build-vision-cuda12.bat" if t12 else "build-vision.bat")
         shutil.copy2(vdir / "bin" / VEXE, eng / VEXE)
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
@@ -3463,9 +3464,9 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
 
 # ------------------------------------------------------------------------------------------------ the data folder
 # The model files - the GGUFs, the prepared packs and the MTP layer, 70-120 GB - live in a data folder NEXT TO the
-# Strata folder (`Strata-data`), not inside it: updating Strata by unzipping a new copy used to give a new, empty
-# folder and a full download again.  Where it is, and which Strata folders this user ran, is kept in a small
-# per-user file, so every Strata folder on the PC finds the same files.
+# DACAN folder (`DACAN-data`), not inside it: updating DACAN by unzipping a new copy used to give a new, empty
+# folder and a full download again.  Where it is, and which DACAN folders this user ran, is kept in a small
+# per-user file, so every DACAN folder on the PC finds the same files.
 DATA_ITEMS = ("models", "packs", "mtp")
 
 
@@ -3713,8 +3714,8 @@ def ram_ctx(model, ram, low_ram=False) -> int:
 
 def settings_path() -> Path:
     if WIN:
-        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Strata" / "settings.json"
-    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "strata" / "settings.json"
+        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "DACAN" / "settings.json"
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "dacan" / "settings.json"
 
 
 def load_settings() -> dict:
@@ -3743,15 +3744,15 @@ def has_data(folder: Path) -> bool:
 
 
 def other_installs(settings: dict) -> list:
-    """Strata folders besides this one that may hold model files: the ones this user ran before, and Strata* folders
-    next to this one (a zip unpacked again lands in e.g. `Strata-main (1)\\Strata-main`)."""
+    """DACAN folders besides this one that may hold model files: the ones this user ran before, and DACAN* folders
+    next to this one (a zip unpacked again lands in e.g. `DACAN-main (1)\\DACAN-main`)."""
     cands = [Path(p) for p in settings.get("installs", [])]
     for base in dict.fromkeys((ROOT.parent, ROOT.parent.parent)):
         try:
             for d in base.iterdir():
-                if d.is_dir() and d.name.lower().startswith("strata"):
+                if d.is_dir() and d.name.lower().startswith("dacan"):
                     cands.append(d)
-                    cands += [c for c in d.iterdir() if c.is_dir() and c.name.lower().startswith("strata")]
+                    cands += [c for c in d.iterdir() if c.is_dir() and c.name.lower().startswith("dacan")]
         except OSError:
             pass
     found = []
@@ -3823,22 +3824,22 @@ def repoint_config(cfg_file: Path, old: Path, new: Path) -> None:
 
 def data_folder(requested: str | None) -> tuple:
     """(the data folder, folders on other drives that still hold model files).  Moves the model files of this folder
-    and of earlier Strata folders on the same drive into the data folder, and points their configs there."""
+    and of earlier DACAN folders on the same drive into the data folder, and points their configs there."""
     settings = load_settings()
     dest = Path(requested).expanduser().resolve() if requested else \
-        Path(settings["data_dir"]) if settings.get("data_dir") else ROOT.parent / "Strata-data"
+        Path(settings["data_dir"]) if settings.get("data_dir") else ROOT.parent / "DACAN-data"
     try:
         dest.mkdir(parents=True, exist_ok=True)
-    except OSError as e:                                # e.g. no write access next to the Strata folder
+    except OSError as e:                                # e.g. no write access next to the DACAN folder
         warn(f"cannot use {dest} for the model files ({e}): keeping them in {ROOT}")
         dest = ROOT
     elsewhere = []
-    # #198: the data folder remembered before (a --data-dir to a new place) is a source too, and so is a Strata-data
+    # #198: the data folder remembered before (a --data-dir to a new place) is a source too, and so is a DACAN-data
     # folder nested in any of them (an install that kept its models one level down)
     sources = [ROOT, *other_installs(settings)]
     if settings.get("data_dir") and Path(settings["data_dir"]) != dest:
         sources.append(Path(settings["data_dir"]))
-    sources += [f / "Strata-data" for f in list(sources) if (f / "Strata-data") != dest]
+    sources += [f / "DACAN-data" for f in list(sources) if (f / "DACAN-data") != dest]
     seen = set()
     for folder in sources:
         key = os.path.normcase(str(folder))
@@ -3869,15 +3870,23 @@ def data_folder(requested: str | None) -> tuple:
             elsewhere.append(folder)                    # in use, or a copy the data folder already has
             warn(f"some model files are still in {folder} (in use, or already in {dest})")
         else:
-            ok(f"model files from {folder} moved to {dest} (a new copy of Strata finds them there)")
+            ok(f"model files from {folder} moved to {dest} (a new copy of DACAN finds them there)")
     installs = [str(ROOT)] + [p for p in settings.get("installs", []) if p != str(ROOT) and Path(p).is_dir()]
     save_settings({**settings, "data_dir": str(dest), "installs": installs[:20]})
     return dest, elsewhere
 
 
+# The sampling an API client gets for the fields it does not send (the web page sends the same by default): the
+# model's recommended settings, penalties off.  A "sampling" block of the user's own is never replaced.
+DEFAULT_SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+
+
 def write_config(path: Path, cfg: dict):
     """A run config, written whole or not at all (#459): to a temporary file first, then moved over the old one, so
-    a setup stopped half-way (a closed window, a full disk) never leaves an empty strata-*.json behind."""
+    a setup stopped half-way (a closed window, a full disk) never leaves an empty dacan-*.json behind.  A config
+    without a "sampling" block gets DEFAULT_SAMPLING."""
+    if "sampling" not in cfg:
+        cfg["sampling"] = dict(DEFAULT_SAMPLING)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     os.replace(tmp, path)
@@ -3887,7 +3896,7 @@ def write_config(path: Path, cfg: dict):
 # "sampling" or "mcp_servers" block, "allowed_hosts", "cors_origins", "open_browser" - and is kept when setup runs again
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision"})
-SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP"})   # the "env" entries setup writes
+SETUP_ENV = frozenset({"DACAN_HIPBLASLT_TUNING", "DACAN_RESIDENT_PIN", "DACAN_NO_ARENA_THP"})   # the "env" entries setup writes
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
 
@@ -3962,7 +3971,7 @@ def args_dropped(old: dict, cfg: dict) -> list[str]:
 def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None) -> None:
     """#629: setup's run config, written over an earlier one for the same model without losing what the user added
     to it: the keys setup does not write are carried over (carry_over), and the earlier file is kept as
-    strata-<model>.json.bak when it changes.  `source`: an earlier install's config to carry the keys over from when
+    dacan-<model>.json.bak when it changes.  `source`: an earlier install's config to carry the keys over from when
     this folder has none yet (a copy set up like the last one).  A line says what was kept, one what was not."""
     old_path = cfg_path if cfg_path.is_file() else source
     old = None
@@ -4009,13 +4018,13 @@ def readable_config(path: Path) -> bool:
 
 
 def model_config_files(folder: Path) -> list:
-    """#346: the strata-*.json files of a folder that can be model configs. The server keeps a config's Chat settings
-    next to it as strata-<model>.shared-settings.json: it matches the pattern but is no config (no exe, no args)."""
-    return [p for p in folder.glob("strata-*.json") if not p.name.endswith(".shared-settings.json")]
+    """#346: the dacan-*.json files of a folder that can be model configs. The server keeps a config's Chat settings
+    next to it as dacan-<model>.shared-settings.json: it matches the pattern but is no config (no exe, no args)."""
+    return [p for p in folder.glob("dacan-*.json") if not p.name.endswith(".shared-settings.json")]
 
 
 def previous_config(elsewhere_first: list, settings: dict):
-    """The most recently used model config of another Strata folder on this PC, for a folder that has none yet.  One
+    """The most recently used model config of another DACAN folder on this PC, for a folder that has none yet.  One
     that does not parse (an empty or cut-off file, #459) is skipped with a warning: the newest readable one is used,
     and with none this copy is set up as a fresh install."""
     cands = []
@@ -4028,7 +4037,7 @@ def previous_config(elsewhere_first: list, settings: dict):
 def choices_from_config(cfg_path: Path) -> dict:
     """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
-    tag = cfg_path.stem[len("strata-"):]
+    tag = cfg_path.stem[len("dacan-"):]
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
     model = (tag[len(FAMILIES[family]["tag"]):] if tag.startswith(FAMILIES[family]["tag"]) else tag).upper()
     if model not in MODELS:                            # (sizes have no dash except UD-Q4_K_XL: the old rule)
@@ -4060,7 +4069,7 @@ def find_in(roots: list, rel: str):
 
 # ------------------------------------------------------------------------------------------------ start
 def model_config(path: Path) -> bool:
-    """#549: a model's run config (a JSON object with "exe" and "args"). Any other strata-*.json in the folder (a
+    """#549: a model's run config (a JSON object with "exe" and "args"). Any other dacan-*.json in the folder (a
     file of the user's own, a cut-off one) is skipped with a warning naming it instead of stopping setup."""
     try:
         cfg = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -4071,7 +4080,7 @@ def model_config(path: Path) -> bool:
         why = e.strerror or str(e)
     except ValueError:
         why = "not valid JSON"
-    warn(f"skipped {path.name} ({why}): it is not a Strata model config")
+    warn(f"skipped {path.name} ({why}): it is not a DACAN model config")
     return False
 
 
@@ -4083,8 +4092,8 @@ def installed_configs():
 def source_version() -> str:
     """The engine version the source tree builds (CMakeLists.txt's project version)."""
     if not (ROOT / "CMakeLists.txt").exists():       # DACAN: no engine source here, the ready-made engine's version
-        return UPSTREAM_VERSION
-    m = re.search(r"project\(strata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
+        return ENGINE_VERSION
+    m = re.search(r"project\(dacan VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
     return m.group(1) if m else "0"
 
 
@@ -4171,7 +4180,7 @@ def calibrate_config(cfg_path: Path) -> bool:
     import calibrate as CAL
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     say()
-    say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
+    say("  Tuning DACAN for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
     say("  draft depth, the CPU threads, the expert cache). It takes roughly 15-30 minutes (3 rounds of each value); the PC is busy meanwhile.")
     try:
         since = os.path.getsize(cfg["log"]) if cfg.get("log") and os.path.isfile(cfg["log"]) else 0
@@ -4240,15 +4249,145 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     return cfg
 
 
+# ------------------------------------------------------------------------------------------------ DACAN's own pack
+# DACAN: Swift 1.5 as NVFP4 + Q8 (DACAN) - the routed experts in NVFP4 (68 GB, read into RAM once), the dense part and
+# the n-gram table in 8 bits (the table is read from the SSD, the engine's default --ple-io direct) - from
+# tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN, already packed for the engine: nothing is converted here.
+# START-HERE.bat --dacan-nvfp4 (Linux: ./setup.sh --dacan-nvfp4) installs it beside the other models; a later
+# START-HERE.bat offers it like any installed model, and UPDATE.bat keeps it (its config is upgraded, not rebuilt).
+DACAN_HF_REPO = "tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN"
+HF_REVISIONS[DACAN_HF_REPO] = "9206479e87bc7118a741fe4dfb4d2bef4cf25aa5"    # 2026-10-04
+DACAN_DENSE = "Swift-1.5-Qwen3.8-Flash-Next-dense-Q8_0.gguf"
+DACAN_EXPERTS = "Swift-1.5-Qwen3.8-Flash-Next-NVFP4-experts.bin"           # pack-nvfp4/native_experts.txt names it
+DACAN_FILES = {DACAN_DENSE: (60391831520, "0a264d1438f9f0cc38598cbb9f3088e31481b5179b4ee4747493145535207554"),
+               DACAN_EXPERTS: (67948019712, "50389c1563d0c00a40afe360fbb485fbf55f151a557a9f8e45691d15f6f8e835")}
+DACAN_PACK = {"dense.bin": (1538035200, "6eba284f9e3caf50da37a1144c0210c6be925c8fe2efe4283042d4a2167d1062"),
+              "index.txt": (93675, None), "native_experts.txt": (7426, None),
+              "tokenizer/chat_template.jinja": (8952, None), "tokenizer/merges.txt": (3353258, None),
+              "tokenizer/token_type.json": (744960, None), "tokenizer/tokenizer.json": (541, None),
+              "tokenizer/vocab.json": (5737005, None)}
+DACAN_RAM_GB = 80          # the 63.3 GiB of experts in RAM, plus the engine, the server and the OS
+DACAN_TAG = "dacan-nvfp4"
+
+
+def install_dacan_nvfp4(a, data, roots, port) -> int:
+    """Install (or repair) NVFP4 + Q8 (DACAN) and write dacan-dacan-nvfp4.json; start it unless --no-start."""
+    say()
+    say("  DACAN: Swift 1.5 as NVFP4 + Q8 (DACAN) - a ~132 GB download, ~80 GB of RAM, an NVIDIA RTX 20 or newer")
+    step(1, "this PC")
+    gpu = gpu_info(a.gpu if isinstance(a.gpu, int) else None)
+    if gpu is None:
+        fail("no NVIDIA GPU found", "NVFP4 + Q8 (DACAN) runs on NVIDIA RTX 20 and newer")
+    why = gpu_problem(gpu)
+    if why:
+        fail(f"{gpu['name']}: {why}")
+    ok(f"GPU {gpu['index']}: {gpu['name']}, {gpu['vram_gb']:.0f} GB")
+    ram = ram_gb()
+    if ram < DACAN_RAM_GB:
+        fail(f"NVFP4 + Q8 (DACAN) keeps its 68 GB of experts in RAM: it needs ~{DACAN_RAM_GB} GB, this PC has {ram:.0f}",
+             "the GSQ-RCO sizes in START-HERE.bat --setup need 48-64 GB")
+    ok(f"RAM: {ram:.0f} GB")
+    name, avx2, avx512 = cpu_info()
+    name = (name.splitlines() or ["unknown CPU"])[0].strip()   # one line per socket on Windows
+    if not avx2:
+        fail(f"{name} has no AVX2", "DACAN's CPU kernels need AVX2 (Intel Haswell / AMD Ryzen and newer)")
+    ok(f"CPU: {name}" + (" (AVX-512: the NVFP4 experts the GPU does not hold run on DACAN's AVX-512 kernel)"
+                         if avx512 else " (AVX2)"))
+    models_dir = Path(a.models_dir) / DACAN_TAG
+    pack = find_in(roots, f"packs/{DACAN_TAG}") or data / "packs" / DACAN_TAG
+    files = [models_dir / f for f in DACAN_FILES]
+    left = sum(DACAN_FILES[f.name][0] - (f.stat().st_size if f.exists() and not done(f) else 0)
+               for f in files if not done(f)) / 1e9
+    if left > 0 and free_gb(models_dir) < left + 8:
+        fail(f"not enough free disk space in {models_dir}: need ~{left + 8:.0f} GB", "use --models-dir on a bigger drive")
+
+    step(2, "Python packages")
+    pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
+                "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
+
+    step(3, "the DACAN engine")
+    llama = get_llama_cpp()
+    eng = get_prebuilt(a.prebuilt, gpu, "none")
+    if eng is None:
+        fail(*DACAN_NO_SOURCE)
+    meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
+    if int(meta.get("dacan") or 0) < DACAN_BUILD:
+        fail("the installed engine is not DACAN's (or an older DACAN build): NVFP4 + Q8 (DACAN) needs it",
+             "run UPDATE.bat (Linux: ./update.sh) with internet, then this again")
+    pip_cuda_libs(13)
+    lib_dirs = meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs(13)
+    ok(f"engine: {eng / EXE} (DACAN build {meta.get('dacan')})")
+
+    step(4, "downloading NVFP4 + Q8 (DACAN)")
+    say(f"  The model files go in {models_dir}")
+    base = hf(DACAN_HF_REPO)
+    for f in files:
+        download(base + f.name, f)
+        verify_sha256(f, *DACAN_FILES[f.name])
+    for rel, (size, sha) in DACAN_PACK.items():
+        dst = pack / rel
+        download(base + "pack-nvfp4/" + rel, dst)
+        if sha:
+            verify_sha256(dst, size, sha)
+        elif dst.stat().st_size != size:
+            dst.unlink(missing_ok=True)
+            dst.with_name(dst.name + ".done").unlink(missing_ok=True)
+            fail(f"{dst.name} is {dst.stat().st_size if dst.exists() else 0:,} bytes, not {size:,}: deleted",
+                 "run this again to download it again")
+    ok(f"model files present: {models_dir}, pack {pack}")
+
+    step(5, "the MTP draft layer")
+    env = dict(os.environ, DACAN_GGUF_PY=str(llama / "gguf-py"))
+    mtp = (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
+    rt = mtp / "rt"
+    if (rt / "experts.bin").exists() and mtp_corrupt(mtp, env):
+        warn("some MTP tensors are not the checkpoint's: fetching them again and rebuilding the draft layer")
+        (rt / "experts.bin").unlink(missing_ok=True)
+    if not (rt / "experts.bin").exists():
+        say("  The MTP draft layer (speculative decoding) comes from the original Qwen checkpoint: ~5 GB of it.")
+        run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)],
+            env={**env, "DACAN_SOURCE": model_source()})
+        run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
+             "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
+        run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],
+            env=env)
+    cfg_path = ROOT / f"dacan-{DACAN_TAG}.json"
+    refresh_draft_vocab(rt, a.draft_vocab or saved_draft_vocab(cfg_path) or DEFAULT_DRAFT_VOCAB)
+    ok(f"MTP draft layer: {rt}")
+
+    step(6, "writing the start script")
+    ctx = int(a.context or 131072)
+    dense = models_dir / DACAN_DENSE
+    args = ["--pack", str(pack), "--native", str(dense), "--ple-gguf", str(dense),
+            "--expert-profile", str(ROOT / "data" / "expert-profile.bin"), "--expert-cache", "auto",
+            "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
+            "--max-context", str(ctx), "--kv", "int8"]
+    kv_ram = kv_streaming_ram_gb(ctx, "int8")
+    if ctx >= 65536 and not is_wsl() and ram >= DACAN_RAM_GB + kv_ram + 1:
+        args += ["--kv-resident", "32768"]
+        ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram:.1f} GB), more experts fit in VRAM")
+    if a.vram_reserve_mib is not None:
+        args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
+    cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
+           "model_name": "swift-1.5-nvfp4-dacan", "log": str(ROOT / f"dacan-{DACAN_TAG}.log"),
+           "lib_dirs": lib_dirs, "port": port}
+    write_config(cfg_path, cfg)
+    ok(f"config: {cfg_path} (context {ctx // 1024}K, KV 8-bit; images: not with this pack yet)")
+    if a.no_start:
+        say("  Start it with START-HERE.bat (Linux: ./setup.sh): it is offered beside the other installed models.")
+        return 0
+    return start(cfg_path, a.port, None, yes=a.yes)
+
+
 def update_install(have: list, a) -> int:
     """#475: `setup.py --update` (UPDATE.bat / update.sh, after their git pull): what a plain START-HERE.bat does to
     an install before it starts the model, without starting it - the Python packages, the ready-made engine when this
     setup needs a newer one (MIN_ENGINE; a compiled engine when its source changed), each installed model's config
     upgrades and its draft subset.  No question is asked and the model files are not touched; a model still running
     keeps its engine (update_installed_engine says to close it and run this again)."""
-    have = [p for p in have if model_config(p)]        # #549: a strata-*.json that is no model config is skipped
+    have = [p for p in have if model_config(p)]        # #549: a dacan-*.json that is no model config is skipped
     if not have:
-        say("  No model is installed in this Strata folder yet: run START-HERE.bat (Linux: ./setup.sh) to set it up -")
+        say("  No model is installed in this DACAN folder yet: run START-HERE.bat (Linux: ./setup.sh) to set it up -")
         say("  it finds an earlier install's model files next to it and reuses them.")
         return 0
     pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
@@ -4258,20 +4397,20 @@ def update_install(have: list, a) -> int:
     for cfg_path in have:
         cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
         if "--mtp" in cfg["args"][:-1]:
-            refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
+            refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", DEFAULT_DRAFT_VOCAB))
         if cfg.get("backend") == "hip" and WIN:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461
         ok(f"{cfg.get('model_name', cfg_path.stem)}: up to date")
     ver = engine_version(Path(json.loads(have[0].read_text(encoding="utf-8-sig"))["exe"]))
     say()
-    ok("Strata is updated" + (f" (engine {'.'.join(map(str, ver))})" if any(ver) else "") +
+    ok("DACAN is updated" + (f" (engine {'.'.join(map(str, ver))})" if any(ver) else "") +
        ". Start the model with " + ("START-HERE.bat" if WIN else "./setup.sh") + " when you want it.")
     return 0
 
 
 def settings_summary(cfg: dict, port=None) -> str:
     """#564: the settings a start uses, in one line: the config's engine options (the model's file paths left out)
-    and the server's own fields, so a change made by hand to strata-<model>.json can be checked without the log."""
+    and the server's own fields, so a change made by hand to dacan-<model>.json can be checked without the log."""
     a, out, i = [str(x) for x in cfg.get("args") or []], [], 0
     while i < len(a):
         flag = a[i]
@@ -4320,8 +4459,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             else f"{k.replace('_', ' ')} {v}" for k, v in keep.items()))
     cfg_path.touch()                                     # the most recently used model
     if "--mtp" in cfg["args"][:-1]:
-        refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
-    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+        refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", DEFAULT_DRAFT_VOCAB))
+    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "dacan", "--config", str(cfg_path),
            "--port", str(port or cfg.get("port", 8080))]
     if cfg.get("backend") == "hip":                    # AMD, numbered as HIP numbers them (setup's KFD order)
         if WIN:
@@ -4418,8 +4557,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     for n, line in enumerate(textwrap.wrap(f"Settings ({cfg_path.name}): {settings_summary(cfg, port)}", 100,
                                            break_on_hyphens=False)):   # #564: what this start uses
         say(("  " if n == 0 else "    ") + line)
-    if not WIN and os.environ.get("STRATA_EXECV"):
-        # Replace this process instead of spawning a child. The Docker image sets STRATA_EXECV=1,
+    if not WIN and os.environ.get("DACAN_EXECV"):
+        # Replace this process instead of spawning a child. The Docker image sets DACAN_EXECV=1,
         # so there the server is PID 1 and docker stop's SIGTERM reaches the process that can
         # answer the engine with QUIT. Normal Linux starts keep spawning the server as a child.
         os.execv(cmd[0], cmd)
@@ -4430,6 +4569,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
 OLD_DRAFT_VOCABS = {"369151522226a5edaa5f12cfd1e2ae7db8f4fbdbd222f3dcf327dced9597fb25"}   # to 0.1.26: 27 Han tokens
 
 
+# DACAN: the Cyrillic subset is the default (Russian answers +39 % on the same model, English and code as fast)
+DEFAULT_DRAFT_VOCAB = "cyrillic"
 DRAFT_VOCABS = {"cjk": "draft_vocab.bin", "en": "draft_vocab_en.bin", "cyrillic": "draft_vocab_cyrillic.bin",
                 "fr": "draft_vocab_fr.bin"}
 
@@ -4474,15 +4615,15 @@ SMALL_DRAFT_VRAM_GB = 14   # #474: below this the default subset's head can be w
 
 
 def draft_vocab_note(vram_gb: float, chosen: str | None) -> list[str]:
-    """#474: on a card under 14 GB, the default draft subset (cjk, ~348 MiB of VRAM) can be what does not fit at the
-    start ("the draft head does not fit"), and the engine's expert cache gets what a smaller one leaves.  Setup
-    RECOMMENDS a smaller one here and changes nothing (the owner's rule, #403 #406): a subset chosen with
-    --draft-vocab, or kept from an earlier install, gets no note.  [] for every other case."""
+    """#474: on a card under 14 GB, the default draft subset (DEFAULT_DRAFT_VOCAB, ~193 MiB of VRAM) can be what does
+    not fit at the start ("the draft head does not fit"), and the engine's expert cache gets what a smaller one
+    leaves.  Setup RECOMMENDS a smaller one here and changes nothing (the owner's rule, #403 #406): a subset chosen
+    with --draft-vocab, or kept from an earlier install, gets no note.  [] for every other case."""
     if chosen or not 0 < vram_gb < SMALL_DRAFT_VRAM_GB:
         return []
     start = "START-HERE.bat" if WIN else "./setup.sh"
-    return [f"Tip for a {vram_gb:.0f} GB card: the draft layer's default token subset (with Chinese, Japanese and "
-            f"Korean) needs up to ~{DRAFT_VOCAB_MIB['cjk']} MiB of VRAM.",
+    return [f"Tip for a {vram_gb:.0f} GB card: the draft layer's default token subset (English, code and Cyrillic) "
+            f"needs up to ~{DRAFT_VOCAB_MIB[DEFAULT_DRAFT_VOCAB]} MiB of VRAM.",
             f"  For English and code answers, {start} --draft-vocab en needs up to ~{DRAFT_VOCAB_MIB['en']} MiB "
             f"(cyrillic: ~{DRAFT_VOCAB_MIB['cyrillic']}) and leaves the rest to the expert cache - and it is the",
             "  fix when the start stops with \"the draft head does not fit\". The model keeps the choice."]
@@ -4501,7 +4642,7 @@ def small_card_note(ctx: int, draft_vocab: str | None) -> list[str]:
         tips.append("an 8K context (a smaller KV cache)")
     if draft_vocab != "en":
         tips.append(f"--draft-vocab en (a draft head of ~{DRAFT_VOCAB_MIB['en']} MiB instead of "
-                    f"~{DRAFT_VOCAB_MIB[draft_vocab or 'cjk']})")
+                    f"~{DRAFT_VOCAB_MIB[draft_vocab or DEFAULT_DRAFT_VOCAB]})")
     lines = ["If the start stops with \"no VRAM is left for the expert cache\" (the engine's log says how much is "
              "short):"]
     if tips:
@@ -4567,7 +4708,7 @@ def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: st
 
 PREFILL_BIG_RAM_GB = 96        # bench #433 #440 #834 #669: --prefill auto:32768 +21-35% at 96 GB, ~3x slower at 32 GB
 PREFILL_RISK_RAM_GB = 64       # below this an explicit auto:32768 is warned about
-HEADROOM_RAM_GB = 48           # bench #834: STRATA_RESIDENT_HEADROOM_GIB=6 on a PC with this much RAM or less
+HEADROOM_RAM_GB = 48           # bench #834: DACAN_RESIDENT_HEADROOM_GIB=6 on a PC with this much RAM or less
 AGENT_CACHE_FREE_GB = 24       # bench #882 #440: RAM left beside the model for the conversation cache
 AGENT_CACHE_MIB = 8192
 SMALL_VISION_VRAM_GB = 12.5    # bench #469: the GPU image encoder shrinks the prompt chunks on cards up to 12 GB
@@ -4595,8 +4736,8 @@ def bench_tips(args, env, ram: float, model_ram_gb: float, vram_gb: float, visio
         tips.append(f"tip: with {ram:.0f} GB of RAM, --prefill auto:32768 in the config's args read prompts 21-35% "
                     "faster in community benchmarks (#433 #440 #834); not set, nothing changes")
     resident = any(a in args for a in ("--resident-experts", "--resident-budget-gib"))
-    if resident and ram <= HEADROOM_RAM_GB and "STRATA_RESIDENT_HEADROOM_GIB" not in (env or {}):
-        tips.append(f"tip: on a PC with {ram:.0f} GB of RAM, \"env\": {{\"STRATA_RESIDENT_HEADROOM_GIB\": \"6\"}} in the "
+    if resident and ram <= HEADROOM_RAM_GB and "DACAN_RESIDENT_HEADROOM_GIB" not in (env or {}):
+        tips.append(f"tip: on a PC with {ram:.0f} GB of RAM, \"env\": {{\"DACAN_RESIDENT_HEADROOM_GIB\": \"6\"}} in the "
                     "config kept decode speed in a community benchmark and left the system 2 GiB more (#834); the "
                     "default is 4")
     if "--conversation-cache-mib" not in args and ram - model_ram_gb >= AGENT_CACHE_FREE_GB:
@@ -4640,7 +4781,7 @@ def mtp_corrupt(mtp: Path, env=None) -> bool:
     return r.returncode == 3
 
 
-def refresh_draft_vocab(rt: Path, choice: str = "cjk") -> None:
+def refresh_draft_vocab(rt: Path, choice: str = DEFAULT_DRAFT_VOCAB) -> None:
     """The draft layer's token subset in the MTP folder: `cjk` (data/draft_vocab.bin, since 0.1.27, #137), `en`
     (data/draft_vocab_en.bin, the English/code subset before it: ~110 MiB less VRAM, English answers 1-2% faster) or
     `cyrillic` (data/draft_vocab_cyrillic.bin: English/code and the whole Cyrillic script, for Ukrainian, Russian,
@@ -4715,7 +4856,7 @@ def use_cuda12(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
          "CUDA 12 engine (docs/OLDER_GPUS.md; START-HERE.bat --setup --cuda 13 and newer cards only moves it back)")
     main = gpu_info(cards[0]["index"]) or cards[0]
     vision = "gpu" if cfg.get("vision") else "none"
-    eng = get_cuda12_engine(os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
+    eng = get_cuda12_engine(os.environ.get("DACAN_PREBUILT_URL", PREBUILT_URL),
                             {**main, "archs": sorted({int(g["arch"]) for g in cards})}, vision, yes)
     cfg["exe"] = str(eng / EXE)
     cfg["cuda"] = 12
@@ -4729,11 +4870,11 @@ def use_cuda12(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
 
 def write_run_script(model, cfg_path, port, open_browser=True):
     """run-<model>.bat / .sh: the server with this config; `open_browser` False (#609: --no-browser) leaves --open out."""
-    serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+    serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "dacan", "--config", str(cfg_path),
              "--port", str(port)] + (["--open"] if open_browser else [])
     if WIN:
         script = ROOT / f"run-{model.lower()}.bat"
-        script.write_text("@echo off\r\ntitle Strata " + model + "\r\ncd /d \"" + str(ROOT) + "\"\r\n" +
+        script.write_text("@echo off\r\ntitle DACAN " + model + "\r\ncd /d \"" + str(ROOT) + "\"\r\n" +
                           " ".join(f'"{x}"' for x in serve) + "\r\nif errorlevel 1 pause\r\n", encoding="utf-8")
     else:
         script = ROOT / f"run-{model.lower()}.sh"
@@ -4803,8 +4944,79 @@ def sycl_setup(argv) -> int:
             rest.append(x)
     script = ROOT / "sycl" / "setup_intel.py"
     if not script.exists():
-        fail(f"{script} is missing", "use a full Strata checkout (git clone) - docs/INTEL_ARC.md")
+        fail(f"{script} is missing", "use a full DACAN checkout (git clone) - docs/INTEL_ARC.md")
     return subprocess.call([sys.executable, str(script), *rest])
+
+
+
+# The names an install from before the DACAN rename used (October 2026): its run configs, its data folder and its
+# settings are carried over once, at the start of every run (a second run finds nothing to move).
+OLD_NAME = "strata"
+
+
+def _old_path_renamed(p: str) -> str:
+    """One path of an old run config: the <Old>-data folder in it -> DACAN-data, and its last part when it is one of
+    the old names (the engine, the image encoder, the log) -> the DACAN name.  Every other part stays as it is (a
+    folder the user named with the old word is theirs)."""
+    old_cap = OLD_NAME.capitalize()
+    parts = re.split(r"([\\/])", p)
+    parts = ["DACAN-data" if x == f"{old_cap}-data" else x for x in parts]
+    last = parts[-1]
+    if last in (OLD_NAME, OLD_NAME + ".exe") or last.startswith((OLD_NAME + "-", OLD_NAME + "_")):
+        parts[-1] = "dacan" + last[len(OLD_NAME):]
+    return "".join(parts)
+
+
+def _old_config_renamed(v):
+    if isinstance(v, str):
+        return _old_path_renamed(v) if (OLD_NAME in v or OLD_NAME.capitalize() in v) else v
+    if isinstance(v, list):
+        return [_old_config_renamed(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _old_config_renamed(x) for k, x in v.items()}
+    return v
+
+
+def migrate_old_names() -> None:
+    """Rename what an earlier install left under the old name: <old>-<model>.json -> dacan-<model>.json (the engine,
+    vision, log and data paths inside renamed, _old_path_renamed), the engine files in engine/ (kept working until
+    the update replaces them), the <Old>-data folder beside this one -> DACAN-data (a rename on the same drive: the
+    model files do not move), and the settings file to its new folder."""
+    old_cap = OLD_NAME.capitalize()
+    old_data, new_data = ROOT.parent / f"{old_cap}-data", ROOT.parent / "DACAN-data"
+    if old_data.is_dir() and not new_data.exists():
+        try:
+            old_data.rename(new_data)
+            ok(f"model folder renamed: {old_data.name} -> {new_data.name}")
+        except OSError as e:
+            warn(f"cannot rename {old_data} to {new_data.name} ({e}): the model files stay where they are")
+    old_set = (Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / old_cap / "settings.json"
+               if WIN else Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / OLD_NAME / "settings.json")
+    if old_set.is_file() and not settings_path().exists():
+        try:
+            settings_path().parent.mkdir(parents=True, exist_ok=True)
+            st = json.loads(old_set.read_text(encoding="utf-8-sig"))
+            settings_path().write_text(json.dumps(_old_config_renamed(st), indent=1), encoding="utf-8")
+        except (OSError, ValueError) as e:
+            warn(f"cannot carry the settings over from {old_set} ({e})")
+    ext = ".exe" if WIN else ""
+    for eng in (ROOT / "engine", ROOT / ENGINE12_DIR):
+        for old, new in ((OLD_NAME + ext, EXE), (f"{OLD_NAME}-vision{ext}", VEXE)):
+            if (eng / old).is_file() and not (eng / new).exists():
+                try:
+                    (eng / old).rename(eng / new)
+                except OSError as e:
+                    warn(f"cannot rename {eng / old} ({e})")
+    for f in sorted(ROOT.glob(f"{OLD_NAME}-*.json")):
+        new = ROOT / ("dacan-" + f.name[len(OLD_NAME) + 1:])
+        try:
+            cfg = json.loads(f.read_text(encoding="utf-8-sig"))
+            if not new.exists():
+                write_config(new, _old_config_renamed(cfg))
+            f.unlink()
+            ok(f"model config renamed: {f.name} -> {new.name}")
+        except (OSError, ValueError) as e:
+            warn(f"cannot carry {f.name} over ({e})")
 
 
 def main() -> int:
@@ -4850,8 +5062,8 @@ def main() -> int:
                          "that uses the API; remembered for this model, also in run-<model>.bat/.sh)")
     ap.add_argument("--browser", dest="browser", action="store_true",
                     help="open the chat page again when the model is ready (the default; undoes --no-browser)")
-    ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default Strata-data next to this folder, "
-                                       "remembered for every Strata folder on this PC")
+    ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default DACAN-data next to this folder, "
+                                       "remembered for every DACAN folder on this PC")
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
                                        "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
@@ -4867,23 +5079,23 @@ def main() -> int:
     ap.add_argument("--source", choices=SOURCES, default=None,
                     help="where the model files come from: auto (default: Hugging Face), huggingface or modelscope "
                          "(mainland China: the same files, checked against ModelScope's published SHA-256; "
-                         "STRATA_SOURCE)")
+                         "DACAN_SOURCE)")
     ap.add_argument("--inspect", nargs="+", metavar=("SOURCE", "VARIANT"),
-                    help="what a GGUF is and whether Strata runs it, from its headers only (no download): a file, a "
+                    help="what a GGUF is and whether DACAN runs it, from its headers only (no download): a file, a "
                          "folder, a URL, ms:owner/repo (ModelScope) or hf:owner/repo, and optionally a variant name")
-    ap.add_argument("--cuda", choices=["12", "13", "auto"], default=os.environ.get("STRATA_CUDA") or None,
+    ap.add_argument("--cuda", choices=["12", "13", "auto"], default=os.environ.get("DACAN_CUDA") or None,
                     help="NVIDIA: the CUDA toolkit of this model's engine. auto (default): CUDA 13, the ready-made "
                          "engine; CUDA 12 (experimental) when a chosen card is older than CUDA 13 supports (Pascal, "
                          "Volta). 12 also runs with an older driver (Windows 528+, Linux 525+). docs/OLDER_GPUS.md")
-    ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
+    ap.add_argument("--prebuilt", default=os.environ.get("DACAN_PREBUILT_URL", PREBUILT_URL),
                     help="where the ready-made engine is (a URL folder or a local folder)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 15-30 minutes, longer on a slow card), then start the model")
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
-                    help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
-                         "and code only (~110 MiB less VRAM, English answers 1-2%% faster), cyrillic = English, code "
-                         "and the Cyrillic script (Ukrainian, Russian... answers decode ~30%% faster), fr = English, "
+                    help="the draft layer's tokens: cyrillic = English, code and the Cyrillic script (default; Ukrainian, "
+                         "Russian... answers decode ~30%% faster), cjk = with Chinese, Japanese and Korean, en = English "
+                         "and code only (~110 MiB less VRAM, English answers 1-2%% faster), fr = English, "
                          "code and French (French answers: 18%% more drafts accepted)")
     ap.add_argument("--low-ram", choices=["auto", "on", "off", "resident", "mmap"], default="auto",
                     help="read the model's experts from one file in its folder instead of copying them all into RAM "
@@ -4908,14 +5120,17 @@ def main() -> int:
                          "experts fit on the GPU); auto: when the RAM has room for it")
     ap.add_argument("--backend", choices=["cuda", "hip", "sycl"],
                     help="cuda = NVIDIA (default), hip = AMD RX 7900 / 7800 / 7700 XT, RX 9060 XT / 9070 / AI PRO R9700 on "
-                         "Linux or Windows (chosen by itself when the PC has no NVIDIA card Strata can use), "
+                         "Linux or Windows (chosen by itself when the PC has no NVIDIA card DACAN can use), "
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
+    ap.add_argument("--dacan-nvfp4", action="store_true",
+                    help="DACAN: install Swift 1.5 as NVFP4 + Q8 (DACAN) - a ~132 GB download, ~80 GB of RAM, NVIDIA RTX 20 or newer")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    migrate_old_names()                                # an install from before the DACAN rename
     if a.source:
-        os.environ["STRATA_SOURCE"] = a.source
+        os.environ["DACAN_SOURCE"] = a.source
     if a.inspect:                                      # headers only: nothing is installed
-        sys.exit(subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode)
+        sys.exit(subprocess.run([sys.executable, str(ROOT / "tools" / "dacan_inspect.py"), *a.inspect[:2]]).returncode)
     if a.backend == "sycl":                            # Intel Arc: the SYCL port's own setup (sycl/setup_intel.py)
         return sycl_setup(sys.argv[1:])
     if a.resident_budget_gib is not None and not a.resident_budget_gib > 0:
@@ -4931,7 +5146,7 @@ def main() -> int:
             a.gpu = int(a.gpu)
         else:
             ap.error(f"--gpu takes a GPU number as nvidia-smi numbers them, e.g. --gpu 1 (or --gpus 0,2), not {a.gpu!r}")
-    say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
+    say("DACAN - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
     data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
     roots = [data, *elsewhere]
     if a.models_dir is None:
@@ -4946,12 +5161,12 @@ def main() -> int:
         return update_install(have, a)
     explicit = a.setup or a.model or a.family or a.check or a.no_start
     adopted = None                                     # #629: the earlier install this copy is set up like
-    if not have and not explicit:                      # a new copy of Strata (an update unzipped elsewhere): set it
+    if not have and not explicit:                      # a new copy of DACAN (an update unzipped elsewhere): set it
         prev = previous_config(elsewhere, load_settings())   # up like the last one, from the files already here
         if prev is not None:
             ch = choices_from_config(prev)
             if ch["model"]:
-                say(f"  Found your earlier install in {prev.parent} ({prev.stem[len('strata-'):]}): setting up this "
+                say(f"  Found your earlier install in {prev.parent} ({prev.stem[len('dacan-'):]}): setting up this "
                     "copy the same way - the model files are reused, nothing big is downloaded.")
                 a.family, a.model, a.context = ch["family"], ch["model"], a.context or ch["context"]
                 adopted = prev
@@ -4976,6 +5191,8 @@ def main() -> int:
     # choice, and asked once when the PC has cards that could share the model
     run_gpu = start_gpus(a.gpus) or a.gpu
     port = a.port or 8080                              # a new install's port (issue #32: --port for an existing one)
+    if a.dacan_nvfp4:                                  # DACAN's own pack: an install of its own
+        return install_dacan_nvfp4(a, data, roots, port)
     if have and a.calibrate and not (a.setup or a.model or a.family or a.check):
         if not a.build:
             update_installed_engine(a.prebuilt)
@@ -5025,7 +5242,7 @@ def main() -> int:
     if a.backend is None and nv_ok and amd_ok:
         # both kinds of card: asked (a first run on such a PC used to take NVIDIA without mentioning the Radeon)
         say()
-        say("  This PC has NVIDIA and AMD cards Strata can use:")
+        say("  This PC has NVIDIA and AMD cards DACAN can use:")
         say("  1) NVIDIA: " + ", ".join(f"{g['name']} ({g['vram_gb']:.0f} GB)" for g in found if gpu_problem(g) is None)
             + "   (recommended)")
         say("  2) AMD: " + ", ".join(f"{g['name']} ({g['vram_gb']:.0f} GB{', unified memory' if g.get('uma') else ''})"
@@ -5055,7 +5272,7 @@ def main() -> int:
                         "empty: ROCm cannot use it yet (docs/STRIX_HALO.md: the amdgpu driver and /dev/kfd access, "
                         "your user in the render and video groups)")
         if not usable:
-            fail("no AMD GPU Strata can use", f"the AMD backend runs on {AMD_CARDS}")
+            fail("no AMD GPU DACAN can use", f"the AMD backend runs on {AMD_CARDS}")
         if a.gpus:                                     # a layer split across these cards, the first one the main
             chosen = amd_parse_gpus(a.gpus, amd)
             gpu = chosen[0]
@@ -5116,7 +5333,7 @@ def main() -> int:
                                            f"{CUDA12_MIN_DRIVER} or newer, docs/OLDER_GPUS.md)"))
     if gpu["vram_gb"] < 11:
         warn("less than 12 GB of " + ("GPU memory (this APU's carve-out + shared memory)" if gpu.get("uma") else "VRAM")
-             + ": Strata will run, but most experts stay on the CPU and it will be slow")
+             + ": DACAN will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
     cpu, avx2, avx512 = cpu_info()
     need = min(d["ram_gb"] for d in MODELS.values())
@@ -5125,11 +5342,11 @@ def main() -> int:
         # every model keeps ALL its experts in RAM (23+ GB); VRAM only holds a copy of the most-used ones, so a
         # bigger GPU does not lower this.  The owner's rule: a stop by default, a risk the user can take (--model
         # with --yes, or y)
-        confirm_risk(f"RAM: {ram:.0f} GB - the smallest model (the Coder) needs about {need} GB: Strata keeps all of "
+        confirm_risk(f"RAM: {ram:.0f} GB - the smallest model (the Coder) needs about {need} GB: DACAN keeps all of "
                      "the model's experts in RAM (23-50 GB, whatever the GPU), so the OS will page them from disk. "
                      "Expect it to be very slow, and it may not start at all.", bool(a.model), a.yes,
                      f"RAM: {ram:.0f} GB - the smallest model (the Coder) needs about {need} GB",
-                     "Strata keeps all of the model's experts in RAM (23-50 GB, whatever the GPU) and the GPU holds a "
+                     "DACAN keeps all of the model's experts in RAM (23-50 GB, whatever the GPU) and the GPU holds a "
                      "copy of the most-used ones: it needs 32 GB of RAM or more (48 GB for the full model); --model "
                      "NAME --yes installs one anyway")
         warn(f"going on with {ram:.0f} GB of RAM, as you chose")
@@ -5148,13 +5365,13 @@ def main() -> int:
             warn(problem)
     floor = cpu_floor(avx2)
     if floor == "unsupported":
-        fail("this CPU has neither AVX2 nor SSE4.2; Strata needs at least SSE4.2 (Intel Nehalem, 2008, or newer)")
+        fail("this CPU has neither AVX2 nor SSE4.2; DACAN needs at least SSE4.2 (Intel Nehalem, 2008, or newer)")
     if not avx2:
         # #394 #595 #623: the ready-made engine is AVX2; an older CPU gets one compiled here, whose CPU experts run on
         # ggml-cpu's kernels for this CPU.  Experimental: measured only on newer CPUs with the older path forced, and by
         # users on a few Xeons.  A warning, not a stop.
-        warn(f"this CPU has no AVX2: Strata support for it is EXPERIMENTAL and slow. Setup compiles the engine on this "
-             f"PC for {'AVX' if floor == 'avx' else 'SSE4.2'} (STRATA_ISA_FLOOR={floor}; 10-20 minutes, once), and the "
+        warn(f"this CPU has no AVX2: DACAN support for it is EXPERIMENTAL and slow. Setup compiles the engine on this "
+             f"PC for {'AVX' if floor == 'avx' else 'SSE4.2'} (DACAN_ISA_FLOOR={floor}; 10-20 minutes, once), and the "
              "CPU's share of the experts runs on ggml-cpu's kernels, a few times slower than on an AVX2 CPU. "
              "See \"Older CPUs\" in docs/INSTALL.md")
         if hip and WIN:
@@ -5181,10 +5398,10 @@ def main() -> int:
         if not any_fits:
             # #977: every size says "does not fit", so the verdict says so too (and the exit code, for scripts). It only
             # reports: --model NAME --yes still installs one anyway.
-            say(f"\nThis PC cannot run Strata yet: no model size fits {ram:.0f} GB of RAM (the smallest needs about "
+            say(f"\nThis PC cannot run DACAN yet: no model size fits {ram:.0f} GB of RAM (the smallest needs about "
                 f"{need} GB). --model NAME --yes installs one anyway, slowly.")
             return 1
-        say("\nThis PC can run Strata. Run it again without --check to install.")
+        say("\nThis PC can run DACAN. Run it again without --check to install.")
         return 0
 
     # ---- 2. the questions
@@ -5208,7 +5425,7 @@ def main() -> int:
     names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
     names.sort(key=lambda m: bool(MODELS[m].get("experimental")))   # an experimental size last, never the default
     if a.model and a.model not in names:
-        # #444: say which family has that size, and (with --gguf-dir) which files Strata can run at all
+        # #444: say which family has that size, and (with --gguf-dir) which files DACAN can run at all
         elsewhere_fams = [f for f in FAMILIES if f in MODELS[a.model].get("families", ("qwen", "swift"))]
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names)
              + (f" (or {a.model}: " + ", ".join(f"--family {f} --model {a.model}" for f in elsewhere_fams) + ")"
@@ -5238,7 +5455,7 @@ def main() -> int:
                  "answers, so it is several times slower than the 2-3-bit models; quality checked against llama.cpp")
         if hip and MODELS[model].get("nvidia_only"):
             # #429 (jkuepker): checked before the 111 GB download.  The HIP engine has no prompt kernels for its
-            # Q4_K / Q5_K experts (STRATA_MMQ_KQUANTS is CUDA-only) and it has not been run on AMD: asked, not refused
+            # Q4_K / Q5_K experts (DACAN_MMQ_KQUANTS is CUDA-only) and it has not been run on AMD: asked, not refused
             confirm_risk(f"{model} has not been run on AMD cards yet: its prompt kernels are NVIDIA-only, so on "
                          f"{gpu_name(gpu)} long prompts read much more slowly, and it may not work at all",
                          bool(a.model), a.yes, f"{model} is NVIDIA-only so far", "choose one of the 2-3-bit models, "
@@ -5412,10 +5629,10 @@ def main() -> int:
     shards = gguf_dir_shards(models_dir, fam, model) if a.gguf_dir else \
         [models_dir / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
     problem = gguf_dir_problem(models_dir, shards[0], fam, model) if a.gguf_dir else None
-    if problem:                                        # #444: files Strata cannot run, or another choice's files
+    if problem:                                        # #444: files DACAN cannot run, or another choice's files
         fail(*problem)
     if not a.gguf_dir and not all(sh.exists() and done(sh) for sh in shards):
-        for r in elsewhere:                            # already downloaded in a Strata folder on another drive
+        for r in elsewhere:                            # already downloaded in a DACAN folder on another drive
             cand = [r / "models" / tag / sh.name for sh in shards]
             if all(c.exists() and done(c) for c in cand):
                 models_dir, shards = cand[0].parent, cand
@@ -5452,14 +5669,14 @@ def main() -> int:
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
 
     # ---- 4. the engine
-    step(4, "the Strata engine")
+    step(4, "the DACAN engine")
     llama = get_llama_cpp()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
     if hip and WIN:                                    # AMD on Windows: the ready-made HIP engine (no compiler)
         eng = None if a.build else get_prebuilt_hip(a.prebuilt, gpu)
         if eng is None:
-            fail("no ready-made AMD engine for this Strata version" + (" (--build)" if a.build else ""),
-                 "compiling it on Windows: tools\\hip\\build_windows.bat makes strata-windows-x64-hip.zip, then run "
+            fail("no ready-made AMD engine for this DACAN version" + (" (--build)" if a.build else ""),
+                 "compiling it on Windows: tools\\hip\\build_windows.bat makes dacan-windows-x64-hip.zip, then run "
                  "START-HERE.bat --backend hip --prebuilt <its dist folder> (docs/AMD_HIP.md)")
         gpu = hip_card(eng, gpu, amd)
         a.gpu = gpu["index"] if gpu["count"] > 1 else a.gpu
@@ -5484,7 +5701,7 @@ def main() -> int:
     need_engine = MODELS[model].get("engine", UNSLOTH_ENGINE)
     if budget is not None and engine_ver < need_engine:      # checked before the 94-111 GB download
         fail(f"{model} needs engine {'.'.join(map(str, need_engine))} or newer; this one is {meta.get('version')}",
-             "update Strata (or compile the engine with --build) and run setup again")
+             "update DACAN (or compile the engine with --build) and run setup again")
     ok(f"engine: {eng / EXE}")
 
     # ---- 5. the model files
@@ -5536,18 +5753,18 @@ def main() -> int:
                 "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")
 
     # ---- 6. the pack and the MTP draft layer
-    step(6, "preparing the model for Strata")
+    step(6, "preparing the model for DACAN")
     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
-    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    env = dict(os.environ, DACAN_GGUF_PY=str(llama / "gguf-py"))
     if model == "Q2_0" and avx512 and family == "qwen":
         # the Q2_0 experts repacked for the AVX-512 kernel (the measured speed): a one-time ~40 GB conversion
         if not (pack / "index.txt").exists() or not (pack / "experts.bin").exists():   # index.txt is written last
             say("  Converting the Q2_0 experts for the AVX-512 kernel (one time, ~40 GB written, 2-5 min) ...")
-            run([sys.executable, str(ROOT / "tools" / "strata_pack.py"), "build", "--gguf", str(shards[0]),
+            run([sys.executable, str(ROOT / "tools" / "dacan_pack.py"), "build", "--gguf", str(shards[0]),
                  "--out", str(pack), "--skip-hash", "--force"], env=env)   # --force: #634 refuses an occupied pack
             run([sys.executable, str(ROOT / "tools" / "pack_index.py"), "--pack", str(pack)], env=env)
         if not (pack / "tokenizer" / "vocab.json").exists():
-            run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(shards[0]),
+            run([sys.executable, str(ROOT / "tools" / "dacan_tokenizer.py"), "--gguf", str(shards[0]),
                  "--out", str(pack)], env=env)   # writes <pack>/tokenizer/
     elif not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
         # every tensor as the GGUF stores it; the experts are read from the GGUF at start (seconds to build)
@@ -5569,14 +5786,14 @@ def main() -> int:
         say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
         say("  only its ~5 GB of MTP tensors are downloaded.")
         run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)],
-            env={**env, "STRATA_SOURCE": model_source()})
+            env={**env, "DACAN_SOURCE": model_source()})
         run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
              "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
         run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],
             env=env)
     # a setup run again without --draft-vocab keeps the subset this model's config chose before (cyrillic, fr, en)
-    draft_vocab = a.draft_vocab or saved_draft_vocab(ROOT / f"strata-{tag.lower()}.json")
-    refresh_draft_vocab(rt, draft_vocab or "cjk")
+    draft_vocab = a.draft_vocab or saved_draft_vocab(ROOT / f"dacan-{tag.lower()}.json")
+    refresh_draft_vocab(rt, draft_vocab or DEFAULT_DRAFT_VOCAB)
     ok(f"MTP draft layer: {rt}")
     for line in draft_vocab_note(gpu.get("vram_gb", 0.0), draft_vocab):   # #474: a recommendation, nothing changes
         say("  " + line)
@@ -5704,7 +5921,7 @@ def main() -> int:
         args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
                  "--cvec-mode", "project", "--cvec-dir", "per-layer"]
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
-           "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"strata-{tag.lower()}.log"),
+           "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"dacan-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port}
     if cuda_tk == 12:                                  # the experimental CUDA 12 engine (engine-cuda12/)
         cfg["cuda"] = 12
@@ -5715,12 +5932,12 @@ def main() -> int:
         # engine refuses any other one and falls back to plain hipBLAS)
         table = hipblaslt_table(gpu["arch"], lib_dirs, meta.get("hipblaslt_version"))
         if table:
-            cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
+            cfg["env"] = {"DACAN_HIPBLASLT_TUNING": str(table)}
         if GFX1103_OPT_IN and gfx_arch_is(gpu["arch"], "gfx1103") and not WIN:
             # the 780M's KFD queues are evicted (a GPU reset) while transparent huge pages move the pinned expert arena
-            cfg.setdefault("env", {})["STRATA_NO_ARENA_THP"] = "1"
+            cfg.setdefault("env", {})["DACAN_NO_ARENA_THP"] = "1"
         if resident:   # ROCm: large page-locked host allocations can fail or be slow for the CPU; keep the copy pageable
-            cfg.setdefault("env", {})["STRATA_RESIDENT_PIN"] = "0"
+            cfg.setdefault("env", {})["DACAN_RESIDENT_PIN"] = "0"
     if gpu["count"] > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
         cfg["gpus_asked"] = True                       # chosen at setup: not asked again at start
@@ -5763,7 +5980,7 @@ def main() -> int:
             cfg["parallel"] = 1
             ok("parallel requests: one at a time (--parallel 1)")
     if vision != "none":
-        old_cfg = ROOT / f"strata-{tag.lower()}.json"
+        old_cfg = ROOT / f"dacan-{tag.lower()}.json"
         vt = vision_tokens(a.vision_tokens, vision, old_cfg if old_cfg.is_file() else adopted)
         cfg["vision"] = {"exe": str(eng / VEXE), "mmproj": str(mmproj), "model": str(shards[0]),
                          "gpu": vision == "gpu", "max_tokens": vt}
@@ -5771,7 +5988,7 @@ def main() -> int:
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
-    cfg_path = ROOT / f"strata-{tag.lower()}.json"
+    cfg_path = ROOT / f"dacan-{tag.lower()}.json"
     cal = setup_calibration(cfg, hip)                  # #566: Linux HIP too; the tuning is offered on NVIDIA only
     if cal is not None:
         sys.path.insert(0, str(ROOT / "tools"))
@@ -5788,7 +6005,7 @@ def main() -> int:
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
     if cal is None and not hip and not a.no_start and not a.yes and ask(
-            "Tune Strata for this PC now? It measures a few engine settings (about 15-30 minutes, longer on a slow card; the PC is busy "
+            "Tune DACAN for this PC now? It measures a few engine settings (about 15-30 minutes, longer on a slow card; the PC is busy "
             "meanwhile; later: START-HERE --calibrate)", ["y", "n"], "y", a.yes) == "y":
         tuned = calibrate_config(cfg_path)
     else:

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Update Strata without starting the model (#475): the newest code (git pull, when this folder is a git clone), then
+# Update DACAN without starting the model (#475): the newest code (git pull, when this folder is a git clone), then
 # what ./setup.sh does before a start - the engine (a new ready-made one when this version needs it, or compiled
 # again when its source changed), the Python packages, each installed model's settings and draft subset. The model
 # files are not touched. Start the model later with ./setup.sh. Options are passed on to setup.py.
@@ -12,7 +12,7 @@ main() {
       echo "\"git pull\" here yourself, then run ./update.sh again."
       exit 1
     fi
-    echo "Getting the newest Strata (git pull) ..."
+    echo "Getting the newest DACAN (git pull) ..."
     if ! git pull --ff-only; then
       # The history of the repository was rewritten on 2026-10-06 (#1276): a clone made before that has no commit in
       # common with origin/main, so a fast-forward can never work. Say so, and move it over when nothing is lost.
@@ -52,9 +52,9 @@ main() {
       fi
     fi
   else
-    echo "This copy of Strata was not made with git, so it cannot fetch new files itself. Download the newest one:"
+    echo "This copy of DACAN was not made with git, so it cannot fetch new files itself. Download the newest one:"
     echo "  https://github.com/tirex999/DACAN/archive/refs/heads/main.zip"
-    echo "unzip it anywhere and run ./setup.sh (or ./update.sh) in it: it finds the model files in Strata-data and"
+    echo "unzip it anywhere and run ./setup.sh (or ./update.sh) in it: it finds the model files in DACAN-data and"
     echo "sets itself up the same way - nothing big is downloaded again."
     echo "Checking this copy's engine and settings meanwhile ..."
   fi

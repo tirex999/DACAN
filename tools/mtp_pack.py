@@ -1,9 +1,9 @@
-"""tools/mtp_pack.py - plan v0.3 P6 prep: the MTP draft block as a Strata GGUF, from the BF16 tensors.
+"""tools/mtp_pack.py - plan v0.3 P6 prep: the MTP draft block as a DACAN GGUF, from the BF16 tensors.
 
 llama.cpp's qwen4exp converter drops the MTP head (`supports_mtp_export = False`), and the flyweight MTP GGUF is
-no longer on this PC, so Strata packs its own from the 31 `mtp.*` tensors fetched by tools/mtp_fetch.py:
+no longer on this PC, so DACAN packs its own from the 31 `mtp.*` tensors fetched by tools/mtp_fetch.py:
 
-    python tools/mtp_pack.py --src Desktop/Strata/mtp-bf16 --experts q2_0 --out mtp-q2_0.gguf
+    python tools/mtp_pack.py --src Desktop/DACAN/mtp-bf16 --experts q2_0 --out mtp-q2_0.gguf
     python tools/mtp_pack.py --src ... --experts q4_0 --out mtp-q4_0.gguf       (acceptance comparison arm)
 
 Layout: dense tensors (attention, indexer, hyper-connections, shared expert, router, fc/norms) stay BF16 (F32 for
@@ -12,7 +12,7 @@ Layout: dense tensors (attention, indexer, hyper-connections, shared expert, rou
 
     q2_0   64-element blocks, grid {-1, 0, 1, 2} x d. The scale is chosen per block to MINIMIZE squared error over
            that grid (the ggml reference sets d = max|w| and never uses the +2 level). Same format as the main
-           model's experts, so Strata's CPU VNNI kernel and GPU hit kernel serve it unchanged. ~0.71 GB.
+           model's experts, so DACAN's CPU VNNI kernel and GPU hit kernel serve it unchanged. ~0.71 GB.
     q4_0   ggml reference rounding. ~1.42 GB.       q8_0   ggml reference. ~2.67 GB.
 
 This is round-to-nearest, not GSQ: the plan picks the expert format by MEASURED draft acceptance (P0.3/P6), not
@@ -142,11 +142,11 @@ def main() -> int:
     manifest = json.loads((src / "mtp-manifest.json").read_text())
     fn, qtype, block, block_bytes = QUANT[a.experts]
     w = gguf.GGUFWriter(a.out, "qwen4exp-mtp")
-    w.add_string("strata.mtp.source", "Qwen/Qwen3.8-Flash-Next BF16 checkpoint, mtp.* tensors")
-    w.add_string("strata.mtp.source_sha256", hashlib.sha256(
+    w.add_string("dacan.mtp.source", "Qwen/Qwen3.8-Flash-Next BF16 checkpoint, mtp.* tensors")
+    w.add_string("dacan.mtp.source_sha256", hashlib.sha256(
         json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
-    w.add_string("strata.mtp.expert_format", a.experts)
-    w.add_string("strata.mtp.expert_quantizer", "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
+    w.add_string("dacan.mtp.expert_format", a.experts)
+    w.add_string("dacan.mtp.expert_quantizer", "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
     report = []
     for t in sorted(manifest, key=lambda t: t["name"]):
         name, shape = t["name"], t["shape"]

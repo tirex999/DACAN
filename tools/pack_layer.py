@@ -1,4 +1,4 @@
-"""Strata P0.S9 - build the pack-layout expert arena from the real GGUF.
+"""DACAN P0.S9 - build the pack-layout expert arena from the real GGUF.
 
 The architecture (§3.2) defines one expert blob as 1,382,400 bytes:
 
@@ -34,8 +34,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from gguf_reader import GGUFFile  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
-STRATA = REPO.parents[min(1, len(REPO.parents) - 1)]   # the dev layout's default shards (setup.py passes --gguf)
-SHARD1 = STRATA / "Q2_0" / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"
+DACAN = REPO.parents[min(1, len(REPO.parents) - 1)]   # the dev layout's default shards (setup.py passes --gguf)
+SHARD1 = DACAN / "Q2_0" / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"
 
 H, FF, NE = 2560, 640, 512
 QK, BLOCK_BYTES = 64, 18          # Q2_0
@@ -84,7 +84,7 @@ def build(n_layers: int, out_path: pathlib.Path) -> dict:
                 per_expert = t.elements // NE
                 assert per_expert * BLOCK_BYTES // QK == ROLE_BYTES, per_expert
             layer_off = out.tell()
-            # vectorized over the layer's 512 experts (the same bytes the per-block loop wrote; tools/strata_pack.py
+            # vectorized over the layer's 512 experts (the same bytes the per-block loop wrote; tools/dacan_pack.py
             # verify checks them): each role is (512 experts, rows, blocks per row, 18 bytes)
             def role_blocks(role, rows, per_row):
                 t = roles[role]

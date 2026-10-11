@@ -1,17 +1,17 @@
-"""Which Strata model a GGUF is - and whether Strata can run it - from its header alone.
+"""Which DACAN model a GGUF is - and whether DACAN can run it - from its header alone.
 
 Reads only the files' headers (a few MB each, by HTTP range requests for a remote file) with quantscope, prints the
 real storage of every weight group (bits per weight, quantization types), then compares the routed experts and the
 sizes with the files setup installs (data/gguf_fingerprints.json):
 
-    python tools/strata_inspect.py ms:ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF          # list the variants
-    python tools/strata_inspect.py ms:ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF IQ3_S    # one variant
-    python tools/strata_inspect.py ms:unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL
-    python tools/strata_inspect.py D:/models/my-copy-00001-of-00002.gguf                  # a local file or folder
-    python tools/strata_inspect.py https://example.com/x-00001-of-00002.gguf              # one URL (that shard only)
+    python tools/dacan_inspect.py ms:ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF          # list the variants
+    python tools/dacan_inspect.py ms:ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF IQ3_S    # one variant
+    python tools/dacan_inspect.py ms:unsloth/Qwen3.8-Flash-Next-GGUF UD-Q2_K_XL
+    python tools/dacan_inspect.py D:/models/my-copy-00001-of-00002.gguf                  # a local file or folder
+    python tools/dacan_inspect.py https://example.com/x-00001-of-00002.gguf              # one URL (that shard only)
 
 ms: is ModelScope, hf: Hugging Face (HF_ENDPOINT is honoured).  setup.py --inspect runs the same.
-    python tools/strata_inspect.py --fingerprints data/gguf_fingerprints.json             # remake the table
+    python tools/dacan_inspect.py --fingerprints data/gguf_fingerprints.json             # remake the table
 """
 from __future__ import annotations
 
@@ -89,11 +89,11 @@ def load_fingerprints(path: Path = FINGERPRINTS) -> dict:
 
 def verdict(fp: dict, table: dict) -> tuple[str, str]:
     """(kind, sentence): kind is "known" (a file setup installs, under any name), "layout" (the same routed-expert
-    layout as one: a fine-tune made with the same recipe, untested), "no" (Strata cannot run it) or "untested"
-    (naming the tensors whose quantization no file Strata runs has for them)."""
+    layout as one: a fine-tune made with the same recipe, untested), "no" (DACAN cannot run it) or "untested"
+    (naming the tensors whose quantization no file DACAN runs has for them)."""
     known = {k: v for k, v in table.items() if not k.startswith("_")}
     if fp["arch"] != ARCH:
-        return "no", f"not Qwen3.8-Flash-Next (architecture {fp['arch']!r}): Strata runs only that model"
+        return "no", f"not Qwen3.8-Flash-Next (architecture {fp['arch']!r}): DACAN runs only that model"
     exact = [k for k, v in known.items() if v["expert_bytes"] == fp["expert_bytes"] and v["bytes"] == fp["bytes"]
              and v["tensors"] == fp["tensors"]]
     if exact:
@@ -107,17 +107,17 @@ def verdict(fp: dict, table: dict) -> tuple[str, str]:
     runs = set().union(*(v["expert_bytes"] for v in known.values()))
     other = sorted(set(fp["expert_bytes"]) - runs)
     if other:
-        return "no", ("its routed experts use " + ", ".join(other) + ", a quantization no file Strata runs uses "
-                      "(Strata's expert kernels cover " + ", ".join(sorted(runs)) + ")")
+        return "no", ("its routed experts use " + ", ".join(other) + ", a quantization no file DACAN runs uses "
+                      "(DACAN's expert kernels cover " + ", ".join(sorted(runs)) + ")")
     seen = table.get("_roles", {})
     new = [f"{r} {'/'.join(t for t in ts if t not in seen.get(r, []))}" for r, ts in fp.get("roles", {}).items()
            if any(t not in seen.get(r, []) for t in ts)]
-    head = ("its routed experts use only quantizations Strata runs (" + ", ".join(fp["expert_bytes"]) +
+    head = ("its routed experts use only quantizations DACAN runs (" + ", ".join(fp["expert_bytes"]) +
             "), but this file is not one setup installs: not tested (and setup still refuses the GGUF names "
             "it lists as unsupported, such as UD-Q2_K_XL: this is a header reading, not a promise that it runs)")
     if new:
-        return "untested", head + ". Stored differently from every file Strata runs: " + ", ".join(new)
-    return "untested", head + "; every tensor uses a quantization some file Strata runs has for it"
+        return "untested", head + ". Stored differently from every file DACAN runs: " + ", ".join(new)
+    return "untested", head + "; every tensor uses a quantization some file DACAN runs has for it"
 
 
 def make_fingerprints(out: Path) -> None:
@@ -168,7 +168,7 @@ def main() -> None:
     qs.summarize(name, tensors)
     fp = fingerprint(arch, tensors)
     kind, sentence = verdict(fp, load_fingerprints())
-    print(f"\nStrata: {sentence}")
+    print(f"\nDACAN: {sentence}")
     sys.exit(0 if kind in ("known", "layout") else 2 if kind == "no" else 0)
 
 

@@ -1,10 +1,10 @@
-"""serve/runconfig.py - #564: the web page's Settings view of the run config (strata-<model>.json).
+"""serve/runconfig.py - #564: the web page's Settings view of the run config (dacan-<model>.json).
 
-A short list of documented keys can be read and changed from Strata's own page (GET / POST /config).  Everything
+A short list of documented keys can be read and changed from DACAN's own page (GET / POST /config).  Everything
 else in the file - the keys setup writes, the network and security keys (host, api_key, cors_origins,
 trusted_origins, allowed_hosts), the MCP servers and before_load (which run programs), sampling keys not listed
 here - is kept as it is: a change touches only the keys it names (as setup run again keeps the user's keys, #629).
-The earlier file is kept as strata-<model>.json.bak.  The server reads the config when it starts, so a change is
+The earlier file is kept as dacan-<model>.json.bak.  The server reads the config when it starts, so a change is
 used from the next start on.
 """
 from __future__ import annotations

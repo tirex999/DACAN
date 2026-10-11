@@ -1,9 +1,9 @@
 """GET /metrics in the Prometheus text format, with vLLM's metric names, so the dashboards and alerts written for a
-vLLM server read a Strata server unchanged.  Everything comes from the server's own record (Service.metrics(), the
+vLLM server read a DACAN server unchanged.  Everything comes from the server's own record (Service.metrics(), the
 same dict the JSON /metrics returns) plus three latency histograms observed when a request finishes.
 
-What vLLM has no name for is the JSON's own facts under `strata:`, named after the JSON's keys (live.tok_s ->
-strata:live_tok_s, totals.decode_ms -> strata:totals_decode_seconds_total, hardware.gpu_util -> strata:gpu_util), so
+What vLLM has no name for is the JSON's own facts under `dacan:`, named after the JSON's keys (live.tok_s ->
+dacan:live_tok_s, totals.decode_ms -> dacan:totals_decode_seconds_total, hardware.gpu_util -> dacan:gpu_util), so
 the two formats say the same thing and a panel can be moved from the Monitor tab to Grafana by its key."""
 import threading
 
@@ -62,7 +62,7 @@ def _num(v, default=0):
 
 def render(m: dict, lat: dict) -> str:
     """The text for one scrape.  `m` is Service.metrics(), `lat` Latencies.snapshot()."""
-    model = str((m.get("engine") or {}).get("model") or "strata").replace("\\", "\\\\").replace('"', '\\"')
+    model = str((m.get("engine") or {}).get("model") or "dacan").replace("\\", "\\\\").replace('"', '\\"')
     lab = f'model_name="{model}"'
     live, totals = m.get("live") or {}, m.get("totals") or {}
     out = []
@@ -92,7 +92,7 @@ def render(m: dict, lat: dict) -> str:
            _num(totals.get("drafts_offered")))
     metric("vllm:spec_decode_num_accepted_tokens_total", "counter", "MTP draft tokens accepted.",
            _num(totals.get("drafts_accepted")))
-    metric("vllm:num_preemptions_total", "counter", "Preempted requests (Strata does not preempt).", 0)
+    metric("vllm:num_preemptions_total", "counter", "Preempted requests (DACAN does not preempt).", 0)
     for name, key, help_ in (("vllm:time_to_first_token_seconds", "ttft", "Time to the first token."),
                              ("vllm:inter_token_latency_seconds", "itl", "Time between two tokens."),
                              ("vllm:e2e_request_latency_seconds", "e2e", "A request from start to end.")):
@@ -102,12 +102,12 @@ def render(m: dict, lat: dict) -> str:
             out.append(f'{name}_bucket{{{lab},le="{b}"}} {c}')
         out.append(f'{name}_bucket{{{lab},le="+Inf"}} {n}')
         out.append(f"{name}_sum{{{lab}}} {round(total, 6)}\n{name}_count{{{lab}}} {n}")
-    strata(m, out, lab)
+    dacan(m, out, lab)
     return "\n".join(out) + "\n"
 
 
-def strata(m: dict, out: list, lab: str):
-    """The JSON's facts vLLM has no name for, under `strata:` and the JSON's key."""
+def dacan(m: dict, out: list, lab: str):
+    """The JSON's facts vLLM has no name for, under `dacan:` and the JSON's key."""
     live, totals = m.get("live") or {}, m.get("totals") or {}
     hw, eng = m.get("hardware") or {}, m.get("engine") or {}
     reqs = m.get("requests") or []
@@ -119,8 +119,8 @@ def strata(m: dict, out: list, lab: str):
             return                                       # unknown here (no GPU telemetry, an older engine): no sample
         if name not in typed:                            # one HELP / TYPE per family, before its first sample
             typed.add(name)
-            out.append(f"# HELP strata:{name} {help_}\n# TYPE strata:{name} {kind}")
-        out.append(f"strata:{name}{{{lab}{labels}}} {value}")
+            out.append(f"# HELP dacan:{name} {help_}\n# TYPE dacan:{name} {kind}")
+        out.append(f"dacan:{name}{{{lab}{labels}}} {value}")
 
     for state in ("unloaded", "idle", "reading", "generating"):
         metric("live_state", "gauge", "1 for what the engine is doing (live.state).", int(live.get("state") == state),

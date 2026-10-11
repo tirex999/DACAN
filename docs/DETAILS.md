@@ -1,12 +1,12 @@
-# Strata - the details
+# DACAN - the details
 
-The technical side of Strata: every measured number, the API, images, all settings and how the engine works.
+The technical side of DACAN: every measured number, the API, images, all settings and how the engine works.
 New here? Start with the [README](../README.md); installing step by step is in [INSTALL.md](INSTALL.md), the models in
 [MODELS.md](MODELS.md), common problems in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 > **On this page:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
 > [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) ·
-> [MCP tools](#tools-from-mcp-servers) · [MCP server](#manage-strata-from-your-ai-assistant-mcp-server) ·
+> [MCP tools](#tools-from-mcp-servers) · [MCP server](#manage-dacan-from-your-ai-assistant-mcp-server) ·
 > [Images](#images-vision) ·
 > [Troubleshooting](#troubleshooting) · [How it works](#how-it-works)
 
@@ -23,9 +23,9 @@ measured with Swift 1.5's IQ2_XS, which runs at the original's speed.
 4K 1,294 -> 1,570, 32K 2,170 -> 2,653, 128K 2,123 -> 2,468 tokens/s (+16-22%), as close to an FP16 reference as the
 previous kernels (closer at 32K: teacher-forced KL 0.009 vs 0.012). The decode path's block selection and greedy
 argmax run on thread-block clusters (RTX 50, sm_90+; other cards keep the previous kernels; the same tokens): Q2_0 output at 4K 89 -> 93.5, at 128K
-64.5 -> 76.4 tokens/s. `STRATA_PF_FUSED=0` keeps the previous prompt kernels (byte-identical answers to 0.1.35);
-`STRATA_PF_FUSED=1` also runs the native IQ packs' fused kernels (opt-in: IQ2_XS prompts +12% at 4K, +3% at 32K, the
-IQ3 packs about even; on HIP they run on gfx11 and on gfx1200 / gfx1201, see AMD_HIP.md); `STRATA_QSA_CLUSTER=0` / `STRATA_ARGMAX_MULTI=0` turn the decode kernels off. The tables
+64.5 -> 76.4 tokens/s. `DACAN_PF_FUSED=0` keeps the previous prompt kernels (byte-identical answers to 0.1.35);
+`DACAN_PF_FUSED=1` also runs the native IQ packs' fused kernels (opt-in: IQ2_XS prompts +12% at 4K, +3% at 32K, the
+IQ3 packs about even; on HIP they run on gfx11 and on gfx1200 / gfx1201, see AMD_HIP.md); `DACAN_QSA_CLUSTER=0` / `DACAN_ARGMAX_MULTI=0` turn the decode kernels off. The tables
 below are 0.1.26's.
 
 ### Prompt processing (tokens/s)
@@ -40,7 +40,7 @@ below are 0.1.26's.
 | **IQ3_S** (AMD RX 7900 XTX, gfx1100) | 760 | 1,275 | 1,641 | 1,594 | 1,494 | - |
 
 Engine 0.1.26; `bench/results/2026-09-29-speed-0126`. The AMD RX 7900 XTX row: engine 0.1.38 on a ROCm
-10.2 nightly with a tuned gfx1100 hipBLASLt-100500 table (upstream as [#755](https://github.com/Niko1221/Strata/pull/755)),
+10.2 nightly with a tuned gfx1100 hipBLASLt-100500 table,
 the median of 3 clean cells per tier
 (Ryzen 9 7900X, 96 GB; 1K-128K one-shot runs, 256 generated tokens,
 greedy). At 32K-128K that is 8-28% faster than 0.1.22. † not measured
@@ -59,7 +59,7 @@ measured again: 0.1.14.
 | **IQ3_S** (AMD RX 7900 XTX, gfx1100) | 65.1 | 60.4 | 64.4 | 61.8 | 59.2 | - |
 
 Engine 0.1.26, the same runs. The AMD RX 7900 XTX row: engine 0.1.38 on a ROCm 10.2 nightly (tuned
-gfx1100 hipBLASLt-100500 table, upstream as [#755](https://github.com/Niko1221/Strata/pull/755)), median of 3 clean cells per tier (same box; decode is flat in
+gfx1100 hipBLASLt-100500 table), median of 3 clean cells per tier (same box; decode is flat in
 context - the GDN linear attention is O(1) per token; 1K/4K prefill ran slightly under the 0.1.31
 packaged-ROCm numbers, 32K-128K ahead). † not measured again: 0.1.14.
 
@@ -94,14 +94,14 @@ VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the
 slower. It streams its KV cache like the other formats (`--kv-resident N`): on an RTX 2060 SUPER 8 GB at 128K with
 20,480 resident cells, +780 expert slots over resident K8V4, and it scores better than 4-bit KV on long documents.
 
-**Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
-expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
+**Reproducible greedy output (0.1.30, opt-in, `DACAN_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
+expert for one token with ggml's dot product and for several tokens with DACAN's multi-token kernels, which round
 slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt
 at temperature 0 can end in a different (equally good) answer when the drafting, the cache state or a resumed
-conversation differ (issue #152). `STRATA_IQ_MT_MIN=1` (in the config's `env`) uses the multi-token kernels for
+conversation differ (issue #152). `DACAN_IQ_MT_MIN=1` (in the config's `env`) uses the multi-token kernels for
 every group: the answer then no longer depends on the drafting. Measured on a Ryzen 7600 (AVX-512): IQ3_S decode
 -1..-3%, the other models the same; the default stays the fastest rule. On an Intel CPU of Alder Lake or later
-without AVX-512, where the AVX-2 kernel gathers the IQ3_S grid, `STRATA_IQ3S_MT1=1` (opt-in) gives IQ3_S the multi-token
+without AVX-512, where the AVX-2 kernel gathers the IQ3_S grid, `DACAN_IQ3S_MT1=1` (opt-in) gives IQ3_S the multi-token
 kernel for one token, which is the faster one there; it changes a lone token's rounding, so it is off by default. Through the server, two more things carry
 over from one request to the next (#410): the adaptive tier moves experts between RAM and VRAM (the GPU and the CPU
 round an expert differently), and the prompt cache resumes a repeated prompt and reads only its tail through the
@@ -111,9 +111,9 @@ answer after a start differ from the next ones. Measured here (IQ3_XXS, a 3.6K-t
 three switches 1 answer of 4, without `--pcie-frac 0` 2 of 4 (the first one differs), with the defaults 2 of 4.
 `--pcie-frac 0` costs decode speed (the missed experts all run on the CPU), so keep it for A/B runs.
 
-**Coupled drafts with Gumbel-max picks (opt-in, `STRATA_SPEC_COUPLED=1` and `STRATA_SPEC_GUMBEL=1`):** for a request
-that samples (temperature above 0), `STRATA_SPEC_COUPLED=1` lets the draft layer sample its guesses with the target's own
-chain and random draw instead of taking its most likely token. `STRATA_SPEC_GUMBEL=1` changes how both of them pick from
+**Coupled drafts with Gumbel-max picks (opt-in, `DACAN_SPEC_COUPLED=1` and `DACAN_SPEC_GUMBEL=1`):** for a request
+that samples (temperature above 0), `DACAN_SPEC_COUPLED=1` lets the draft layer sample its guesses with the target's own
+chain and random draw instead of taking its most likely token. `DACAN_SPEC_GUMBEL=1` changes how both of them pick from
 that chain: the token with the largest p / E, where E is exponential noise keyed by the seed, the position and the token
 id (the Gumbel-max trick; it is still an exact sample of the same distribution). With the default pick, one random number
 walked over the candidates sorted by probability, a draft and a target whose candidate lists differ in one token tend to
@@ -123,7 +123,7 @@ Max+ 395 (Radeon 8060S, Linux, ROCm 7.14.1, the iGPU alone), UD-Q4_K_XL, `--spec
 layer), temperature 1.0 / top_p 0.95 / top_k 20, a 1.3K-token prompt and 512 output tokens, 12-13 requests per arm:
 drafts accepted 52.8% -> 59.9%, tokens per verify window 2.65 -> 2.88, output 41.1 -> 44.9 tokens/s (+9%); a window
 costs the same (draft 8.8 -> 9.1 ms of 64). `sampler_parity` checks the pick against a host reference on every sampled
-path, and that its frequencies match the softmax. On an RTX 3060 (IQ3_XXS, `--spec 4 --mtp`, temperature 1.0 / top_p 0.95 / top_k 20, 12 interleaved pairs of 200-token story and code requests) `STRATA_SPEC_COUPLED=1` raised the accepted drafts from 62.1% to 66.9% and adding `STRATA_SPEC_GUMBEL=1` to 68.0%, but decode speed did not move beyond the run-to-run spread (median 43.3 tok/s with coupled alone, 42.8 with Gumbel as well): try it on your own card before relying on it.
+path, and that its frequencies match the softmax. On an RTX 3060 (IQ3_XXS, `--spec 4 --mtp`, temperature 1.0 / top_p 0.95 / top_k 20, 12 interleaved pairs of 200-token story and code requests) `DACAN_SPEC_COUPLED=1` raised the accepted drafts from 62.1% to 66.9% and adding `DACAN_SPEC_GUMBEL=1` to 68.0%, but decode speed did not move beyond the run-to-run spread (median 43.3 tok/s with coupled alone, 42.8 with Gumbel as well): try it on your own card before relying on it.
 
 **The draft layer's tokens (0.1.27, `--draft-vocab`):** the MTP draft layer can only propose tokens from a subset
 of the vocabulary (`mtp/rt/draft_vocab.bin`). Since 0.1.27 the subset includes every Chinese, Japanese and Korean
@@ -172,18 +172,18 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
   advances between their windows too (docs/BATCHING.md); not with `--batch-groups` or `--peer-device` (the blocking
   tier runs there). With `--pipeline-windows 2` (two windows in flight, see
   [MULTI_GPU.md](MULTI_GPU.md)) the copies into the evicted slots and the moves into RAM also wait until the windows
-  that were in flight when they were decided have completed (`STRATA_PIPELINE_ADAPT_ASYNC=0`: the blocking tier
+  that were in flight when they were decided have completed (`DACAN_PIPELINE_ADAPT_ASYNC=0`: the blocking tier
   there). It is not bit-exact from run to run: which window first computes a swapped-in expert on the GPU (which
   rounds differently from the CPU) depends on when its copy lands.
   It stays on the blocking tier (said in the log) when the exchange buffers are not page-locked; the stats line
   reports ms per round.
-- `STRATA_EXCHANGE_ROTATE=1` (opt-in): an adaptive swap hands buffer ownership over instead of copying the evicted
+- `DACAN_EXCHANGE_ROTATE=1` (opt-in): an adaptive swap hands buffer ownership over instead of copying the evicted
   blob into the RAM copy (equal-size blobs, fully page-locked copy). Same tokens, fewer host copies; it works with
   `--adapt-async 1` too. Details and the measurement: [EXCHANGE_ROTATION.md](EXCHANGE_ROTATION.md).
 - The answers are the plain mapped mode's for the same expert placement: the bytes are the file's. With a page-locked
   copy the GPU also takes its usual share of the misses over PCIe (`--pcie-frac`), as with enough RAM; `--pcie-frac 0`
-  (or `STRATA_RESIDENT_PIN=0`) gives the mapped mode's exact tokens.
-- The engine leaves 4 GB of the RAM it finds free (`STRATA_RESIDENT_HEADROOM_GIB`); when even the experts the GPU does
+  (or `DACAN_RESIDENT_PIN=0`) gives the mapped mode's exact tokens.
+- The engine leaves 4 GB of the RAM it finds free (`DACAN_RESIDENT_HEADROOM_GIB`); when even the experts the GPU does
   not hold do not fit, it says so and runs the plain mapped mode. The server log shows, per request, how many expert
   reads went to the file (`resident RAM: ... blob reads from the file`: 0 in steady use).
 - `--low-ram resident|mmap` forces one variant (also on a PC with enough RAM, e.g. to try it).
@@ -196,14 +196,14 @@ other ~18 GB), a 32 GB PC with a 12-16 GB GPU the Coder; IQ3_XXS on a 32 GB PC s
   engine that runs the resident variant on a split, so it keeps both cards, resident, as for any config:
   [MULTI_GPU.md](MULTI_GPU.md#using-it).
 
-**A mapped arena for small RAM (Linux, opt-in, 0.1.39, PR #640):** `STRATA_ARENA_MMAP=1` maps a native pack's expert
+**A mapped arena for small RAM (Linux, opt-in, 0.1.39, PR #640):** `DACAN_ARENA_MMAP=1` maps a native pack's expert
 arena read-only from the pack's `experts.bin` instead of reading it into locked RAM, for a PC whose GPUs hold most
 experts but whose RAM is small (2x 16 GB GPUs with 32 GB of RAM: ~1 GB -> 25 GB available while serving). The first
 start writes `experts.bin` (when the drive has room for it), later starts map it; the pages of the experts a GPU holds
 are handed back to the OS. Run it with `--pcie-frac 0` (the GPUs get no mapped alias). Without the variable nothing
 changes.
 
-**Releasing mapped expert pages on Windows (opt-in):** `STRATA_FILE_RELEASE=1` lets `FileExpertSource` trim the
+**Releasing mapped expert pages on Windows (opt-in):** `DACAN_FILE_RELEASE=1` lets `FileExpertSource` trim the
 full file-backed pages of experts after their GPU uploads complete, including the slots lent to prefill and then
 refilled. It works with `experts.bin` and the direct GGUF views; shared boundary pages and private/pinned buffers
 are left alone. Unset or `0` keeps the previous behavior. On one 32 GB Windows 11 laptop with an RTX 4080 Laptop
@@ -219,20 +219,20 @@ maps the model's GGUF files themselves and reads each expert's gate, up and down
 says they are (the files are checked against it first: every tensor's name, type, shape, offset and bounds). That
 saves the 23-50 GB copy on the disk. The answers are the same: on the Coder, 64 greedy tokens from `experts.bin` and
 from the GGUF gave identical tokens and logits. An expert read from the GGUF is three reads instead of one, so the
-engine fetches a layer's missing experts on 8 threads (`STRATA_FETCH_THREADS`) with one batched page request
+engine fetches a layer's missing experts on 8 threads (`DACAN_FETCH_THREADS`) with one batched page request
 (Windows `PrefetchVirtualMemory`). With an `experts.bin` in the pack, nothing changes. Setup does not use this yet.
 
-**Linux file-tier I/O path (opt in, `STRATA_IO_PREFETCH=1`; 0.1.40.2):** the mapped file tier reads experts through
-page faults. With this on, the layer's uncached experts and the router-predicted ones of the next layer (`STRATA_LOOKAHEAD_K`,
-`STRATA_IO_PREFETCH_DEPTH`, default 2 when on) are read by I/O threads (`STRATA_IO_PF_THREADS`, default 8) with whole-blob
+**Linux file-tier I/O path (opt in, `DACAN_IO_PREFETCH=1`; 0.1.40.2):** the mapped file tier reads experts through
+page faults. With this on, the layer's uncached experts and the router-predicted ones of the next layer (`DACAN_LOOKAHEAD_K`,
+`DACAN_IO_PREFETCH_DEPTH`, default 2 when on) are read by I/O threads (`DACAN_IO_PF_THREADS`, default 8) with whole-blob
 `pread`s into the page cache, and the CPU kernels read the mapping as before. The bytes are the same, so the output is the
-same (greedy IQ3_XXS and Q2_0 hashes identical, prefetch off vs on). `STRATA_IO_PF_STAGE=1` instead stages every uncached
-expert in a buffer and makes the layer wait for them; `STRATA_IO_PF_AHEAD=0` keeps only the demand reads. The per-request
+same (greedy IQ3_XXS and Q2_0 hashes identical, prefetch off vs on). `DACAN_IO_PF_STAGE=1` instead stages every uncached
+expert in a buffer and makes the layer wait for them; `DACAN_IO_PF_AHEAD=0` keeps only the demand reads. The per-request
 log line "file tier I/O" shows what the OS read from the drive (/proc/self/io, major faults) against the engine's expert
-reads; `STRATA_IO_STATS=1` (or prefetch on) adds the page-cache hit / miss split (mincore) and the read-ahead used / unused counts.
+reads; `DACAN_IO_STATS=1` (or prefetch on) adds the page-cache hit / miss split (mincore) and the read-ahead used / unused counts.
 Measured (interleaved A/B, 10 pairs, 200-token greedy medians, page cache dropped before each run, memory limit by cgroup):
 
-| box, lane | default (fill) | `STRATA_IO_PF_STAGE=1` |
+| box, lane | default (fill) | `DACAN_IO_PF_STAGE=1` |
 |---|---|---|
 | RTX 3060, 32 GB, IQ3_XXS | -3.4% | **+25.7%** |
 | RTX 3060, 16 GB, IQ3_XXS | -1.8% | -32.6% |
@@ -253,37 +253,37 @@ A clamped budget no longer fails the safety check that follows (#403). A budget 
 warning, with every expert read from the files. Setup sets N with `--resident-budget-gib N`. With
 the GGUF read in place it also warms the next layer's likely experts: while the CPU works on a layer, a thread applies
 the next layer's router to this layer's input and asks the OS for the pages of the predicted experts that neither the
-GPU nor the RAM budget holds (only pages - the experts computed are the same; `STRATA_LOOKAHEAD=0` turns it off). This
+GPU nor the RAM budget holds (only pages - the experts computed are the same; `DACAN_LOOKAHEAD=0` turns it off). This
 is what runs [Unsloth's UD-Q4_K_XL](UNSLOTH_Q4.md) (72 GiB of experts) on a 64 GB PC: 7-8.5 tokens/s at N = 40 on an
 RTX 5070, against ~3 tokens/s before these changes.
 
 **Switches added in 0.1.40 (all off unless noted; none changes the default output):**
-- `--kv-grow` (or `STRATA_KV_GROW=1`; `--no-kv-grow` turns it off): the K/V takes VRAM only for the cells the requests
+- `--kv-grow` (or `DACAN_KV_GROW=1`; `--no-kv-grow` turns it off): the K/V takes VRAM only for the cells the requests
   reach, and the expert cache holds the rest, giving slots back as the context grows. It needs one GPU, an expert
   profile, the whole K/V in VRAM (no KV streaming) and every expert in RAM (not the resident low-RAM mode); otherwise,
   and with `--batch`, `--vram-elastic` or `--peer-device`, the engine says so and stays off.
-- `--host-core last` (or `STRATA_HOST_CORE=last`, Windows): the host thread runs on the last physical core and the
+- `--host-core last` (or `DACAN_HOST_CORE=last`, Windows): the host thread runs on the last physical core and the
   workers take the first. Windows sends a GPU's interrupts to the first core, where a host spinning on the GPU's flags
   waits for them (`--host-core first` is the default; the startup log names the cores).
-- `STRATA_ADAPT_LAG=2` (#764): a window takes the adaptive tier's swaps once they are two windows old (default 1,
-  as 0.1.39). `STRATA_PREFILL_EQUAL=1` (#693): a prompt segment is read in chunks of equal size, not full chunks and a
-  short last one (changes the rounding). `STRATA_OWNED_PRICE=exact` (#796): the cache sizing prices the prompt path's
+- `DACAN_ADAPT_LAG=2` (#764): a window takes the adaptive tier's swaps once they are two windows old (default 1,
+  as 0.1.39). `DACAN_PREFILL_EQUAL=1` (#693): a prompt segment is read in chunks of equal size, not full chunks and a
+  short last one (changes the rounding). `DACAN_OWNED_PRICE=exact` (#796): the cache sizing prices the prompt path's
   own buffers by their real allocation instead of 0.1.39's rule.
-- `STRATA_Q2_BITPLANE=1`: a bit-plane row kernel for Q2_0 on CPUs with AVX2 and no AVX-512 (changes the last bits).
-  `STRATA_NO_AVXVNNI=1` turns the AVX-VNNI forms of the i-quant, IQ4_NL and Q2_0 rows off on CPUs that have them
+- `DACAN_Q2_BITPLANE=1`: a bit-plane row kernel for Q2_0 on CPUs with AVX2 and no AVX-512 (changes the last bits).
+  `DACAN_NO_AVXVNNI=1` turns the AVX-VNNI forms of the i-quant, IQ4_NL and Q2_0 rows off on CPUs that have them
   (Alder Lake, Sapphire Rapids and later); they give the same bits as the AVX2 forms, 4-25% faster rows.
 - Draft layer: `--lookup-chain-min M` (the shortest context match `--lookup-chain` extends, default 3),
   `--mtp-hnorm stream` (one norm per stream, as llama.cpp's MTP graph) and `--mtp-draft-vocab FILE` (a token subset
   of your own instead of `<mtp>/draft_vocab.bin`).
-- Elsewhere: HIP `STRATA_DENSE_MMQ=1` and `STRATA_HIP_ADAPT_KERNEL_COPY=1` in [AMD_HIP.md](AMD_HIP.md#model-and-serving-configuration);
-  `STRATA_KEEP_EMPTY_TURNS=1` and `STRATA_TOPK_STREAM=0` in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+- Elsewhere: HIP `DACAN_DENSE_MMQ=1` and `DACAN_HIP_ADAPT_KERNEL_COPY=1` in [AMD_HIP.md](AMD_HIP.md#model-and-serving-configuration);
+  `DACAN_KEEP_EMPTY_TURNS=1` and `DACAN_TOPK_STREAM=0` in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 
 **Read-ahead at start (Linux):** the weights, the native dense matrices, the GPU cache's fill from the profile, the
 resident RAM copy and the MTP draft files are asked for ahead of their reads (madvise / posix_fadvise WILLNEED in
 128 KiB steps), so the drive sees a deep queue instead of one page fault at a time. Measured on a Gen3 NVMe (RTX 5090,
 32 GB, Q2_0 resident at 262K): ready in 70 s instead of ~920 s; the fill went from 39 MB/s to 3.2 GB/s.
-`STRATA_READ_AHEAD=0` turns it off; `STRATA_FILL_AHEAD=N` sets how many fill pairs are asked for ahead (default 256).
+`DACAN_READ_AHEAD=0` turns it off; `DACAN_FILL_AHEAD=N` sets how many fill pairs are asked for ahead (default 256).
 
 **How much came from where:** with `--stats` the engine prints the tiers of the decode (`expert tiers`: blobs from the
 RAM copy, blobs and MB from the files, the time spent reading them; `routing prefetch`: how many of the file reads had
@@ -296,17 +296,17 @@ Its `hit_rate` is the VRAM share of the experts looked up while answering: exper
 (engine 0.1.39 or newer, #588) is their share of all routed experts, and the server log and the Monitor tab show it
 beside the hit rate.
 
-**Where a decode window's time goes (profiling, #610):** start the server with `STRATA_DECODE_TIMING=1` (and
-`STRATA_VERIFY_PROFILE=1` for the GPU's side) in the environment. After each request the engine log then has one
-`strata decode timing:` line - windows, tokens per window, and per window the verify time split into the wait for the
+**Where a decode window's time goes (profiling, #610):** start the server with `DACAN_DECODE_TIMING=1` (and
+`DACAN_VERIFY_PROFILE=1` for the GPU's side) in the environment. After each request the engine log then has one
+`dacan decode timing:` line - windows, tokens per window, and per window the verify time split into the wait for the
 GPU, the CPU expert pool (plan, activation quantization, jobs) and the stage, plus commit and draft - and one
-`strata decode GPU stages (ms/window):` line with the GPU time of each stage (GDN and QSA layers, the VRAM expert
+`dacan decode GPU stages (ms/window):` line with the GPU time of each stage (GDN and QSA layers, the VRAM expert
 hits, the router, the head, ...). The GPU profile times every stage with events, so it slows the decode a little:
 use it to compare, not to measure speed. This works with every pack; `--gpu-stages` (a one-token replay of
 per-layer graphs) refuses a native (IQ) pack, which has no such graphs.
 
-**How good the next-layer expert prediction is (measurement only):** `STRATA_LOOKAHEAD_STATS=1` runs the router look-ahead on any expert tier and
-scores it against the routing of the next layer: every 100 windows the engine log has a `strata lookahead stats:` line with the experts per layer
+**How good the next-layer expert prediction is (measurement only):** `DACAN_LOOKAHEAD_STATS=1` runs the router look-ahead on any expert tier and
+scores it against the routing of the next layer: every 100 windows the engine log has a `dacan lookahead stats:` line with the experts per layer
 outside the GPU cache, the recall and precision of the top-k / k+4 / k+10 guesses and of the vote-ranked top 4 / 8 / 12, how much of the PCIe share they
 would cover, and the predictor thread's time per window. It costs CPU (the predictor is a thread beside the expert pool), so use it to measure, not to
 time. `tools/replay_cache_policy.py` replays a `--dump-routing` trace through the adaptive tier's swap policy offline.
@@ -324,7 +324,7 @@ whole chunk at once; unpinned experts are copied by helper threads. Measured on 
 (1K-262K). Details and the quality check:
 [`bench/results/2026-09-28-prefill-speed`](../bench/results/2026-09-28-prefill-speed/README.md). Existing installs
 switch to `--prefill auto` the next time START-HERE / setup.sh starts them. The raw numbers:
-[`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
+[`bench/results/`](../bench/results/). The [paper](paper/DACAN-Paper.pdf) explains every number.
 
 ## Other GPUs (estimated)
 
@@ -370,7 +370,7 @@ RCO on code, agentic and vision calibration data; its authors report 91.3% of th
 98.7% of LiveCodeBench v6. One size, named IQ1_M for its 1.89 bits per *original* parameter; the kept experts are
 stored like IQ3_S (IQ2_S-IQ4_XS gate/up, IQ4_NL/Q2_0 down). Shard 1 is 29.6 GB (experts: 23 GB of RAM), so it runs
 on **32 GB of RAM**, and at 262K on 64 GB. Its shard 2 and its vision encoder are the original's files: with the
-original installed, setup downloads only shard 1. Strata ships its expert profile (`data/expert-profile-coder.bin`,
+original installed, setup downloads only shard 1. DACAN ships its expert profile (`data/expert-profile-coder.bin`,
 the shipped ranking mapped onto the kept experts through the release's `rco-allocation.txt`: 72% of the expert
 reads hit the GPU on a 12 GB card). Images work; the experimental speed projection loads and runs on it (it was made
 for the full model).
@@ -385,7 +385,7 @@ The setup's first question also offers **[Swift 1.5](https://huggingface.co/ukis
 UkisAI's fine-tune of Qwen3.8-Flash-Next, trained to reach the answer with much less thinking (its authors: 63% fewer
 thinking tokens, 1.8x sooner answers, under 1% accuracy loss). Same architecture, the original's sizes except Q2_0,
 its own
-vision encoder; Strata runs it at the same speed (4K, IQ2_XS: 465 prompt / 78.7 output tokens/s, vs 467 / 78.3 for
+vision encoder; DACAN runs it at the same speed (4K, IQ2_XS: 465 prompt / 78.7 output tokens/s, vs 467 / 78.3 for
 the original). Its authors recommend **IQ2_XS** (their Q2_0 is marked experimental). Its license is the Swift Open
 License 1.0 - read it on the model page.
 
@@ -421,12 +421,12 @@ Everything else is installed for you the first time.
 | OS | Windows 10/11, or Linux (Ubuntu 22.04/24.04 get everything installed automatically). |
 
 What the first start installs: in this folder `.venv/`, `engine/` and `third_party/`; the model files (`models/`,
-`packs/`, `mtp/`, 70-120 GB) in **`Strata-data` next to this folder**, so a new copy of Strata (an update unzipped
-elsewhere) finds them and sets itself up the same way. The place is remembered per user (`%APPDATA%\Strata\settings.json`,
-`~/.config/strata/settings.json`); `--data-dir` chooses another. Installs from before 0.1.16 are moved there by the next
+`packs/`, `mtp/`, 70-120 GB) in **`DACAN-data` next to this folder**, so a new copy of DACAN (an update unzipped
+elsewhere) finds them and sets itself up the same way. The place is remembered per user (`%APPDATA%\DACAN\settings.json`,
+`~/.config/dacan/settings.json`); `--data-dir` chooses another. Installs from before 0.1.16 are moved there by the next
 start (a rename on the same drive; files on another drive are used where they are).
 Python 3.12 if you have none (for your user account, no admin), a private Python environment, NVIDIA's CUDA libraries
-(from pip, ~0.4 GB), the ready-made Strata engine for RTX 20/30/40/50, the model and the MTP draft layer. If no
+(from pip, ~0.4 GB), the ready-made DACAN engine for RTX 20/30/40/50, the model and the MTP draft layer. If no
 ready-made engine fits your PC, it offers to install the build tools (Visual Studio Build Tools + CUDA Toolkit on
 Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GPU (asks first; 20-40 minutes once).
 
@@ -444,7 +444,7 @@ Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GP
 4. **Images?** yes / no (see [Images](#images-vision)).
 
 Then it downloads and prepares everything (the model is 66-76 GB, so the first start takes a while; an interrupted
-download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, the Strata
+download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, the DACAN
 app. It has three tabs:
 - **Chat:** streaming answers, the model's thinking (folded away once it answers), code with a copy button, pictures when
   images are on, and sampling and thinking-level settings. Chats stay in your browser.
@@ -463,7 +463,7 @@ START-HERE.bat --setup                          install another model, or change
 SETUP.bat                                       the same (double-click it)
 START-HERE.bat --model IQ2_XS --context 32768 --vision yes --yes     no questions
 START-HERE.bat --gguf-dir D:\models\IQ2_XS       use GGUF files you already have
-START-HERE.bat --data-dir E:\Strata-data         keep the model files somewhere else
+START-HERE.bat --data-dir E:\DACAN-data         keep the model files somewhere else
 START-HERE.bat --port 8081                      another port
 START-HERE.bat --gpu 1                          another GPU (numbered as nvidia-smi; setup picks the one with the most VRAM)
 START-HERE.bat --calibrate                      tune the engine for this PC (about 15-30 minutes, longer on a slow card), then start
@@ -555,8 +555,8 @@ Terminal chat: `.venv/bin/python chat.py`.
 
 ## Sharing the GPU with other programs (optional)
 
-By default the model stays loaded until you close Strata. On a PC that also games, renders or runs another model
-server, three server options (all off by default; also as keys in `strata-<model>.json`) give the VRAM back:
+By default the model stays loaded until you close DACAN. On a PC that also games, renders or runs another model
+server, three server options (all off by default; also as keys in `dacan-<model>.json`) give the VRAM back:
 
 | Option | Config key | What it does |
 | --- | --- | --- |
@@ -588,12 +588,12 @@ the shrink. Without the flag nothing changes (the same answers as without it).
 
 **Keep what the expert cache learned across restarts (opt-in, engine 0.1.36, #477):** a start fills the GPU's expert
 cache from the shipped profile, and the adaptive tier (`--adapt-every`) then moves in the experts your requests use.
-With `"expert_profile_save": "expert-profile-learned.bin"` in `strata-<model>.json` the engine saves that as a
+With `"expert_profile_save": "expert-profile-learned.bin"` in `dacan-<model>.json` the engine saves that as a
 profile - the experts in VRAM first, then the routing it counted since the start, then the shipped order - on a
 clean exit and every 10 minutes between requests (`"expert_profile_save_every": 5` for another interval, `0` for
 exit only), written to a temporary file and renamed, so a crash never leaves half a file. The next start begins from
 it instead of the config's `--expert-profile` when it is a profile of the same model (else from the config's, as
-before). A relative path is in the Strata folder; one file per model, and a profile per project works the same way
+before). A relative path is in the DACAN folder; one file per model, and a profile per project works the same way
 (point the key at another file). The file is a fingerprint of what you used the model for: it stays on your PC.
 Without the key nothing is counted or written. Setup rewrites the config when run again: add the key again then.
 
@@ -631,7 +631,7 @@ deliberately pinned memory (the expert arena, 50.3 GB here, plus the pinned K/V,
 line in the log is the reliable tell, and on NVIDIA hardware `CUDA - Sysmem Fallback Policy` set to
 `Prefer No Sysmem Fallback` for the engine's executable is the other way to make an over-sized cache fail instead of
 paging (not measured here). Reported with the measurements in
-[issue #781](https://github.com/Niko1221/Strata/issues/781).
+an earlier report.
 
 The same shape appears on a second, smaller card. On a 16 GB RTX 5080 at 786,432, UD-IQ4_XS, INT8 KV, with
 `Prefer No Sysmem Fallback` set and an explicit `--expert-cache 4000`, taking `--vram-reserve-mib` down from 770 to 0
@@ -669,17 +669,17 @@ request counters, `vllm:prefix_cache_queries_total` / `_hits_total` (prompt toke
 dashboards and alerts written for a vLLM server read this one. With an API key, the scraper sends it as a bearer
 token. Any other request keeps the JSON.
 
-The JSON's own facts that vLLM has no name for come in the same scrape under `strata:`, named after their JSON key,
-so a Monitor-tab panel and a Grafana panel read the same value: `strata:live_state{state="..."}`, `strata:live_tok_s`,
-`strata:live_prefill_tok_s_mean`, `strata:live_prompt_read`, `strata:engine_max_context`,
-`strata:totals_prompt_seconds_total` / `strata:totals_decode_seconds_total`, `strata:last_hit_rate` and
-`strata:last_decode_tok_s` (the last request's), and the hardware - `strata:gpu_util`, `strata:gpu_mem_used_bytes`,
-`strata:gpu_mem_total_bytes`, `strata:gpu_temp_celsius`, `strata:gpu_power_watts` (one sample per card, label
-`gpu`), `strata:cpu`, `strata:ram_used_bytes`, `strata:ram_total_bytes`. A value the server does not have (no GPU
+The JSON's own facts that vLLM has no name for come in the same scrape under `dacan:`, named after their JSON key,
+so a Monitor-tab panel and a Grafana panel read the same value: `dacan:live_state{state="..."}`, `dacan:live_tok_s`,
+`dacan:live_prefill_tok_s_mean`, `dacan:live_prompt_read`, `dacan:engine_max_context`,
+`dacan:totals_prompt_seconds_total` / `dacan:totals_decode_seconds_total`, `dacan:last_hit_rate` and
+`dacan:last_decode_tok_s` (the last request's), and the hardware - `dacan:gpu_util`, `dacan:gpu_mem_used_bytes`,
+`dacan:gpu_mem_total_bytes`, `dacan:gpu_temp_celsius`, `dacan:gpu_power_watts` (one sample per card, label
+`gpu`), `dacan:cpu`, `dacan:ram_used_bytes`, `dacan:ram_total_bytes`. A value the server does not have (no GPU
 telemetry, an older engine) has no sample rather than a zero.
 
 Ready to use, in `docs/monitoring/`: `prometheus.yml` (a scrape config, the API key as a bearer token),
-`servicemonitor.yaml` (the same for the Prometheus Operator) and `grafana-strata.json`, a Grafana dashboard to
+`servicemonitor.yaml` (the same for the Prometheus Operator) and `grafana-dacan.json`, a Grafana dashboard to
 import (it asks for the Prometheus data source): requests running and waiting, tokens per second, time to first
 token, time between tokens and request duration (p50 / p95), the prompt cache and MTP draft rates, and the engine's
 own panels (state, batch slots, rates, expert cache hit rate, GPU and RAM). Its first row uses only vLLM's names, so
@@ -687,10 +687,10 @@ it also reads a vLLM server.
 
 `/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `/slots` uses llama.cpp's names: `n_ctx` and `n_prompt_tokens` (the running request's prompt size, kept after it ends: what a front-end's context meter divides by `n_ctx`). `total_slots` in `/props` is the number of `--batch` slots (1 without). `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
 
-`chat_template_caps` uses llama.cpp's field names. Strata checks them when loading the active template by rendering
+`chat_template_caps` uses llama.cpp's field names. DACAN checks them when loading the active template by rendering
 small requests; a rejected or omitted feature is `false`, and a template that fails a probe in any way only turns that
 feature off (the server still starts). `supports_tools` checks tool definitions and XML call
-instructions; `supports_tool_calls` checks that calls in the history use Strata's XML format and keep tool results.
+instructions; `supports_tool_calls` checks that calls in the history use DACAN's XML format and keep tool results.
 `supports_parallel_tool_calls` checks multiple calls in one assistant turn, and `supports_system_role` checks a
 leading system message. `supports_preserve_reasoning` means older assistant turns keep their `reasoning_content`
 in the rendered prompt. It does not describe whether a new reply returns reasoning. These are compatibility hints
@@ -699,13 +699,13 @@ offer tools.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
-  "model": "strata", "messages": [{"role": "user", "content": "Write a haiku about GPUs."}], "max_tokens": 512 }'
+  "model": "dacan", "messages": [{"role": "user", "content": "Write a haiku about GPUs."}], "max_tokens": 512 }'
 ```
 
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
-r = client.chat.completions.create(model="strata", messages=[{"role": "user", "content": "Hello!"}])
+r = client.chat.completions.create(model="dacan", messages=[{"role": "user", "content": "Hello!"}])
 print(r.choices[0].message.content)
 ```
 
@@ -722,10 +722,10 @@ print(r.choices[0].message.content)
   short. The levels are instructions the model was trained with, not a hard token limit: on easy questions all three
   think briefly, on hard ones `high` thinks longest and is most accurate.
   To start with another level for every request that names none, put `"reasoning_effort": "low"` (or `none`, `medium`,
-  `high`) in `strata-<model>.json`, outside `"args"` (#1641): the engine has no such option, and `--reasoning-effort` in
+  `high`) in `dacan-<model>.json`, outside `"args"` (#1641): the engine has no such option, and `--reasoning-effort` in
   `"args"` is moved to this key with a note at startup. The web app's shared Chat settings ("Use for other apps too") and a
   request's own level win over it.
-- **Keep Windows awake while it works (opt-in, #1727).** `"prevent_sleep": true` in `strata-<model>.json` keeps the PC
+- **Keep Windows awake while it works (opt-in, #1727).** `"prevent_sleep": true` in `dacan-<model>.json` keeps the PC
   from going to sleep while at least one request is running or waiting (Windows' `SetThreadExecutionState` with
   `ES_SYSTEM_REQUIRED`; the screen may still turn off), and gives the normal sleep rules back when the server is idle
   and when it exits. Default off. On Linux and macOS it does nothing (one line at startup says so).
@@ -733,18 +733,18 @@ print(r.choices[0].message.content)
   thinking at N tokens: when it gets there the server ends it with a short wrap-up line and `</think>`, and the model
   answers from there (the engine continues from what it already holds, so nothing is read again). The wrap-up is
   part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
-  `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
+  `dacan-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
   Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
 - **A reply that ends inside its thinking (#1053, opt-in).** Some turns write a sentence of reasoning and then the
   end-of-turn token with no `</think>`: the content is empty and an agent stops. `"reasoning_close_retry": true` in
-  `strata-<model>.json` closes the thinking once (as the thinking budget does) and continues, once per request, only for
+  `dacan-<model>.json` closes the thinking once (as the thinking budget does) and continues, once per request, only for
   a reply that ended that way with no answer and no tool call. Off by default.
 - **A reply stuck on one token is ended (0.1.39, #606).** When a reply repeats the same token 256 times in a row, the
   server ends it there with `finish_reason` `"length"` and says so in its window: a model in a loop, or a broken
   state that answers one token forever (#606 saw 36,689 tokens of `!`). `"repeat_stop_tokens": N` in
-  `strata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
+  `dacan-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
 - **Repeated reasoning (opt-in, #728).** The single-token guard above does not see a model that repeats whole
-  passages. `"reasoning_loop_recovery"` in `strata-<model>.json` is `false` (the default), `"stop"` or `"recover"`
+  passages. `"reasoning_loop_recovery"` in `dacan-<model>.json` is `false` (the default), `"stop"` or `"recover"`
   (`true` means `"recover"`). Every 512 output tokens, at a complete character and parser boundary, the reasoning is
   measured over its last 2,000 words and punctuation marks (counting passages over the last 30,000 words), and its
   last 2,048 characters are checked for a period of at most 64 characters (#1753: a loop written as one long word,
@@ -762,7 +762,7 @@ print(r.choices[0].message.content)
   the recorded answer quality alongside the completion rate when testing it.
 - **Changing the effort without re-reading the prompt (opt-in, 0.1.39, #458).** The effort's instruction is the
   first thing in the prompt, so a request that only changes the effort (an agent's "think harder" switch, `none` for
-  a quick tool step) reads the whole conversation again. `"effort_position": "end"` in `strata-<model>.json` renders
+  a quick tool step) reads the whole conversation again. `"effort_position": "end"` in `dacan-<model>.json` renders
   every request's prompt start as the default effort's and puts a `low` / `medium` effort in a short system turn
   right before the answer (no thinking: the empty thinking block, as always); the engine (0.1.39+, which the server
   checks) keeps its checkpoint in front of that turn, so the next request reuses the conversation whatever its
@@ -770,14 +770,14 @@ print(r.choices[0].message.content)
   place than it was trained with; how well it follows it there is not measured yet.
 - **Anthropic requests that don't ask for thinking (opt-in, 0.1.32, #278).** By default a `/v1/messages` request
   with no `"thinking"`, effort or budget thinks as the model's template does. `"anthropic_thinking": "on_request"` in
-  `strata-<model>.json` renders such a request without thinking - Anthropic's own rule, and what Claude Code's short
+  `dacan-<model>.json` renders such a request without thinking - Anthropic's own rule, and what Claude Code's short
   helper calls (a session title in a few dozen tokens) need; its real turns ask for thinking when it is on there.
 - **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
   15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
   connection or pressing stop in your app really stops the model, so the next request starts at once.
-- **Tool calls in other forms (opt-in).** `"tool_call_recovery": true` in `strata-<model>.json` reads a call of a
+- **Tool calls in other forms (opt-in).** `"tool_call_recovery": true` in `dacan-<model>.json` reads a call of a
   tool the request declared also when the model writes it as `<parameter=NAME>` instead of `<function=NAME>`, as JSON
   (`{"name": ..., "arguments": ...}`) inside `<tool_call>`, as a `<function=NAME>` block at the start of a line
   without `<tool_call>` (outside code), or as a second call inside the same `<tool_call>` (without the switch the
@@ -803,13 +803,13 @@ print(r.choices[0].message.content)
   {
     "$schema": "https://opencode.ai/config.json",
     "provider": {
-      "strata": {
+      "dacan": {
         "npm": "@ai-sdk/openai-compatible",
-        "name": "Strata (local)",
+        "name": "DACAN (local)",
         "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "none" },  // or your api_key
         "models": {
-          "strata": {
-            "name": "Qwen3.8-Flash-Next (Strata)",
+          "dacan": {
+            "name": "Qwen3.8-Flash-Next (DACAN)",
             // context: what you chose in setup; output: what one reply may use (prompt + output must fit)
             "limit": { "context": 262144, "output": 32768 },
             "options": { "reasoningEffort": "high" },                  // sent as reasoning_effort
@@ -822,49 +822,49 @@ print(r.choices[0].message.content)
         }
       }
     },
-    "model": "strata/strata"
+    "model": "dacan/dacan"
   }
   ```
 
   Set `limit.context` to the context you chose in setup: OpenCode compacts the conversation before it gets there.
   Keep `limit.output` well under it: a request whose prompt plus `max_tokens` runs past the context is refused (see
-  **Context** below), or add `"fit_max_tokens": true` to `strata-<model>.json`. For a hard cap on the thinking, add
-  `"reasoning_budget_tokens": N` to `strata-<model>.json` (see above).
-- **Claude Code** (Strata 0.1.17 or newer): set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and
-  `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; Strata ignores the name), plus any
+  **Context** below), or add `"fit_max_tokens": true` to `dacan-<model>.json`. For a hard cap on the thinking, add
+  `"reasoning_budget_tokens": N` to `dacan-<model>.json` (see above).
+- **Claude Code** (DACAN 0.1.17 or newer): set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and
+  `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; DACAN ignores the name), plus any
   `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
 - **Codex CLI** (0.1.39): see [the Responses API](#the-responses-api-and-codex-cli) below.
 - **Context.** Chosen in setup (8K-262K). Requests longer than that are refused, never silently cut. A request whose
   `max_tokens` would run past the context is refused too (400); agents that always ask for their full output cap
-  can instead get it shortened to the room left: add `"fit_max_tokens": true` to `strata-<model>.json` (or pass
+  can instead get it shortened to the room left: add `"fit_max_tokens": true` to `dacan-<model>.json` (or pass
   `--fit-max-tokens` to `serve/server.py`). A prompt that leaves no room at all is still refused.
-- **Model aliases** (0.1.32). `"aliases": ["qwen", "local-model"]` in `strata-<model>.json` lists the model under
+- **Model aliases** (0.1.32). `"aliases": ["qwen", "local-model"]` in `dacan-<model>.json` lists the model under
   those names too in `/v1/models` (each with its own `id`, and in the model's `aliases`), like llama-server's
   `--alias`; a request naming one is answered under that name. Any other name is still served, as before.
 - **Model settings in the web page (0.1.39, #564).** The About tab's Model settings card shows and changes a few of
-  the keys above in `strata-<model>.json`: the `sampling` defaults (temperature, top_p, top_k, min_p),
+  the keys above in `dacan-<model>.json`: the `sampling` defaults (temperature, top_p, top_k, min_p),
   `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`,
   `lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and `--vram-reserve-mib`. An empty field removes the
   key (its default). Every other key of the file stays as it is, the earlier file is kept as
-  `strata-<model>.json.bak`, and the model uses the change from its next start. Only Strata's own page can save
+  `dacan-<model>.json.bak`, and the model uses the change from its next start. Only DACAN's own page can save
   (JSON, the API key when one is set, as for the Chat settings); the network, key, MCP and program keys are not
   editable there.
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
   run setup with `START-HERE.bat --setup --host 0.0.0.0 --api-key some-long-secret` (or add `"host": "0.0.0.0"` and
-  `"api_key": "..."` to `strata-<model>.json`). The server window then prints this PC's addresses
+  `"api_key": "..."` to `dacan-<model>.json`). The server window then prints this PC's addresses
   (`from other devices: http://192.168.x.x:8080/`); open that on the other device, or use `.../v1` as an API base URL.
   On Windows the firewall blocks it until you allow it: accept its prompt for Python (private networks), or run
-  `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
+  `New-NetFirewallRule -DisplayName "DACAN 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
   in an admin PowerShell, and make sure the network is set to Private.
 - **From the internet.** Put a tunnel in front of it, for example [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):
   `cloudflared tunnel --url http://127.0.0.1:8080`. **Set a key first**, or anyone with the link can use your PC:
-  add `"api_key": "some-long-secret"` to `strata-<model>.json` (or set the `STRATA_API_KEY` environment variable);
+  add `"api_key": "some-long-secret"` to `dacan-<model>.json` (or set the `DACAN_API_KEY` environment variable);
   clients then send it as their API key. Several keys (one per client, so one can be withdrawn alone): separate them
   with commas, `--api-key key1,key2` or `"api_key": "key1,key2"` as llama.cpp does, or give a list,
   `"api_key": ["key1", "key2"]` (the way to use a key that contains a comma); a request passes with any one of them.
   Streamed answers carry `X-Accel-Buffering: no`, so nginx-style proxies pass
-  each token on at once. The web app's settings and MCP tools only answer Strata's own page: when you open it through
-  a proxy or tunnel whose address differs, add that address, e.g. `"trusted_origins": ["https://strata.example.com"]`.
+  each token on at once. The web app's settings and MCP tools only answer DACAN's own page: when you open it through
+  a proxy or tunnel whose address differs, add that address, e.g. `"trusted_origins": ["https://dacan.example.com"]`.
   With the key set, any `Host` name reaches the server (see Host names below).
 - **From web apps in a browser (CORS).** Off by default. `"cors_origins": ["https://chat.example.com"]` lets pages of
   those origins call `/v1/*` from the browser (Open WebUI's direct connections, browser extensions); `["*"]` lets any
@@ -877,19 +877,19 @@ print(r.choices[0].message.content)
   listens on and, when it listens beyond this PC (`0.0.0.0` or a LAN address), this PC's name (`mypc`, `mypc.local`)
   and `host.docker.internal`; any port. Others get **403** naming the setting, and the server window prints one line
   for each. Reach it under another name (a reverse proxy that keeps the name, a tunnel, a DNS name on your network,
-  another container's name for it)? Add the name: `"allowed_hosts": ["strata.example.com"]` in
-  `strata-<model>.json` or `STRATA_ALLOWED_HOSTS=strata.example.com` (comma-separated); `".example.com"` allows that
+  another container's name for it)? Add the name: `"allowed_hosts": ["dacan.example.com"]` in
+  `dacan-<model>.json` or `DACAN_ALLOWED_HOSTS=dacan.example.com` (comma-separated); `".example.com"` allows that
   name and every name below it, and `["*"]` turns the check off (so does setting `api_key`). The hosts of
   `trusted_origins` count as allowed. Requests without a `Host` header (HTTP/1.0 clients) pass.
 - **Web pages without an API key.** Without `api_key`, a `POST` to `/v1/*` that carries an `Origin` header (a
-  browser page sent it) is answered only for Strata's own page, pages on `localhost` or an allowed host name (any
+  browser page sent it) is answered only for DACAN's own page, pages on `localhost` or an allowed host name (any
   port), the origins in `trusted_origins` or `cors_origins`, and browser extensions and desktop apps
   (`chrome-extension://`, `moz-extension://`, `app://`: no web site can send those), and only with a JSON body; any
   other page, and `Origin: null`, gets **403**. Clients that send no `Origin` (curl, the OpenAI and Anthropic SDKs,
   other servers) are not affected. With
-  an API key, the key decides. `POST /unload` and `POST /load` take `Content-Type: application/json` from Strata's
+  an API key, the key decides. `POST /unload` and `POST /load` take `Content-Type: application/json` from DACAN's
   own page (or no `Origin`), like `/settings`. `POST /slots/0?action=save|restore` keeps the Host and API-key checks
-  and also takes only JSON from no `Origin`, Strata's own page or a trusted origin - also when an API key is set.
+  and also takes only JSON from no `Origin`, DACAN's own page or a trusted origin - also when an API key is set.
 
 **Conversation cache.** A request that continues a chat reads only the part after what the engine already holds: the
 live session, or one of the checkpoints it keeps in RAM (up to 6, ~118 MB each, taken at the start of each new
@@ -903,13 +903,13 @@ request (`cch=...`) and every session (the 4th part of `cc_version=`); the serve
 llama.cpp does), so the system prompt and the tool list in front of it are the same prompt on every turn. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
 `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
 A one-shot request that no later request continues (a classification call, a probe) can send
-`"strata_checkpoint": false` in its body: it saves no checkpoint at its last turn nor every 16K tokens, so what
+`"dacan_checkpoint": false` in its body: it saves no checkpoint at its last turn nor every 16K tokens, so what
 follows the reused prefix (or the root) is read in one run, and its session is not kept or parked for a next request.
 It still starts from a checkpoint it matches, and still saves the system-prompt root when that reaches
 `--prompt-cache-root`. Without the field (or with `true`) nothing changes.
 
 **One long document, many questions: a pinned shared prefix (opt-in, 0.1.40.2, [RESEARCH_RUNS.md](RESEARCH_RUNS.md)).**
-A request can say where the document ends: `"strata_prefix": {"messages": 1}` (the first message is the document),
+A request can say where the document ends: `"dacan_prefix": {"messages": 1}` (the first message is the document),
 `{"message": 0, "chars": 210000}` (the first 210,000 characters of message 0, for a client that sends the document and
 the question in one message) or `{"tokens": 12345}`. The engine reads the prompt in two parts there, keeps the checkpoint
 at the boundary pinned (retention never evicts it, a parked conversation holding it stays parked, `SAVE` keeps it) and,
@@ -934,7 +934,7 @@ anything is overwritten, and each is restored on its own GPU. Verified on a 4-GP
 a 9,276-token conversation restored in 51 ms, and its follow-up decodes exactly the tokens
 it decodes when the conversation never left (`tools/parking_test.py`). FP16,
 INT8, Q4_0 and identity-layout K8V4 snapshots are supported; the K8V4 draft ring
-remains INT8, as in upstream. Windows/HIP and multi-GPU runtime coverage must be
+remains INT8. Windows/HIP and multi-GPU runtime coverage must be
 reported separately from Linux/CUDA evidence.
 
 The web page's Monitor tab has a **Conversation cache** card (0.1.39, #596): the parked conversations against the
@@ -981,7 +981,7 @@ room afterwards):
    absent (no memory controller at that level) is skipped; a file that is there but
    cannot be read or parsed makes the cgroup terms unusable: without `--memory-limit-mib` the guard then uses
    `MemAvailable` alone, as 0.1.41 did, and prints one warning per process; with the flag the sample is unknown, and unknown skips parking.
-3. `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB=N`; the flag wins, `0` = none):
+3. `--memory-limit-mib N` (or `DACAN_MEMORY_LIMIT_MIB=N`; the flag wins, `0` = none):
    N MiB is the total this engine's container or cgroup may use, minus what that
    container uses now. Use it when the container cannot see its own limit. The usage
    is `memory.current` of the top cgroup this mount shows (the container's own, in a
@@ -1008,7 +1008,7 @@ parsed gives no credit; it does not make the sample unknown. The operator's cap 
 conversation is part of the engine's own usage once captured; the check before
 capture is what stops it from growing past the cap.
 
-The startup log has one line for it, `strata generate: memory guard: limit X GiB
+The startup log has one line for it, `dacan generate: memory guard: limit X GiB
 (source: flag|cgroup|meminfo), current Y GiB, reclaimable cache credited Z GiB;
 available ...`, where `source` names the
 number that was smallest at that moment (`meminfo`: MemTotal and `MemTotal -
@@ -1018,7 +1018,7 @@ cache at that moment, not at the time of a park. Without a cgroup limit and with
 plain `MemAvailable`, as before.
 
 What it does not touch: the startup sizing of the expert arena, the file tier's resident budget, the Windows commit
-check and `STRATA_PIN_GUARD` (#1250: whether to page-lock the expert copy in steps follows `MemFree`, and each step
+check and `DACAN_PIN_GUARD` (#1250: whether to page-lock the expert copy in steps follows `MemFree`, and each step
 is checked against the cgroup-aware `host_available_memory`) keep their own probes (`--resident-budget-gib`, #633,
 #1250), and `--memory-limit-mib` does not reach them. This figure is for what runs after the start: parking a
 conversation and saving or restoring a session file, which read `MemAvailable` alone. `host_available_memory`
@@ -1051,7 +1051,7 @@ state. Invalid entries are discarded; transfer/synchronization failure is fatal
 rather than permission to continue with partial state. Indexer spare keys and the
 moving spare row are preserved, including checkpoint rewinds.
 The engine log reports parking, restoration, bytes, evictions, individual snapshot
-sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables
+sizes and K/V bytes reused during capture. `DACAN_SNAPSHOT_FULL_CAPTURE=1` disables
 retention for diagnostic comparisons. Parked snapshots are not
 persisted across restarts; the session files below are.
 
@@ -1059,7 +1059,7 @@ persisted across restarts; the session files below are.
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
 requests of llama-server's slot API, for its single slot 0, when started with `--slot-save-path DIR` (also
 `"slot_save_path"` in the config); NAME must be a plain file name inside DIR. There is no erase action and the file
-format is Strata's own, not llama.cpp's:
+format is DACAN's own, not llama.cpp's:
 
 ```bash
 curl -X POST "http://127.0.0.1:8080/slots/0?action=save"    -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
@@ -1070,7 +1070,7 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
 
 DIR becomes one absolute path at start (`--slot-save-path` relative to the server's working directory, the config's
 `slot_save_path` relative to the config's `"cwd"`), created with mode 0700 when missing. It should be private to the
-user that runs Strata: the files hold the conversation's token IDs and state, are created with mode 0600 on Linux
+user that runs DACAN: the files hold the conversation's token IDs and state, are created with mode 0600 on Linux
 (on Windows they inherit the folder's permissions), and nothing deletes them - about 1.2 GB per 63K-token
 conversation. Before it writes, a save checks that the disk has room for the whole new file plus
 `--session-min-free-mib` (an engine argument, in the config's `args`; default 4096, 0 = no check) - also when it
@@ -1099,7 +1099,7 @@ I/O later fails; the current tokens, images, steering and live device state are 
 SAVE under arbitrary memory pressure. With the option off, or enough RAM at the first probe, cache retention and
 the session file format are unchanged. RESTORE is unchanged.
 
-The request must be `Content-Type: application/json` (else `415`) and come from no browser page, Strata's own or a
+The request must be `Content-Type: application/json` (else `415`) and come from no browser page, DACAN's own or a
 trusted origin (another site's `Origin` gets `403`, also with an API key); the Host and API-key checks apply as
 everywhere. Errors: `501` without `--slot-save-path` or with parallel requests; `400` for a slot other than 0, an unknown action, a refused
 file name, or a file the engine refuses as invalid (not a session file, corrupt, another model or configuration, over
@@ -1114,7 +1114,7 @@ failed after its new file had replaced the old one says so with `error.published
 continue the restored conversation reuses the restored state or its checkpoint; a short tail may be read again (35
 tokens in the measurement below). Only the deepest checkpoint is saved, so an edit further back reads more again.
 Clients still send their messages (and images): the file holds engine state and token/image identity, not a chat
-export. Underneath, `strata --serve` takes `SAVE <path>` and `RESTORE <path>` on stdin between requests and answers
+export. Underneath, `dacan --serve` takes `SAVE <path>` and `RESTORE <path>` on stdin between requests and answers
 `SAVED <tokens> <bytes> <ms>`, `RESTORED <tokens> <bytes> <ms>`, `SERR <kind> <published 0|1> <reason>` (failed,
 the engine and the session as they were) or `FATAL <reason>` (then exits). On the way, `SESSION <done> <total>` follows
 every block of the file that moved (at most 16 MiB, the last partial block and a small file included), and
@@ -1142,7 +1142,7 @@ other files in those folders, and not the path, so a moved model folder still ma
 change in the middle of a file that keeps its size is not seen: do not change model files while their sessions are
 kept. The config fingerprint covers the engine version string (another version is refused; two builds of the same version
 are not told apart - there is no build hash), CUDA or HIP,
-`--kv`, `STRATA_KV_ROT`, `--kv-resident`, `--max-context`, `--mtp-window`, the resolved rope configuration (type,
+`--kv`, `DACAN_KV_ROT`, `--kv-resident`, `--max-context`, `--mtp-window`, the resolved rope configuration (type,
 base, factor, freq scale, original context, the YaRN knobs - the cached K is post-RoPE), the loaded control vector (a
 digest of the tables uploaded: every file's content times its exact scale, the mode, the layer range and the
 direction) and the arithmetic switches (`--native-*`, `--no-ple`, the A/B arms). Sampling, seeds, draft tuning and
@@ -1166,7 +1166,7 @@ state; the server reports `500` and starts it again. A restore does not park the
 `--layer-split`, `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
 `--prompt-cache 0` (the RAM conversation cache need not be on). On Linux the file
 moves with `O_DIRECT` in 16 MiB blocks when the filesystem takes it (buffered I/O otherwise, or with
-`STRATA_SESSION_BUFFERED=1`); on Windows with buffered I/O. The engine has been run on Linux/CUDA only. An earlier
+`DACAN_SESSION_BUFFERED=1`); on Windows with buffered I/O. The engine has been run on Linux/CUDA only. An earlier
 revision's CPU file-I/O test passed as a 32-bit Windows executable under Wine; the current code has not been built
 for Windows, and the Windows engine, HIP and AMD cards have not been run.
 
@@ -1208,7 +1208,7 @@ without penalties, so more of its guesses are now rejected. Requests without pen
 
 **Token biases (opt-in).** The chat API supports request-scoped `logit_bias` objects and token/bias pair lists on supporting CUDA/HIP engines without continuous batching. A value of -100 (or `false` in a pair list) excludes a token. Unsupported engines return an error. See [LOGIT_BIAS.md](LOGIT_BIAS.md) for formats, limits and validation.
 
-**Sampled drafting (opt-in, 0.1.40.2).** With temperature above 0 the engine keeps a draft only when it equals the token the model sampled for that position, and the draft layer proposes its best guess. Two opt-in switches change how the draft layer drafts a sampled request; greedy requests (temperature 0) are never touched and stay byte-identical. `STRATA_SPEC_COUPLED=1` (or `--coupled-draft`) drafts by sampling with the request's own settings and the random number the checking row will use; the text for a seed does not change. `STRATA_SPEC_PROB=1` is speculative rejection sampling: the draft layer samples its guess from its own distribution q, the check accepts it with probability min(1, p/q) (p is the model's distribution after penalties, top_k, top_p, min_p and temperature) and otherwise samples the replacement from the leftover distribution, so every token is distributed exactly as without drafts (the text for a seed then depends on the drafts, so it is reproducible only for the same engine, flags and prompt). Guesses without a distribution (prompt lookup, suffix drafts) keep the exact-match rule, which is already exact. Neither is faster in a way that holds up: on an RTX 3060 (IQ3_XXS, 200-token story and code answers, 10 interleaved pairs) the default's median output speed was 42.4 / 43.2 / 43.3 tok/s at temperature 0.3 / 0.7 / 1.0, coupled drafting 40.6 / 42.4 / 43.3 and rejection sampling 41.0 / 42.6 / 42.6, with run-to-run differences of up to 5% between repeats; drafts kept per round fell at 0.3 and rose by about 5 points at 1.0, which the cost of the longer sampled windows ate. `STRATA_SPEC_DEPTH=1` prints the acceptance by draft depth for each request; `STRATA_SPEC_MIN_TEMP=0.9` limits sampled drafting to hotter requests. Proof that the rejection rule keeps the distribution: `spec_prob_test` (chi-square, 2 million trials per case) and `spec_verify_parity` (GPU against the host reference).
+**Sampled drafting (opt-in, 0.1.40.2).** With temperature above 0 the engine keeps a draft only when it equals the token the model sampled for that position, and the draft layer proposes its best guess. Two opt-in switches change how the draft layer drafts a sampled request; greedy requests (temperature 0) are never touched and stay byte-identical. `DACAN_SPEC_COUPLED=1` (or `--coupled-draft`) drafts by sampling with the request's own settings and the random number the checking row will use; the text for a seed does not change. `DACAN_SPEC_PROB=1` is speculative rejection sampling: the draft layer samples its guess from its own distribution q, the check accepts it with probability min(1, p/q) (p is the model's distribution after penalties, top_k, top_p, min_p and temperature) and otherwise samples the replacement from the leftover distribution, so every token is distributed exactly as without drafts (the text for a seed then depends on the drafts, so it is reproducible only for the same engine, flags and prompt). Guesses without a distribution (prompt lookup, suffix drafts) keep the exact-match rule, which is already exact. Neither is faster in a way that holds up: on an RTX 3060 (IQ3_XXS, 200-token story and code answers, 10 interleaved pairs) the default's median output speed was 42.4 / 43.2 / 43.3 tok/s at temperature 0.3 / 0.7 / 1.0, coupled drafting 40.6 / 42.4 / 43.3 and rejection sampling 41.0 / 42.6 / 42.6, with run-to-run differences of up to 5% between repeats; drafts kept per round fell at 0.3 and rose by about 5 points at 1.0, which the cost of the longer sampled windows ate. `DACAN_SPEC_DEPTH=1` prints the acceptance by draft depth for each request; `DACAN_SPEC_MIN_TEMP=0.9` limits sampled drafting to hotter requests. Proof that the rejection rule keeps the distribution: `spec_prob_test` (chi-square, 2 million trials per case) and `spec_verify_parity` (GPU against the host reference).
 
 ---
 
@@ -1222,7 +1222,7 @@ It is **stateless**: nothing is stored, so the client sends the whole conversati
 with `store: false`). `previous_response_id`, `conversation`, `background` and the retrieve/delete/cancel endpoints
 are refused with an error that says so.
 
-| Request | What Strata does |
+| Request | What DACAN does |
 | --- | --- |
 | `input` as a string, or as items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)` |
 | `instructions` | The system message (with leading `developer` messages; later ones become user messages, as on the chat path) |
@@ -1231,7 +1231,7 @@ are refused with an error that says so.
 | `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the model's default (high) |
 | `max_output_tokens` | The output cap (thinking included). Running out ends the response `incomplete` (`max_output_tokens`) |
 | `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (checked, not constrained) |
-| `thread_source` `thread_title` in `client_metadata["x-codex-turn-metadata"]` | Codex's thread-title request (opt-in: `"codex_thread_titles": true` in `strata-<model>.json`, off by default), sent beside each user turn from another session with `tools: []`: answered without the engine as `{"title": "<the user's line, cut to 36 characters>"}`, so the conversation keeps the prompt cache. The title is the user's line, not one the model wrote |
+| `thread_source` `thread_title` in `client_metadata["x-codex-turn-metadata"]` | Codex's thread-title request (opt-in: `"codex_thread_titles": true` in `dacan-<model>.json`, off by default), sent beside each user turn from another session with `tools: []`: answered without the engine as `{"title": "<the user's line, cut to 36 characters>"}`, so the conversation keeps the prompt cache. The title is the user's line, not one the model wrote |
 | `temperature`, `top_p`, `reasoning_budget_tokens`, ... | As on the chat path |
 
 The model's thinking comes back as a `reasoning` output item with `reasoning_text` content (streamed as
@@ -1252,30 +1252,30 @@ it started they arrive as `response.failed`.
 **Codex CLI.** In `~/.codex/config.toml` (Windows: `%USERPROFILE%\.codex\config.toml`):
 
 ```toml
-model = "strata"                        # any name; Strata answers with its model
-model_provider = "strata"
+model = "dacan"                        # any name; DACAN answers with its model
+model_provider = "dacan"
 model_context_window = 32768            # the context you chose in setup: Codex compacts before it gets there
 show_raw_agent_reasoning = true         # show the model's thinking (it writes no summaries)
 # model_reasoning_effort = "medium"     # none, low, medium or high; default: the model's (high)
 
-[model_providers.strata]
-name = "Strata (local)"
+[model_providers.dacan]
+name = "DACAN (local)"
 base_url = "http://127.0.0.1:8080/v1"
 wire_api = "responses"
 stream_idle_timeout_ms = 600000         # a first, long prompt can take minutes to read
-# env_key = "STRATA_API_KEY"            # only if the server has an api_key: the variable holding it
+# env_key = "DACAN_API_KEY"            # only if the server has an api_key: the variable holding it
 ```
 
 Then run `codex` (or `codex exec "..."`) as usual. Codex warns `Model metadata for ... not found` for a local model
 name; that is expected. Measured with Codex CLI 0.160.0 and Q2_0 on an RTX 5070: its first prompt (instructions and
 tool descriptions) was 9,443 tokens, read in 10 s; in a tool loop, each later turn reused about 96% of the prompt from
 the cache and read only the new part in 1-2 s. On Windows, Codex's sandbox rejected every shell command in that test
-until it was started with `-c 'windows.sandbox="unelevated"'` (a Codex setting, not Strata's).
+until it was started with `-c 'windows.sandbox="unelevated"'` (a Codex setting, not DACAN's).
 
-**Codex's compaction (opt-in: `"codex_compaction_cache": true` in `strata-<model>.json`).** When the context fills up (or
+**Codex's compaction (opt-in: `"codex_compaction_cache": true` in `dacan-<model>.json`).** When the context fills up (or
 on `/compact`), Codex sends the conversation once more with a request to summarize it, and with `tools: []`. The template
 writes the tools at the top of the prompt, so that prompt would share only its first few tokens with the conversation the
-engine holds and be read again from the start, at its longest. With the option on, Strata keeps which Codex conversation
+engine holds and be read again from the start, at its longest. With the option on, DACAN keeps which Codex conversation
 sent the last prompt other than a compaction (`session_id` and `thread_id` from `client_metadata["x-codex-turn-metadata"]`)
 and the tools that prompt was rendered with; a request Codex marks `"request_kind": "compaction"`, from that same
 conversation and without tools of its own, is rendered with them. Only the prompt: for the output parser and in the
@@ -1291,7 +1291,7 @@ that a compaction after an 85,000-token conversation reused 84,895 of its 84,997
 
 The chat page can give the model tools from [MCP](https://modelcontextprotocol.io) servers, as LM Studio and Claude
 Desktop do: reading your files, fetching web pages, searching, anything an MCP server offers. List the servers in
-`strata-<model>.json` under `"mcp_servers"` - the same shape as Claude Desktop's `mcpServers` block, which you can
+`dacan-<model>.json` under `"mcp_servers"` - the same shape as Claude Desktop's `mcpServers` block, which you can
 also paste as it is (key `"mcpServers"`):
 
 ```json
@@ -1303,13 +1303,13 @@ also paste as it is (key `"mcpServers"`):
 ```
 
 Or keep them in their own file and start the server with `--mcp-config path\to\claude_desktop_config.json` (a file
-with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart Strata after a change.
+with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart DACAN after a change.
 
-- **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
+- **A program** (`command`, `args`, optional `env` and `cwd`) is started by DACAN and spoken to over its
   stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`
   servers). **An address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
   transport is not supported). `"disabled": true` leaves an entry out.
-- The servers start with Strata, in the background; the server window says what each one offers
+- The servers start with DACAN, in the background; the server window says what each one offers
   (`MCP server 'files': 14 tools (...)`), or why it did not start - its tools are then left out and the chat works
   without them. The Monitor tab lists them, and the Sampling drawer has **Use tools from MCP servers** (on by
   default). A server that stops later is started again at its next call.
@@ -1318,13 +1318,13 @@ with an `mcpServers` block; add it to the `serve/server.py` line of your run scr
   gives the model an `error: ...` result instead of ending the chat. Results longer than `max_result_chars`
   (default 20,000 characters) are cut, with a note, before the model reads them. Stop stops a running tool too.
 - Only the chat page uses them. API clients (omp, Claude Code, OpenAI and Anthropic SDKs) see the API exactly as
-  before and keep their own tools; a request to `/v1/chat/completions` opts in with `"strata_mcp": true` (it then
-  gets `strata_mcp` tool events in the stream).
+  before and keep their own tools; a request to `/v1/chat/completions` opts in with `"dacan_mcp": true` (it then
+  gets `dacan_mcp` tool events in the stream).
 
 **Security.** MCP tools run on your PC with your user's rights, and **the model decides when to call them** - also
 because of what it reads (a web page or a file can contain instructions). Give a filesystem server only the folders
 it needs, prefer read-only tools, and don't add servers you don't trust. The tools can only be used from the chat
-page itself (a request with another site's Origin or without a JSON content type is refused); if Strata is reachable
+page itself (a request with another site's Origin or without a JSON content type is refused); if DACAN is reachable
 from other devices, set an API key.
 
 **Context extension past 262K (rope scaling, EXPERIMENTAL, off unless you pick it).** The model was trained on
@@ -1366,14 +1366,14 @@ unmeasured: all the runs above are text.
 
 ---
 
-## Manage Strata from your AI assistant (MCP server)
+## Manage DACAN from your AI assistant (MCP server)
 
-`tools/strata_mcp.py` is an MCP server for Claude Code, Claude Desktop, Cursor, VS Code, Codex and other assistants.
-Once it is added, you can ask your assistant "install Strata for this PC", "start Strata" or "is Strata running?".
+`tools/dacan_mcp.py` is an MCP server for Claude Code, Claude Desktop, Cursor, VS Code, Codex and other assistants.
+Once it is added, you can ask your assistant "install DACAN for this PC", "start DACAN" or "is DACAN running?".
 In Claude Code, add it with:
 
 ```bash
-claude mcp add strata -- python C:\Users\you\Strata\tools\strata_mcp.py
+claude mcp add dacan -- python C:\Users\you\DACAN\tools\dacan_mcp.py
 ```
 
 It has eight tools: status (the running model, what is installed, the hardware, a recommended size), the model
@@ -1385,7 +1385,7 @@ processes it started itself. It uses only Python's standard library, so it works
 
 The config snippets for every client, the tool arguments and the safety rules are in
 [docs/MCP_SERVER.md](MCP_SERVER.md). This is the opposite direction from
-[Tools from MCP servers](#tools-from-mcp-servers) above, where the Strata model calls *your* MCP tools.
+[Tools from MCP servers](#tools-from-mcp-servers) above, where the DACAN model calls *your* MCP tools.
 
 ---
 
@@ -1394,7 +1394,7 @@ The config snippets for every client, the tool arguments and the safety rules ar
 The model has a vision encoder: [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 (0.9 GB, a 27-layer ViT plus the projector into the language model). It is **optional**: say yes when the setup asks
 "Images?", or run it again with `--vision gpu` (or `--vision cpu`). The setup downloads the encoder, builds a small
-helper (`strata-vision`, from llama.cpp's `mtmd` library) and adds it to your start script. Nothing else changes.
+helper (`dacan-vision`, from llama.cpp's `mtmd` library) and adds it to your start script. Nothing else changes.
 
 | Encoder on | Time per picture | Cost |
 | --- | --- | --- |
@@ -1406,11 +1406,11 @@ do on every turn, is encoded only once.
 
 **More image tokens (0.1.39, #625):** `--vision-tokens N` at setup (`START-HERE.bat --setup --vision cpu
 --vision-tokens 768`) sets the most tokens a picture becomes - `"max_tokens"` in the `"vision"` section of
-`strata-<model>.json`, which you can also edit by hand. More tokens keep more detail (small text, charts, screenshots)
+`dacan-<model>.json`, which you can also edit by hand. More tokens keep more detail (small text, charts, screenshots)
 and take longer to encode, on the CPU most of all; a setup run again keeps the value.
 
 **A minimum number of image tokens (0.1.40, #767):** `"min_tokens": N` in the `"vision"` section of
-`strata-<model>.json` (edit it by hand; a setup run again keeps it) is passed to the encoder as `--min-tokens N`
+`dacan-<model>.json` (edit it by hand; a setup run again keeps it) is passed to the encoder as `--min-tokens N`
 (mtmd's `image_min_tokens`): a small picture is scaled up to at least N tokens. llama.cpp's mtmd prints that Qwen-VL
 models want at least 1,024 for grounding tasks (pointing, counting small items); the CPU default stays at 300 at most
 and no minimum, because a larger minimum changes the image answers and costs encode time (about 3 s at 300 tokens on
@@ -1430,7 +1430,7 @@ within about 3%. Numbers on more pictures (charts, small text) are welcome in #6
 **Flash attention on the CPU (#660):** ggml's fast CPU kernel for flash attention needs the encoder's head size (72)
 to be a multiple of the vector width: 8 floats with AVX2, which the release builds use, but 16 with AVX-512, which a
 build from source gets on a CPU that has it (Zen 4 and newer, some Intel). There ggml falls back to a kernel that is
-several times slower and accumulates in FP16, so `strata-vision` turns flash attention off on the CPU when its ggml has
+several times slower and accumulates in FP16, so `dacan-vision` turns flash attention off on the CPU when its ggml has
 AVX-512 and leaves it at `auto` (on) otherwise; `--flash-attn on|off|auto` overrides that. A 1024x1024 picture
 (1,024 image tokens) on a Ryzen 7 7700X, 8 threads, an F16 mmproj, one encode per fresh process:
 
@@ -1445,7 +1445,7 @@ The last column is the relative L2 distance of the embeddings from the AVX-512 r
 differ by about 1% anyway.
 
 **A spare GPU for the encoder (0.1.33, #408):** with a card the engine doesn't use, add `"cuda_device": 2` (numbered
-like `nvidia-smi`) to the `"vision"` section of `strata-<model>.json`: the encoder then runs on that card alone. Lower
+like `nvidia-smi`) to the `"vision"` section of `dacan-<model>.json`: the encoder then runs on that card alone. Lower
 `--vram-reserve-mib` in `"args"` to 700 as well, so the engine's cards keep that VRAM for the expert cache. The
 encoder's card needs code in the ready-made encoder (RTX 20/30/40/50).
 
@@ -1466,7 +1466,7 @@ import base64
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
 img = base64.b64encode(open("photo.jpg", "rb").read()).decode()
-r = client.chat.completions.create(model="strata", messages=[{"role": "user", "content": [
+r = client.chat.completions.create(model="dacan", messages=[{"role": "user", "content": [
     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}},
     {"type": "text", "text": "What is in this picture?"}]}])
 print(r.choices[0].message.content)
@@ -1502,33 +1502,33 @@ on the GPU, measured through the API):
 run below the long-output speed: the first rounds have no draft yet.)
 
 **How it works inside:** the encoder turns the picture into rows of the same width as the model's word embeddings;
-Strata puts them where the prompt has `<|image_pad|>` tokens and gives each one its 2-D position (row and column in the
+DACAN puts them where the prompt has `<|image_pad|>` tokens and gives each one its 2-D position (row and column in the
 picture; the model uses interleaved M-RoPE). Answers match llama.cpp's multimodal implementation token for token on our
 test images.
 
 ---
 
-**Stager waits (0.1.40.2, `STRATA_STAGER_SLEEP`):** the prompt-staging threads sleep while they wait on Linux and spin on Windows, because spinning is a little faster there (a 5070 read an 8K Q2_0 prompt 1.2% faster). `STRATA_STAGER_SLEEP=1` makes Windows sleep too, which is the choice when sharing the machine matters more than speed: on a Ryzen 9 7940HS laptop with an RTX 4070 (IQ3_S, 64K context) sleeping waits read 5,914 and 22,305 token prompts 5-6% slower while the whole-machine CPU use fell from 77-90% to 21-25% (issue #1101, thanks to midhatn). `STRATA_STAGER_SLEEP=0` forces spinning on Linux. The output is the same either way.
+**Stager waits (0.1.40.2, `DACAN_STAGER_SLEEP`):** the prompt-staging threads sleep while they wait on Linux and spin on Windows, because spinning is a little faster there (a 5070 read an 8K Q2_0 prompt 1.2% faster). `DACAN_STAGER_SLEEP=1` makes Windows sleep too, which is the choice when sharing the machine matters more than speed: on a Ryzen 9 7940HS laptop with an RTX 4070 (IQ3_S, 64K context) sleeping waits read 5,914 and 22,305 token prompts 5-6% slower while the whole-machine CPU use fell from 77-90% to 21-25% (issue #1101, thanks to midhatn). `DACAN_STAGER_SLEEP=0` forces spinning on Linux. The output is the same either way.
 
-**Stager threads for a GGUF read in place (0.1.41, #1353):** a native pack read from its GGUF shards in place (UD-Q4_K_XL, a Q8_0 pack) copies each expert with 32 threads and a 128-deep ring when the bytes are page faults on an SSD. If the shards' pages are already in the page cache (a big-RAM box, a warm start) those copies are memory copies and the same profile ran 4-7x slower than the 4-thread default (a 124K-token Q8 prompt: 57 -> 350-410 tok/s with the default). The engine now checks a sample of the experts with `mincore` at the first prompt (Linux) and takes the RAM profile when 90% or more of their pages are resident, saying so in its log; a cold or partly cached GGUF keeps the SSD profile. `STRATA_STAGER_SSD=1` / `0` forces either profile; `STRATA_STAGER_THREADS` still wins. The bytes copied are the same.
+**Stager threads for a GGUF read in place (0.1.41, #1353):** a native pack read from its GGUF shards in place (UD-Q4_K_XL, a Q8_0 pack) copies each expert with 32 threads and a 128-deep ring when the bytes are page faults on an SSD. If the shards' pages are already in the page cache (a big-RAM box, a warm start) those copies are memory copies and the same profile ran 4-7x slower than the 4-thread default (a 124K-token Q8 prompt: 57 -> 350-410 tok/s with the default). The engine now checks a sample of the experts with `mincore` at the first prompt (Linux) and takes the RAM profile when 90% or more of their pages are resident, saying so in its log; a cold or partly cached GGUF keeps the SSD profile. `DACAN_STAGER_SSD=1` / `0` forces either profile; `DACAN_STAGER_THREADS` still wins. The bytes copied are the same.
 
-## Short prompts: the CPU shares the experts (on by default on one NVIDIA GPU, `STRATA_PREFILL_CPU_SHARE`)
+## Short prompts: the CPU shares the experts (on by default on one NVIDIA GPU, `DACAN_PREFILL_CPU_SHARE`)
 
 A prompt chunk of a few thousand tokens (an agent's tool result, a test's output, a short follow-up) streams every routed
 expert that is not in VRAM over PCIe, while the CPU pool that decodes sits idle and RAM already holds those experts.
-`STRATA_PREFILL_CPU_SHARE=auto` hands the pool the experts few of the chunk's tokens route to, measures per layer how
-long each side takes and gives the CPU the share at which both end together (`STRATA_PREFILL_CPU_SHARE=0.4` fixes a
+`DACAN_PREFILL_CPU_SHARE=auto` hands the pool the experts few of the chunk's tokens route to, measures per layer how
+long each side takes and gives the CPU the share at which both end together (`DACAN_PREFILL_CPU_SHARE=0.4` fixes a
 share). `auto` also checks that sharing pays: it times layers with the share and without it (the first ones alternate until three comparisons are in, then one in 29 runs the other way) and shares only while the layers that share are the faster ones. Where sharing is slower (every share was, on an RX 7900 GRE with a Ryzen 7 5700X3D under ROCm, #1282), the experts stay on the GPU apart from those measuring layers. It is off unless you set it, and then the output is byte-identical to the build without it.
 
-**0.1.41: on by default** on CUDA builds with one GPU and no `--batch` slots, for prompt chunks below 1,024 tokens: unset behaves as `auto` with `STRATA_PREFILL_CPU_SHARE_MAX=1024`, and the engine prints one line at start saying so. Measured (interleaved whole-engine runs, 8 rounds, medians): 512 tokens -28..-34% and 1,000 tokens -20..-26% prompt time on an RTX 3060, a Tesla P100 and an RTX 5070, 8/8 pairs each; mean KL against the share off 0.004 (max 0.025). The answers can differ slightly from 0.1.40.3. **`STRATA_PREFILL_CPU_SHARE=0` turns it off and gives 0.1.40.3's exact bytes.** The layer split, batch slots and AMD (HIP) builds keep it off unless you set the variable; `STRATA_PREFILL_CPU_SHARE_MAX=3072` (the extension to larger chunks) also stays opt-in: it lost 2% at 2,048 tokens on the 5070.
+**0.1.41: on by default** on CUDA builds with one GPU and no `--batch` slots, for prompt chunks below 1,024 tokens: unset behaves as `auto` with `DACAN_PREFILL_CPU_SHARE_MAX=1024`, and the engine prints one line at start saying so. Measured (interleaved whole-engine runs, 8 rounds, medians): 512 tokens -28..-34% and 1,000 tokens -20..-26% prompt time on an RTX 3060, a Tesla P100 and an RTX 5070, 8/8 pairs each; mean KL against the share off 0.004 (max 0.025). The answers can differ slightly from 0.1.40.3. **`DACAN_PREFILL_CPU_SHARE=0` turns it off and gives 0.1.40.3's exact bytes.** The layer split, batch slots and AMD (HIP) builds keep it off unless you set the variable; `DACAN_PREFILL_CPU_SHARE_MAX=3072` (the extension to larger chunks) also stays opt-in: it lost 2% at 2,048 tokens on the 5070.
 
 With it on, chunks below 3,072 tokens are staged after their routing (only those can hand the CPU a share) instead of
-streaming every expert from 1,024 tokens on; `STRATA_PREFILL_CPU_SHARE_MAX=1024` keeps the old limit. The CPU takes
+streaming every expert from 1,024 tokens on; `DACAN_PREFILL_CPU_SHARE_MAX=1024` keeps the old limit. The CPU takes
 experts it reads from RAM as they are: the arena, the page-locked copy of the resident RAM mode, or the mapped
 `experts.bin`'s pages in the file cache (`--mmap-experts`), not only page-locked ones. Serve without `--batch`; on a
 layer split every stage has the pool and one stage at a time takes it for a chunk.
 
-**0.1.42: not armed by default when memory is short.** A 0.1.41 report (RTX 5090, RAM already tight) had chats failing and the engine restarting until `STRATA_PREFILL_CPU_SHARE=0` was set. The default is now skipped, with one line in the log saying why, when the RAM this process can get (the cgroup limit counts on Linux) is below the share's own buffers plus 3 GiB, when on Windows the commit limit (RAM + page file) has less than 4 GiB left beyond them, or when the experts it would read are file pages (the mapped `experts.bin` outside the GPU cache and the RAM copy) that the free RAM plus 3 GiB cannot keep. An explicit `STRATA_PREFILL_CPU_SHARE=auto` (or a number) is kept and only warns. The share's two page-locked buffers (about 50 MB) are now taken once, at their largest, and a failed allocation ends the share for that run instead of failing the request.
+**0.1.42: not armed by default when memory is short.** A 0.1.41 report (RTX 5090, RAM already tight) had chats failing and the engine restarting until `DACAN_PREFILL_CPU_SHARE=0` was set. The default is now skipped, with one line in the log saying why, when the RAM this process can get (the cgroup limit counts on Linux) is below the share's own buffers plus 3 GiB, when on Windows the commit limit (RAM + page file) has less than 4 GiB left beyond them, or when the experts it would read are file pages (the mapped `experts.bin` outside the GPU cache and the RAM copy) that the free RAM plus 3 GiB cannot keep. An explicit `DACAN_PREFILL_CPU_SHARE=auto` (or a number) is kept and only warns. The share's two page-locked buffers (about 50 MB) are now taken once, at their largest, and a failed allocation ends the share for that run instead of failing the request.
 
 When on, the CPU's rows are computed in the CPU's own activation format, so the output changes in the last bits (first
 token KL against off: mean 0.006, max 0.026 nats over 22 prompts; about half of the 32-token greedy answers on 500 and
@@ -1557,7 +1557,7 @@ expert here: none was page-locked):
 A coding agent's recorded conversation on the two cards (a 100K-token start, then 8 turns of 1-5K tokens of code, 128
 tokens written a turn, the same tokens read by both): 137.4 s off, 130.6 s auto (reading 121.1 -> 114.3 s).
 
-## Missed experts in a verify window: the tail is skipped (on by default on CUDA, `STRATA_ROUTE_TAIL_SKIP`)
+## Missed experts in a verify window: the tail is skipped (on by default on CUDA, `DACAN_ROUTE_TAIL_SKIP`)
 
 When a card cannot hold every routed expert, most of a decode token's waiting time is spent on the experts that are not in VRAM:
 their copy over PCIe or their rows on the CPU pool. In a verify window of several tokens, an expert that **every** token of the window
@@ -1565,17 +1565,17 @@ routes at the bottom of its top 10 (rank 7 or lower, the smallest weights) adds 
 such a missed expert is neither copied nor computed, its contribution is zero, and the other experts keep the weight the router gave them
 (no renormalisation). An expert that any token ranks above 7, and every expert already in VRAM, is served as before.
 
-**`STRATA_ROUTE_TAIL_SKIP=0` turns it off** and restores the answers of a build without it byte for byte (checked: `mg_norepeat` 10 of 10 and `exact_pp` 4096 and 20000
+**`DACAN_ROUTE_TAIL_SKIP=0` turns it off** and restores the answers of a build without it byte for byte (checked: `mg_norepeat` 10 of 10 and `exact_pp` 4096 and 20000
 tokens identical to 0.1.42 without the change, on the RTX 3060, the RTX A4000 alone and as a 2-GPU split, and the Tesla P100). Another rank
-(`STRATA_ROUTE_TAIL_SKIP=8`, `=9`; 1-9 are accepted) is taken as given. The start-up line
-`STRATA_ROUTE_TAIL_SKIP=7 is ON (default)` names the opt-out.
+(`DACAN_ROUTE_TAIL_SKIP=8`, `=9`; 1-9 are accepted) is taken as given. The start-up line
+`DACAN_ROUTE_TAIL_SKIP=7 is ON (default)` names the opt-out.
 
 Where it applies: serve on a CUDA build with one GPU or a layer split (every stage skips by itself). Not applied, and no line printed: when every expert is
 in VRAM (nothing is missed), with `--batch` / `parallel` slots (a window then mixes requests, and one request's skip would depend on another's
 tokens: kept off until measured), with a peer-expert tier or a helper GPU, on HIP and SYCL builds. The request log gets
 `route tail skip: N missed experts skipped` (cumulative) while it is active.
 
-**Answers differ slightly from 0.1.41** (`STRATA_ROUTE_TAIL_SKIP=0` brings them back). Teacher-forced KL of the decode path (the default's own greedy text and the default sampled at T=0.8, 28 chat prompts of code,
+**Answers differ slightly from 0.1.41** (`DACAN_ROUTE_TAIL_SKIP=0` brings them back). Teacher-forced KL of the decode path (the default's own greedy text and the default sampled at T=0.8, 28 chat prompts of code,
 reasoning, chat, six languages and long-document summaries, 220 tokens each, about 6,000 scored tokens per set, through the real verify windows with the MTP drafts;
 `phaseA-tests/cuda-route-kl.md`):
 
@@ -1587,7 +1587,7 @@ reasoning, chat, six languages and long-document summaries, 220 tokens each, abo
 | perplexity of the forced text, skip / no skip | x1.011 / x1.007 | x1.005 / x1.003 |
 | KL of the first token after the prompt | 0.024 / 0.033 | 0.015 / 0.016 |
 | the same engine run twice (the floor; adaptive tier and CPU/GPU split depend on timing) | 0.0006-0.0007 | 0.0007 |
-| `STRATA_PREFILL_CPU_SHARE` on / off (already the default) | 0.0006-0.0007 (first token 0.002-0.0035) | 0.0005-0.0007 (first token 0.002-0.004) |
+| `DACAN_PREFILL_CPU_SHARE` on / off (already the default) | 0.0006-0.0007 (first token 0.002-0.0035) | 0.0005-0.0007 (first token 0.002-0.004) |
 | Q2_0 against IQ3_XXS, the same text | - | 0.1006 (p99 1.08, top-1 90.6%) |
 
 The effect is not even: code and reasoning prompts have a KL of 0.002-0.004, chat and non-English prompts 0.004-0.009.
@@ -1595,7 +1595,7 @@ Task check, greedy, thinking off (HumanEval every second problem, 82; 30 generat
 RTX 3060 76 and 78 of 82 / 78 of 82, reasoning 27 and 27 / 29; RTX A4000 76 and 76 / 76, reasoning 27 and 30 / 27. The runs do not separate the settings
 (one run each; a change of 3 reasoning tasks is noise).
 
-Decode speed, `STRATA_ROUTE_TAIL_SKIP` default against `=0`, 5 interleaved rounds on fresh engines, a story, a code answer and a 6K-token document, 200 tokens each,
+Decode speed, `DACAN_ROUTE_TAIL_SKIP` default against `=0`, 5 interleaved rounds on fresh engines, a story, a code answer and a 6K-token document, 200 tokens each,
 median over the rounds (ratio of tokens/s, default over `=0`; rounds in which the default was faster):
 
 | machine | story | code | 6K document | all three |
@@ -1607,7 +1607,7 @@ median over the rounds (ratio of tokens/s, default over `=0`; rounds in which th
 
 The gain follows how much of a token is spent waiting for missed experts (hit rate 75-90% on the single cards in the profile, `phaseA-tests/cuda-profile.md`); a 2-GPU
 split that holds nearly every expert (hit rate 99.7%) gains nothing. It does not touch prompt reading. Switches that stay opt-in and are not part of this:
-`STRATA_ROUTE_PRIOR` (adds speed, doubles the KL), `STRATA_ROUTE_RESIDENT` and `STRATA_ROUTE_RESIDENT_MTP` (the latter is not faster than the former).
+`DACAN_ROUTE_PRIOR` (adds speed, doubles the KL), `DACAN_ROUTE_RESIDENT` and `DACAN_ROUTE_RESIDENT_MTP` (the latter is not faster than the former).
 
 ## The PCIe share of the missed experts is set from the CPU's speed (CUDA, single GPU, no `--pcie-frac`)
 
@@ -1619,10 +1619,10 @@ Since 0.1.42, on CUDA with one GPU and no `--pcie-frac`, the share starts at the
 already times: the wall time of the CPU pool per missed expert. With `R` = expert bytes / that time (GB/s) and `L` = the probe's link speed, the share is
 `L / (L + 1.85 R)`, rounded to 0.05 and kept between 0.10 and 0.60; it is changed at most three times (after 48, 96 and 96 more windows, about 10 s of
 decoding), and only by a full step. Each change prints one `PCIe share:` line. A request that sets its own `pcie_frac` is left alone.
-**`--pcie-frac N` always wins; `STRATA_PCIE_FRAC_DEFAULT=old` keeps the 0.1.41 rule.** Not used with a layer split, `--batch`, a peer GPU, when every
+**`--pcie-frac N` always wins; `DACAN_PCIE_FRAC_DEFAULT=old` keeps the 0.1.41 rule.** Not used with a layer split, `--batch`, a peer GPU, when every
 expert is in VRAM, or on HIP and SYCL. The constant 1.85 is a fit to three machines, so it lands within a step of each machine's best, not on it.
 
-Measured (interleaved pairs of whole engine runs, new default against `STRATA_PCIE_FRAC_DEFAULT=old`, medians, route tail skip on):
+Measured (interleaved pairs of whole engine runs, new default against `DACAN_PCIE_FRAC_DEFAULT=old`, medians, route tail skip on):
 
 | card | the pool takes | share (old -> new) | decode, new / old | pairs faster |
 |---|---|---|---|---|
@@ -1641,22 +1641,22 @@ None of these changes the default answers; each was measured against the default
 engine runs (a fresh engine per side, warmed, 200-token greedy answers on three fixed prompts, medians; "pairs faster" counts
 the pairs in which the switched arm won). They are here so you can try them on your own card.
 
-- **`STRATA_GDN_CHUNKED=1`: the DeltaNet recurrence of the prompt in chunks of 32 tokens** (sergiywith, #1372; WY form, FP32,
+- **`DACAN_GDN_CHUNKED=1`: the DeltaNet recurrence of the prompt in chunks of 32 tokens** (sergiywith, #1372; WY form, FP32,
   other bits than the default: first-token KL against the default was 0.002-0.009 nats on average, the same top token in
   every prompt tried). The kernel needs 128 SMs in one wave, so by itself it runs only on a card with 128 or more
-  (RTX 5090: 1.8x on the recurrence). On smaller cards `STRATA_GDN_CHUNKED=2` forces it for a measurement, and it is
+  (RTX 5090: 1.8x on the recurrence). On smaller cards `DACAN_GDN_CHUNKED=2` forces it for a measurement, and it is
   slower there: 0.73x on an RTX 3060 (28 SMs) and 0.87x on an RTX 5070 (48 SMs) at 2K-32K tokens (`gdn_rec_parity --bench`),
   and the prompt time did not improve: RTX 5070 2K 1.01x, 8K 1.00x of the default's time; RTX 3060 2K, 8K, 16K 1.01x, no pair faster.
-- **`STRATA_FS_SLOTS=N`: the Foresight swap space** (q8atnight, #1348): N VRAM slots per layer, refilled on a copy stream
-  with the experts that just missed and with the ones the next layer's router predicts (`STRATA_FS_AHEAD=0` for the
+- **`DACAN_FS_SLOTS=N`: the Foresight swap space** (q8atnight, #1348): N VRAM slots per layer, refilled on a copy stream
+  with the experts that just missed and with the ones the next layer's router predicts (`DACAN_FS_AHEAD=0` for the
   misses only), so that an expert the cache lacks can be computed on the GPU instead of by the CPU. The model's own router
-  decides everything; the slots only hold copies of the same bytes (`STRATA_FS_VERIFY=1` reads every landed slot back and
+  decides everything; the slots only hold copies of the same bytes (`DACAN_FS_VERIFY=1` reads every landed slot back and
   compares it: 0 bad in 2,300+ reads on an RTX 5070). The slots are taken from the VRAM the expert cache would have
   (raise `--vram-reserve-mib` by about N x 80 MiB), and in every box measured the smaller cache cost more than the slots
   returned: decode 4 slots, median tok/s B/A (pairs faster): RTX 3060 0.95 (0/6) with misses only, 0.91 (0/6) with the
   look-ahead; Tesla P100 0.97 (2/6) and 1.00 (4/6); 16 slots on the P100 0.96 (0/6); RTX 5070 0.98 (1/6). The reporter
   measured the same on 2x RTX 3090 (the misses per layer are below one there, so the CPU round trip stays). Left off.
-- **`STRATA_STAGE_PIN`: pinned stage buffers** (Zhong Uncle, #1237; **opt-in, `STRATA_STAGE_PIN=1`**. It was on by default in
+- **`DACAN_STAGE_PIN`: pinned stage buffers** (Zhong Uncle, #1237; **opt-in, `DACAN_STAGE_PIN=1`**. It was on by default in
   development, but the 0.1.41 release gate found IQ3_S decode corrupted after a 4096-token prompt with it on, likely a stage
   buffer recycled before its asynchronous copy finished; it stays off until that is fixed). Where the experts are served from the GGUF in
   place (`--mmap-experts`, or too little RAM for the arena) the buffers the cache fill copies from are page-locked, so the
@@ -1664,7 +1664,7 @@ the pairs in which the switched arm won). They are here so you can try them on y
   pageable when the driver refuses). Decode, median tok/s on, off, 6 pairs of whole runs: Tesla P100 with the RAM capped at
   24 GB (cgroup) 13.9 -> 15.0 (+8%, 6/6 pairs faster); RTX 5070 `--mmap-experts` +1.2% (5/6); RTX 3060 `--mmap-experts`
   -0.1% (5/6). Boxes that hold all experts in RAM never use the stage buffers.
-- **`STRATA_ADAPT_LAG=2`: the adaptive tier's copies are waited for one window later** (#764). Decode, 6 pairs: Tesla P100
+- **`DACAN_ADAPT_LAG=2`: the adaptive tier's copies are waited for one window later** (#764). Decode, 6 pairs: Tesla P100
   (PCIe 3.0 x16) +3.5% (6/6 pairs faster), RTX 5070 +0.2% (4/6), RTX 3060 -1.3% (0/6), so it stays opt-in.
 
 ## Thread placement: `--aux-cpus` (Linux, off by default)
@@ -1675,7 +1675,7 @@ helpers, the router look-ahead. The threads the CUDA driver starts are free to r
 `--aux-cpus` puts every thread that is neither a pool worker nor the host thread on spare CPUs. It moves threads only and
 never changes a result.
 
-- **Which CPUs.** `--aux-cpus auto` (or `STRATA_AUX_CPUS=auto`): the SMT siblings of the host's core first, then the CPUs of
+- **Which CPUs.** `--aux-cpus auto` (or `DACAN_AUX_CPUS=auto`): the SMT siblings of the host's core first, then the CPUs of
   physical cores that have no pool worker. A CPU that shares a core with a worker is never taken; when no CPU is spare
   the feature does nothing and the start-up line says so. A list (`--aux-cpus 24,26` or `24-27`) is used as given, minus
   the host's CPU and the workers' CPUs, and only CPUs the process may run on. `--aux-cpus off` is the default.
@@ -1683,16 +1683,16 @@ never changes a result.
   threads, the prefill copy threads and helpers, the router look-ahead, the PLE reader, the file readers, the stdin reader
   and the watchdog. The threads someone else started (the CUDA driver's) are moved by a sweep over `/proc/self/task`
   once the pool exists and again at the start of every request. The pool's workers and the host thread are never moved,
-  and neither is a thread somebody pinned to one CPU. An explicit `STRATA_ADAPT_JOB_CPU` still wins for the adaptive tier's
-  job thread. `STRATA_AUX_STAGER=0` leaves the prefill copy threads where they were started: with a one-CPU spare set up
-  to 32 of them (`STRATA_STAGER_THREADS`) would share that CPU, which can slow the read of a long prompt.
-- **Per request.** `"strata_tune": {"aux_cpus": 1}` (`serve/server.py` forwards `1`, `0`, `true` and `false`) moves the
+  and neither is a thread somebody pinned to one CPU. An explicit `DACAN_ADAPT_JOB_CPU` still wins for the adaptive tier's
+  job thread. `DACAN_AUX_STAGER=0` leaves the prefill copy threads where they were started: with a one-CPU spare set up
+  to 32 of them (`DACAN_STAGER_THREADS`) would share that CPU, which can slow the read of a long prompt.
+- **Per request.** `"dacan_tune": {"aux_cpus": 1}` (`serve/server.py` forwards `1`, `0`, `true` and `false`) moves the
   threads to the set; `0` puts every moved thread back to the placement it had. A request without the key goes back to the
-  start-up setting. With `--batch` the most recently admitted request's value holds, as for the other `strata_tune` keys.
+  start-up setting. With `--batch` the most recently admitted request's value holds, as for the other `dacan_tune` keys.
   An engine started without `--aux-cpus` plans the set anyway, so `1` takes `auto`.
-- **What it prints.** At start: `strata aux cpus: threads that are neither pool workers nor the host go to CPUs 24 (on;
+- **What it prints.** At start: `dacan aux cpus: threads that are neither pool workers nor the host go to CPUs 24 (on;
   N threads placed so far)`, or `(off at start; a request's aux_cpus=1 turns it on)`. A request that changes the state
-  prints `strata serve: aux cpus ON/off for this request`.
+  prints `dacan serve: aux cpus ON/off for this request`.
 - **Not covered.** Other processes (the Python launcher, a container runtime) and the engine's host thread.
 - **Measured.** One machine: 2x RTX 3080 20 GB at 220 W, Xeon E5-2696 v4 (24 logical CPUs in the container, 16 pool
   workers each on its own CPU), UD-Q4_K_XL, layer split 23, `--batch-mtp`, two slots, adaptive tier on. `auto` put the
@@ -1701,7 +1701,7 @@ never changes a result.
   medians): solo decode 79.7 and 80.4 tok/s with `auto` against 72.1 and 72.4 off (off / `auto` = 0.904 and 0.900), two
   streams in aggregate 90.8 and 90.7 against 80.8 and 82.8 (0.890 and 0.912). The same configuration restarted twice
   moved solo by 1.009 and 1.005 and two streams by 0.999 and 1.024. Live on one engine, switching per request with
-  `strata_tune` and rotating the order (20 solo requests per arm, 16 two-stream rounds): off / on = 0.888 solo and
+  `dacan_tune` and rotating the order (20 solo requests per arm, 16 two-stream rounds): off / on = 0.888 solo and
   0.917 two streams, against 0.985 and 0.990 for an A/A control of the same setting. The host thread's involuntary
   context switches over a bench of about ten minutes were 43.8k and 42.8k with the flag off and 3.9k and 2.8k with
   `auto`. Prompt reads (24K, 25K, 51K, 104K) do not depend on the flag: off is +0.7% to +1.5% against `auto`, inside the
@@ -1713,7 +1713,7 @@ never changes a result.
 
 ## Experimental speed projection (EXPERIMENTAL, off by default)
 
-**This is an experiment, not a finished feature.** It ships with Strata but stays off unless you turn it on.
+**This is an experiment, not a finished feature.** It ships with DACAN but stays off unless you turn it on.
 
 A 480 KB control vector for Qwen3.8-Flash-Next (`data/experimental-speed-projection/`, see its README). After each
 of layers 4-44 the engine removes one direction from every hyper-connection stream of the residual: `h -= (h . v) v`,
@@ -1728,10 +1728,10 @@ so measure it on your own prompts; the Monitor marks every request ESP or stock.
 
 **Turning it on (at setup).** `START-HERE.bat --setup` asks "Turn on the experimental speed projection?" (default:
 no), or pass `--experimental-speed-projection on` (`off`, or a path to another vector GGUF). Only for the original
-Qwen3.8-Flash-Next, not Swift 1.5. It writes these engine flags (llama.cpp's) into `strata-<model>.json`:
+Qwen3.8-Flash-Next, not Swift 1.5. It writes these engine flags (llama.cpp's) into `dacan-<model>.json`:
 
 ```
---control-vector-scaled <Strata>\data\experimental-speed-projection\Qwen3.8-Flash-Next-experimental-speed-projection.gguf:1.0
+--control-vector-scaled <DACAN>\data\experimental-speed-projection\Qwen3.8-Flash-Next-experimental-speed-projection.gguf:1.0
 --control-vector-layer-range 4 44 --cvec-mode project --cvec-dir per-layer
 ```
 
@@ -1756,7 +1756,7 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | --- | --- |
 | `the NVIDIA driver is too old` | Update the driver (NVIDIA App or nvidia.com/drivers), restart, run `START-HERE.bat` again. |
 | Python or the build tools could not be installed | Install what it names (links are printed), then run it again. Everything already done is kept. |
-| `port 8080 is already in use` | Strata is already running (look for its window), or another program uses the port: `START-HERE.bat --port 8081`. |
+| `port 8080 is already in use` | DACAN is already running (look for its window), or another program uses the port: `START-HERE.bat --port 8081`. |
 | `cudaHostRegister ... out of memory` in the log | Normal on Windows: the engine pins the experts in per-layer slices instead. Only a problem if the load then fails. |
 | `ExpertCache: cudaMalloc(...) failed: out of memory` although VRAM is free | Windows' page file is off or tiny: every allocation on the graphics card is also charged to Windows' commit (RAM + page file). Set a fixed page file size, the same initial and maximum size (e.g. 65536 MB: System > About > Advanced system settings > Performance > Advanced > Virtual memory > Custom size), and restart: a page file Windows grows on demand ("System managed", or an initial size below the maximum) may not grow in time while the card's memory is charged (#60: "System managed" and 4096-32768 MB still failed, a fixed 64 GB worked). Since 0.1.19 the engine retries with a smaller cache instead of stopping, and setup warns about a page file under 4 GB (issue #60). |
 | The first start takes minutes | It is reading 34-55 GB into RAM; the second start is faster while the files are in the OS cache. |
@@ -1767,17 +1767,17 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | `the setup refuses --rope-scaling none for a past-trained context` | A context past the trained 262,144 needs the rotary angles rescaled (experimental rope scaling), and the setup will not configure one with the stock angles there. Let it pick (`START-HERE.bat --setup --context 393216` adds yarn and a covering factor), or pass `--rope-scaling linear` or `yarn` yourself. |
 | Slower than the tables | The monitor plugged into the GPU and other GPU programs take VRAM from the expert cache; RAM running below its rated speed (enable EXPO/XMP in the BIOS) slows the CPU half. |
 | `this server was started without the vision encoder` | The model was set up for text only: run setup again with `--vision gpu`. |
-| Setup puts the model on an old drive after you moved or reinstalled Strata (#1070) | Setup remembers the data folder you used last in its settings file (`%APPDATA%\Strata\settings.json` on Windows, `~/.config/strata/settings.json` on Linux; the `data_dir` entry) and uses it again. Choose another place with `--data-dir DIR` (model files, packs, MTP layer) or `--models-dir DIR` (the GGUF files only), or delete the `data_dir` line; `--gguf-dir DIR` uses GGUF files you already have without copying. To move a model, copy its folder and run setup with the new `--data-dir`. |
+| Setup puts the model on an old drive after you moved or reinstalled DACAN (#1070) | Setup remembers the data folder you used last in its settings file (`%APPDATA%\DACAN\settings.json` on Windows, `~/.config/dacan/settings.json` on Linux; the `data_dir` entry) and uses it again. Choose another place with `--data-dir DIR` (model files, packs, MTP layer) or `--models-dir DIR` (the GGUF files only), or delete the `data_dir` line; `--gguf-dir DIR` uses GGUF files you already have without copying. To move a model, copy its folder and run setup with the new `--data-dir`. |
 | A picture is refused or `cannot read the image` | The file is not a picture Pillow can open (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF work). |
 | Pictures are slow (3-30 s) | The encoder runs on the CPU: run setup again with `--vision gpu` (needs ~1.4 GB of VRAM). |
 | A request never finishes: "reading the prompt", GPU "100%" at low power | The GPU ran out of VRAM (engines before 0.1.9 could end with ~30 MiB free at large contexts). Run `START-HERE.bat` once to get engine 0.1.9 or newer; the log then says `... MiB of VRAM free with everything loaded` (a few hundred) and names the `--vram-reserve-mib` to add if it is low. |
 | Output much slower than the tables above, only with a large `--context`, and the start says a small `... MiB of VRAM free with everything loaded` | The expert cache does not fit the card at that context. With `--expert-cache auto` the engine shrinks it to fit; with a fixed number it does not check again after the slots are written, and on Windows the extra is put in system memory instead of failing, so only the speed shows it. Use `auto`, a smaller number, or raise `--vram-reserve-mib` (it is deducted before the cache is sized). See "The expert cache size is a budget" under Sharing the GPU. |
-| Generation stops mid-answer, GPU "100%", one CPU core busy | Fixed in engine 0.1.12 (issue #29, a race in the CPU expert pool on big-VRAM cards). Since then a request that stops moving ends with an error instead of hanging (after 2 minutes; 1 minute from 0.1.13): the log says `no progress for ... s ... (issue #29)` with where it stopped, and the next request starts the engine again. If you see that line, please open an issue with it. Engine 0.1.13 adds a stall report under it (what every expert-pool thread and the GPU handshake were doing, memory and page faults) and, on Windows, a `strata-stall-<pid>.dmp` file with every thread's stack: attach both. (`STRATA_WATCHDOG_S` sets the time in seconds; 0 turns it off.) Engine 0.1.14 fixes the stall those reports found (issue #31: with the IQ packs the host could wait forever inside the NVIDIA driver while copying experts in a verify window; the experts are now copied by a GPU kernel, `--pcie-mode dma` restores the old way). |
+| Generation stops mid-answer, GPU "100%", one CPU core busy | Fixed in engine 0.1.12 (issue #29, a race in the CPU expert pool on big-VRAM cards). Since then a request that stops moving ends with an error instead of hanging (after 2 minutes; 1 minute from 0.1.13): the log says `no progress for ... s ... (issue #29)` with where it stopped, and the next request starts the engine again. If you see that line, please open an issue with it. Engine 0.1.13 adds a stall report under it (what every expert-pool thread and the GPU handshake were doing, memory and page faults) and, on Windows, a `dacan-stall-<pid>.dmp` file with every thread's stack: attach both. (`DACAN_WATCHDOG_S` sets the time in seconds; 0 turns it off.) Engine 0.1.14 fixes the stall those reports found (issue #31: with the IQ packs the host could wait forever inside the NVIDIA driver while copying experts in a verify window; the experts are now copied by a GPU kernel, `--pcie-mode dma` restores the old way). |
 | `no progress for 60 s ... reading the prompt` on Linux, and the stall report says `threads waiting on the disk (state D): 16 ...` | The engine waits for the drive, not a deadlock: the n-gram table is read at random (`--ple-io direct`), which a rotational disk cannot keep up with (#605). The engine warns at start when the table is on one; `--ple-io ram` (Linux, needs RAM for the table) or the model on an SSD fixes it. Setup adds `--ple-io ram` itself on a rotational disk when the RAM holds the table (0.1.39). |
-| `the engine said nothing for ... s during the request` or `... did not finish the request after it was stopped (STOP)` | Issue #481: the engine and the server lost step (the engine waits for its next command, the server for the request's end; GPU at 0 %, nothing in the log). The server ends the engine after 300 s without a line from it during a request (while a prompt is read: each chunk may take three times the previous one's time, the first one up to its tokens at 50 tok/s more), the request ends with an error and the next request starts the engine again. `"engine_silence_s": 600` in `strata-<model>.json` sets the time (0 = wait forever, as before). If you see it, please add the end of the engine log to #481. |
-| `the engine said nothing for ... s and used no CPU or disk in that time (frozen ...)` | Issue #1317: a quicker version of the check above for an engine that is not slow but stopped (a deadlock inside a CUDA call, a driver stall): after 90 s without a line, if the engine process has also used no CPU time and moved no disk bytes in that time, the server ends it and the next request starts it again. An engine that is silent but still working is never ended by this check, the server prints one note (`... but is still working; it is not ended`) and leaves it to `engine_silence_s`. `STRATA_ENGINE_STALL_S=180` sets the time, `0` turns the check off (it needs `psutil`, which setup installs). |
+| `the engine said nothing for ... s during the request` or `... did not finish the request after it was stopped (STOP)` | Issue #481: the engine and the server lost step (the engine waits for its next command, the server for the request's end; GPU at 0 %, nothing in the log). The server ends the engine after 300 s without a line from it during a request (while a prompt is read: each chunk may take three times the previous one's time, the first one up to its tokens at 50 tok/s more), the request ends with an error and the next request starts the engine again. `"engine_silence_s": 600` in `dacan-<model>.json` sets the time (0 = wait forever, as before). If you see it, please add the end of the engine log to #481. |
+| `the engine said nothing for ... s and used no CPU or disk in that time (frozen ...)` | Issue #1317: a quicker version of the check above for an engine that is not slow but stopped (a deadlock inside a CUDA call, a driver stall): after 90 s without a line, if the engine process has also used no CPU time and moved no disk bytes in that time, the server ends it and the next request starts it again. An engine that is silent but still working is never ended by this check, the server prints one note (`... but is still working; it is not ended`) and leaves it to `engine_silence_s`. `DACAN_ENGINE_STALL_S=180` sets the time, `0` turns the check off (it needs `psutil`, which setup installs). |
 | `out of memory: cudaFuncSetAttribute` in the log (IQ3_XXS, long prompt) | Fixed in engine 0.1.15: CUDA loaded a kernel's code when it was first needed, and mid-prompt there was no VRAM left for it. Run `START-HERE.bat` (Windows) or `./setup.sh` (Linux) once to update. |
-| Anything else | The engine log is `strata-<model>.log` in this folder. |
+| Anything else | The engine log is `dacan-<model>.log` in this folder. |
 
 ---
 
@@ -1808,27 +1808,27 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
   largest chunk that keeps that ring full. It only gives up ring slots where 0.1.39's rule held the chunk at 4,096
   tokens or less; from 6,144 on it keeps 0.1.39's ring and only looks for a bigger chunk beside it (shrinking the
   ring there measured slower: the Coder -12%), and a prompt that fits 0.1.39's chunk keeps 0.1.39's ring (one
-  chunk: a smaller ring only slowed it). RTX 5070, 32K prompts against `STRATA_RING_BYTES=0`, 2-3 interleaved
+  chunk: a smaller ring only slowed it). RTX 5070, 32K prompts against `DACAN_RING_BYTES=0`, 2-3 interleaved
   rounds: IQ3_XXS +18.5% at a 1,500-slot cache and +9% in another memory state, the Coder +3%, IQ3_S unchanged; 4K
   prompts unchanged (-0.7% to +1.1%, bit-identical). Q2_0 (a fixed `--prefill 2048`) is not affected. It changes
   the bits of a long prompt against 0.1.39 (the experts go through a different
   mix of cached and streamed groups). Measured quality, teacher-forced over the next 2,001 tokens of a long document
   against the FP16 prompt path (IQ3_XXS, `--prefill auto`): 8K prompt KL 0.042 (0.1.39: 0.054), top-1 agreement
-  93.5% (92.2%); 32K prompt KL 0.020 (0.019), top-1 95.3% (95.0%) - the same band as before. `STRATA_RING_BYTES=0`
+  93.5% (92.2%); 32K prompt KL 0.020 (0.019), top-1 95.3% (95.0%) - the same band as before. `DACAN_RING_BYTES=0`
   restores 0.1.39's ring, loan and chunk choice.
 
-The full story, with measurements, bottlenecks and what comes next: **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**.
+The full story, with measurements, bottlenecks and what comes next: **[docs/paper/DACAN-Paper.pdf](paper/DACAN-Paper.pdf)**.
 
 ---
 
 ## Credits and licenses
 
-Strata itself: [MIT](../LICENSE). The model files are not part of it; their licenses apply to them (below).
+DACAN itself: [MIT](../LICENSE). The model files are not part of it; their licenses apply to them (below).
 
 - Model: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; quantizations:
   [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF).
   The Coder: [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
-  (Apache-2.0 per its card); its support in Strata came from @pjgmobile's PR #54.
+  (Apache-2.0 per its card); its support in DACAN came from @pjgmobile's PR #54.
   Swift 1.5: [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
   by UkisAI. Their licenses apply to the weights.
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT): the i-quant formats, the GPU dot products and
@@ -1844,11 +1844,11 @@ Strata itself: [MIT](../LICENSE). The model files are not part of it; their lice
 
 ### Start the API without loading the model
 
-`serve/server.py --engine strata --config strata-<model>.json --lazy` (or `"lazy_load": true` in that
+`serve/server.py --engine dacan --config dacan-<model>.json --lazy` (or `"lazy_load": true` in that
 config) starts the lightweight HTTP API without starting the native engine or the vision encoder. The first
 generation request, or `POST /load`, starts the vision encoder first when configured, then loads the engine through
 the existing reload path, including `before_load` and `min_free_vram_mib`. This also works with image requests:
-the load finishes before Strata encodes the image. `POST /unload` stops both processes. Eager startup remains the
+the load finishes before DACAN encodes the image. `POST /unload` stops both processes. Eager startup remains the
 default.
 
 `POST /v1/load` and `/v1/unload` are JSON control aliases for integrations, accepting `{}` or
@@ -1886,7 +1886,7 @@ then usage/timings and `[DONE]`; failures emit an SSE error and `[DONE]` without
 ### API request monitor
 
 Off by default, since it keeps prompts and answers in memory: turn it on with `"api_monitor": true` in
-`strata-<model>.json` (or `serve/server.py --api-monitor`); otherwise nothing is recorded and the two endpoints below
+`dacan-<model>.json` (or `serve/server.py --api-monitor`); otherwise nothing is recorded and the two endpoints below
 answer 404.
 Open `/api-monitor` to inspect API traffic without opening a chat. It shows the model state, safe
 load/unload controls, active/queued requests, original request bodies, output, separate reasoning and
@@ -1897,9 +1897,9 @@ first-token, prompt/output tokens and engine decode timing are shown separately.
 Both use the existing API-key check. The monitor retains the newest **100 requests in memory** until restart,
 with **262,144 characters per input/output/reasoning/response field** and visible truncation flags. The actual API
 responses are unaffected. Headers are not recorded, and the monitor key is kept in this tab's session storage.
-Treat request history as sensitive input/output when exposing Strata on a network: set an API key as above.
+Treat request history as sensitive input/output when exposing DACAN on a network: set an API key as above.
 The page uses relative URLs and works through the existing host binding or a reverse proxy.
 
 ### Prompt buffers: `bo` shares `emb` (#1454)
 
-The prompt path's half-output buffer `bo` reuses the embedding buffer `emb`, which is dead after the first hyper-connection broadcast: T x 2560 floats less VRAM per chunk (320 MiB at 32768 rows). The planner still counts those bytes by default, so the auto chunk and the cache slots the prompt path borrows are exactly those of 0.1.40.3 and the output bits are unchanged. `STRATA_EMB_REUSE_ACCOUNT=1` lets the planner use the saved bytes: where VRAM limits the chunk it grows (RTX 3060, IQ3_XXS: 6400 to 6656 tokens, 1652 to 1670 borrowed slots, prompt about +3.9%). A different chunk changes the prompt path's rounding, so prompt residuals are not byte-identical to the default; greedy output matched in our runs. Opt-in until it has a KL measurement.
+The prompt path's half-output buffer `bo` reuses the embedding buffer `emb`, which is dead after the first hyper-connection broadcast: T x 2560 floats less VRAM per chunk (320 MiB at 32768 rows). The planner still counts those bytes by default, so the auto chunk and the cache slots the prompt path borrows are exactly those of 0.1.40.3 and the output bits are unchanged. `DACAN_EMB_REUSE_ACCOUNT=1` lets the planner use the saved bytes: where VRAM limits the chunk it grows (RTX 3060, IQ3_XXS: 6400 to 6656 tokens, 1652 to 1670 borrowed slots, prompt about +3.9%). A different chunk changes the prompt path's rounding, so prompt residuals are not byte-identical to the default; greedy output matched in our runs. Opt-in until it has a KL measurement.

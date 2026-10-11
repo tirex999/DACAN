@@ -13,13 +13,13 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
                   its use counts fade.  A PC whose CPU reads the missed experts slowly (DDR3, ~24 GB/s) gains from
                   swapping more: 160 swaps every window measured +7.9% over the default tier on a Xeon E5-2673 v3 (DDR3) with an
                   RTX 4060 Ti on PCIe 3.0 x8 (Q2_0; with the swaps taking effect a window later, #764).
-The first two are measured through one engine (per-request `strata_tune` keys); the worker count and the adaptive
+The first two are measured through one engine (per-request `dacan_tune` keys); the worker count and the adaptive
 tier need a restart per value.  Decode speed only: the prompt path streams every expert whatever these settings say.
 
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
 adaptive expert tier and the OS make single measurements noisy by a few percent.
 
-    python tools/calibrate.py strata-q2_0.json        # measure and print; setup.py --calibrate also saves it
+    python tools/calibrate.py dacan-q2_0.json        # measure and print; setup.py --calibrate also saves it
 """
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ class Session:
         for ids in self.ids_list:
             sampling = {"temperature": 0}
             if tune:
-                sampling["strata_tune"] = tune
+                sampling["dacan_tune"] = tune
             n = sum(1 for t in self.engine.generate(ids, max_new or MAX_NEW, sampling, threading.Event())
                     if t is not None)
             ms = (self.engine.last or {}).get("decode_ms") or 0.0
@@ -135,13 +135,13 @@ class Session:
 
 def run(cfg: dict, say=print, start_engine=None) -> dict:
     """Measure on the engine `cfg` describes; returns {"settings": {flag: value}, "report": {...}}.
-    `start_engine(args)` returns a started engine (serve.server.StrataEngine or a stand-in in tests)."""
+    `start_engine(args)` returns a started engine (serve.server.DacanEngine or a stand-in in tests)."""
     if start_engine is None:
-        from serve.server import StrataEngine, child_env
+        from serve.server import DacanEngine, child_env
 
         def start_engine(args):
-            return StrataEngine(cfg["exe"], args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=child_env(cfg))
-    import strata_tokenizer as ST
+            return DacanEngine(cfg["exe"], args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=child_env(cfg))
+    import dacan_tokenizer as ST
     tpath = Path(cfg["tokenizer"])
     vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
     toks = [None] * len(vocab)
@@ -164,7 +164,7 @@ def engine_args(cfg: dict) -> list[str]:
 
 def engine_error(log: str | None, since: int = 0) -> str | None:
     """#447: the engine's own reason for a failed start - the last line of its log written after byte `since` that is
-    its own ("strata ..." or "ERR ..."), else the last line there; None without a log or a new line."""
+    its own ("dacan ..." or "ERR ..."), else the last line there; None without a log or a new line."""
     if not log:
         return None
     try:
@@ -173,7 +173,7 @@ def engine_error(log: str | None, since: int = 0) -> str | None:
             lines = [x.strip() for x in f.read()[-16384:].decode("utf-8", "replace").splitlines() if x.strip()]
     except OSError:
         return None
-    return next((x for x in reversed(lines) if x.startswith(("strata", "ERR"))), lines[-1] if lines else None)
+    return next((x for x in reversed(lines) if x.startswith(("dacan", "ERR"))), lines[-1] if lines else None)
 
 
 def sweep(s, values: list, base_tune: dict, key: str, label: str, say) -> dict:
@@ -338,6 +338,6 @@ def apply(args: list[str], settings: dict) -> list[str]:
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        sys.exit("usage: calibrate.py <strata-*.json>")
+        sys.exit("usage: calibrate.py <dacan-*.json>")
     res = run(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig")))
     print(json.dumps(res, indent=1))

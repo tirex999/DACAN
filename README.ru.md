@@ -3,83 +3,118 @@
 🇬🇧 [English](README.md) | 🇷🇺 **Русский** · [❤️ Поддержать проект](#поддержать-проект)
 
 **DACAN** — движок для запуска **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** (125 млрд
-параметров, смесь экспертов) и дообученных версий той же формы, например
-[Swift 1.5](https://huggingface.co/ukisai/Swift1.5-Qwen3.8-Flash-Next), на обычном железе. Начиная с этой версии он
-построен на [Strata](https://github.com/Niko1221/Strata) 0.1.42 и добавляет к ней своё:
+параметров, смесь экспертов) и дообученных моделей того же устройства, например
+[Swift 1.5](https://huggingface.co/ukisai/Swift1.5-Qwen3.8-Flash-Next), на обычном железе: одна-две игровые карты NVIDIA
+и оперативная память ПК. В комплекте установщик, сервер с API, совместимым с OpenAI и Anthropic, и веб-чат.
 
-- **RTX 20 (Turing)** — промт на этих картах читается быстрее, без ключей;
-- **наши кванты NVFP4 + Q8 (DACAN)** — эксперты NVFP4 считаются и на карте, и на процессоре (AVX-512);
-- **`--numa`** — для серверов с двумя сокетами (Linux).
+**Движок выкладывается готовым** (`dacan` / `dacan.exe` в [релизах](https://github.com/tirex999/DACAN/releases), для
+Windows x64 и Linux x64). Его исходники не публикуются; установщик и сервер открыты (MIT, [LICENSE](LICENSE)).
 
-Всё остальное — установщик, сервер, веб-приложение, API OpenAI и Anthropic, деление модели на несколько карт — как в
-Strata 0.1.42.
+## Что нужно
 
-**Движок выкладываем готовым** (`strata.exe` в [релизах](https://github.com/tirex999/DACAN/releases)); исходники
-наших изменений не публикуем. Установщик и сервер — открытые, из Strata (MIT).
+- **Видеокарта NVIDIA начиная с серии RTX 20** (Turing, Ampere, Ada, Blackwell), **драйвер 580 или новее**:
+  - RTX 20 (Turing): RTX 2060 / 2070 / 2080 / 2080 Ti (в том числе 2080 Ti на 22 ГБ), Titan RTX, Quadro RTX;
+  - майнинговые **CMP 30HX / 40HX / 50HX** (Turing) и **CMP 70HX / 90HX** (Ampere) — установщик принимает их так же,
+    как карты выше; сами мы на них не запускали. Шина PCIe у них урезана, поэтому загрузка модели и подкачка экспертов
+    на карту идут дольше;
+  - RTX 30, RTX 40, RTX 50 и профессиональные карты этих поколений.
 
-## Установка (Windows)
+  Старые карты (GTX 10, Volta), AMD и Intel не поддерживаются.
+- **Windows 10/11 x64** или **Linux x64 с glibc 2.35 и новее** (Ubuntu 22.04 и новее, Debian 12, Fedora 36 и новее, ...).
+- **Процессор с AVX2.** Объём ОЗУ зависит от модели: установщик скажет, что поместится, и предложит только это.
 
-Нужно: видеокарта NVIDIA от RTX 20 и новее, драйвер 580 или новее, Windows 10/11 x64, процессор с AVX2. Python установщик поставит сам.
+## Установка
 
-1. Скачайте папку: `git clone https://github.com/tirex999/DACAN` или
+**Windows**
+
+1. Возьмите папку: `git clone https://github.com/tirex999/DACAN` или
    [ZIP](https://github.com/tirex999/DACAN/archive/refs/heads/main.zip) (распакуйте куда угодно).
-2. Запустите **`START-HERE.bat`**. Он спросит модель, размер, контекст и картинки, всё скачает (движок DACAN — из
-   релиза, модели — с Hugging Face) и запустит сервер.
+2. Запустите **`START-HERE.bat`**. Он спросит модель, её размер, контекст и картинки, скачает всё (движок DACAN из
+   релиза, модели с Hugging Face) и запустит сервер. Python поставит сам, если его нет.
+
+**Linux**
+
+```sh
+git clone https://github.com/tirex999/DACAN
+cd DACAN
+./setup.sh
+```
+
+Вопросы те же, что на Windows; движок `dacan-linux-x64.zip` скачивается из релиза. Заранее нужен только драйвер
+NVIDIA: Python 3.10+ с venv ставится через apt / dnf / pacman, если его нет (спросит пароль sudo), библиотеки CUDA 13
+приходят pip-пакетами в собственный `.venv` папки. Следующие запуски `./setup.sh` просто стартуют модель.
 
 ## Обновление
 
-**`UPDATE.bat`** — свежие файлы (`git pull`), новый движок DACAN, если он вышел, и настройки моделей. Модели заново не
-качаются. Потом запуск — как обычно, `START-HERE.bat`.
+**`UPDATE.bat`** (Windows) или **`./update.sh`** (Linux): свежие файлы (`git pull`), новый движок DACAN, если вышел,
+настройки моделей. Модели заново не скачиваются. Дальше запуск как обычно (`START-HERE.bat` / `./setup.sh`).
 
-**Если у вас стоял прежний DACAN** (без `UPDATE.bat`): один раз выполните в его папке `git pull` (или скачайте ZIP
-заново и распакуйте рядом), затем `UPDATE.bat`. Скачанные модели установщик сам перенесёт в папку `Strata-data` рядом и
-найдёт их там. Движок апстрима, если он стоял, заменится на движок DACAN.
+Установку прежней версии DACAN обновление переносит само: папка со скачанными моделями переименовывается в
+`DACAN-data`, конфиги моделей — в `dacan-<модель>.json`, старый движок заменяется.
 
-## Linux
+Если в вашей копии ещё нет `UPDATE.bat` / `update.sh`, один раз выполните `git pull` в её папке (или распакуйте ZIP
+поверх), затем обновление.
 
-Готовый движок DACAN для Linux выйдет следом. Пока на Linux работает прежняя версия — ветка
-[`dacan-1`](https://github.com/tirex999/DACAN/tree/dacan-1) (две RTX 2080 Ti, `--second-card`, `--park`, её README).
+## Параметры выборки
 
-## Карты старше RTX 20 и AMD
+Как выбирается следующее слово. По умолчанию стоят рекомендованные для модели значения, их DACAN и использует:
 
-DACAN выпускает движок только для NVIDIA RTX 20 и новее. Для Pascal / Volta (CUDA 12) и AMD установщик берёт готовый
-движок Strata той же версии.
+| параметр | по умолчанию | что делает |
+|---|---|---|
+| `temperature` | **0.6** | насколько свободно выбираются слова: 0 = всегда самое вероятное слово (на тот же вопрос — тот же ответ), выше = разнообразнее |
+| `top_p` | **0.95** | рассматриваются только самые вероятные слова, вместе дающие 95 % вероятности |
+| `top_k` | **20** | рассматривается не больше стольких самых вероятных слов (DACAN принимает от 1 до 64) |
+| `presence_penalty`, `repetition_penalty`, `frequency_penalty` | **выкл.** | отталкивают модель от уже сказанных слов; включайте, только если ответы повторяются |
+
+- **Веб-чат** по умолчанию отправляет именно эти значения (⚙ настройки: Temperature, Top-p, Top-k). Переключатель
+  «Use for other apps too» делает настройки веб-чата значениями по умолчанию для всех клиентов API.
+- **Клиенты API** (Open WebUI, Claude Code, свои скрипты) получают значения по умолчанию для всех полей, которые сами
+  не прислали: они лежат в блоке `"sampling"` конфига модели `dacan-<модель>.json` рядом с `setup.py`, менять их можно
+  там (после правки перезапустите модель). Поля из самого запроса всегда главнее.
+- **Скорость.** Быстрее всего `temperature` 0: движок угадывает несколько токенов вперёд и проверяет их за один шаг, а
+  когда каждый раз берётся самое вероятное слово, угаданных принимается больше. Со случайной выборкой (temperature
+  выше 0) их принимается меньше.
 
 ## Веса
 
-- **[tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN)** —
-  Swift 1.5: **NVFP4 + Q8 (DACAN)** и 8 бит (Q8_0).
-- **[tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN)** — исходная модель
-  в тех же форматах.
-- Кванты GSQ-RCO (2–3.5 бита) от [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) и
+- **[tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN)**:
+  Swift 1.5 в **NVFP4 + Q8 (DACAN)** и 8 бит (Q8_0).
+- **[tirex2001/Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Qwen3.8-Flash-Next-DACAN)**: исходная модель в
+  тех же форматах.
+- Кванты GSQ-RCO (2-3.5 бита) от [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) и
   [UkisAI](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) ставит установщик.
+
+Словарь черновиков (слова, которые движок угадывает наперёд) выбирает установщик: по умолчанию кириллический — для
+чата на русском; английский и французский тоже есть (`--draft-vocab en` / `fr`).
 
 ## Документы
 
-Руководство Strata (установка, ключи, API, картинки, неполадки) — в [docs/](docs/), главное —
-[docs/DETAILS.md](docs/DETAILS.md).
+[docs/](docs/) (на английском): [DETAILS](docs/DETAILS.md) (флаги, API, картинки, как устроен движок),
+[MULTI_GPU](docs/MULTI_GPU.md) и [SECOND_GPU](docs/SECOND_GPU.md) (две карты), [BATCHING](docs/BATCHING.md) (несколько
+запросов сразу), [UNSLOTH_Q4](docs/UNSLOTH_Q4.md), [MCP_SERVER](docs/MCP_SERVER.md) (DACAN как инструмент для
+ИИ-ассистентов), [TROUBLESHOOTING](docs/TROUBLESHOOTING.md). Вопросы и проблемы:
+[issues](https://github.com/tirex999/DACAN/issues).
 
-## Благодарности и лицензии
+## Лицензии
 
-[Strata](https://github.com/Niko1221/Strata) от Niko1221 и её участников (MIT, [LICENSE](LICENSE)) — основа движка,
-установщик и сервер. [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT). У весов свои лицензии: Qwen
-Community License 1.0 у Qwen3.8-Flash-Next, NVIDIA Open Model License у экспертов NVFP4 от NVIDIA, Swift Open License
-v1.0 у Swift 1.5.
+Установщик и сервер: MIT ([LICENSE](LICENSE)). [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT) внутри
+движка и кодировщика картинок. У весов свои лицензии: Qwen Community License 1.0 у Qwen3.8-Flash-Next, NVIDIA Open
+Model License у NVFP4-экспертов NVIDIA, Swift Open License v1.0 у Swift 1.5.
 
 ---
 
 ## Поддержать проект
 
-Всё, что здесь лежит, — движок, кванты, замеры — мы делаем и выкладываем бесплатно. Если это помогло вам запустить
-модель на своём железе, можно поблагодарить донатом.
+Всё здесь — движок, кванты, замеры — сделано и выложено бесплатно. Если это помогло вам запустить модель на своём
+железе, можно сказать спасибо донатом.
 
 | | адрес | QR |
 |---|---|---|
-| **ЮMoney** (рубли: кошелёк ЮMoney или карта любого банка) | `4100119356331418` · [перевести](https://yoomoney.ru/to/4100119356331418) | <img src="docs/donate/yoomoney.svg" width="130" alt="QR ЮMoney"> |
+| **ЮMoney** (рубли: кошелёк ЮMoney или любая банковская карта) | `4100119356331418` · [перевести](https://yoomoney.ru/to/4100119356331418) | <img src="docs/donate/yoomoney.svg" width="130" alt="QR ЮMoney"> |
 | **USDT** (TRC-20, сеть Tron) | `TBvoJHi7uyonSpvdH9Y6RAAXGWYVR2jeqw` | <img src="docs/donate/usdt-trc20.svg" width="130" alt="QR USDT TRC-20"> |
 | **Ethereum** (ETH и токены сети Ethereum, ERC-20) | `0x66CA7c683fbaF030b2300c918A3751209eA30dEa` | <img src="docs/donate/eth.svg" width="130" alt="QR Ethereum"> |
 
 > ⚠️ **Сеть важна.** На адрес Tron отправляйте только активы сети Tron (USDT TRC-20, TRX), на адрес Ethereum — только
-> активы сети Ethereum. Отправленное не в той сети пропадёт.
+> активы сети Ethereum. Отправленное не в той сети теряется.
 
 Спасибо! 🙏

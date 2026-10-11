@@ -1,4 +1,4 @@
-"""serve/winjob.py - on Windows, tie the processes Strata starts to the server's own lifetime.
+"""serve/winjob.py - on Windows, tie the processes DACAN starts to the server's own lifetime.
 
 Closing the console window, Task Manager or a crash end the server without running its cleanup, and the engine,
 the vision encoder and the MCP servers kept running on their own. `contain(proc)` puts a child in a job object that

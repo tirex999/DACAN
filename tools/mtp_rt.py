@@ -1,9 +1,9 @@
 """tools/mtp_rt.py - plan v0.3 P6: the MTP draft layer's runtime files, from the packed MTP GGUF.
 
-    python tools/mtp_rt.py --gguf <Strata>/mtp-bf16/mtp-q2_0.gguf --out <Strata>/mtp-bf16/rt
+    python tools/mtp_rt.py --gguf <DACAN>/mtp-bf16/mtp-q2_0.gguf --out <DACAN>/mtp-bf16/rt
 
 Writes
-  experts.bin   512 routed experts in the engine's blob layout (`include/strata/kernels/cpu/expert.hpp`): gate/up
+  experts.bin   512 routed experts in the engine's blob layout (`include/dacan/kernels/cpu/expert.hpp`): gate/up
                 rows interleaved (2r = gate r, 2r+1 = up r), then down rows; the Q2_0 codes in one plane and the fp16
                 scales in another.  A lossless relayout of the GGUF's Q2_0 blocks (same bytes, `cpu_expert_fixture.py`).
   dense.bin     every other tensor: the large projections quantized to Q8_0 (ggml's reference rounding) so the

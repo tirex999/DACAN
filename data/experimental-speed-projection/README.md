@@ -4,7 +4,7 @@
 direction of 2,560 values per layer (`direction.1` .. `direction.47`, GGUF `controlvector` format). The JSON beside it
 is the configuration its authors selected and their scores.
 
-**What it does.** Turned on, Strata removes each direction from the residual stream after layers 4-44
+**What it does.** Turned on, DACAN removes each direction from the residual stream after layers 4-44
 (`h -= (h . v) v` on every hyper-connection stream), the same operation as llama.cpp's `--cvec-mode project` in the
 package's patches. The package's own documentation describes the vector as a **refusal-direction projection**: the
 model declines far fewer requests (it reports 1 of 50 vs 50 of 50 on its test set), and removing refusals removes a

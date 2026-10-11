@@ -1,4 +1,4 @@
-# Strata on two or more GPUs (layer split)
+# DACAN on two or more GPUs (layer split)
 
 One model can run across several NVIDIA cards in one PC. The layers are split into contiguous ranges, one per GPU:
 the first card runs layers 0 to K-1, the next card runs K onward, and so on; the last card also runs the output head
@@ -14,12 +14,12 @@ is every card's share and skips those probes; there is no per-card setting yet.
 ## Using it
 
 **Nothing to type.** `START-HERE.bat` (Linux: `./setup.sh`) lists your NVIDIA cards and says for each one whether
-Strata can use it:
+DACAN can use it:
 
 ```
   Your NVIDIA GPUs:
     GPU 0: NVIDIA GeForce RTX 5080, 16 GB VRAM - can be used
-    GPU 1: NVIDIA GeForce GTX 1080 Ti, 11 GB VRAM - not supported - older than the RTX 20 series (compute capability 6.1; Strata needs 7.5 or newer)
+    GPU 1: NVIDIA GeForce GTX 1080 Ti, 11 GB VRAM - not supported - older than the RTX 20 series (compute capability 6.1; DACAN needs 7.5 or newer)
     GPU 2: NVIDIA GeForce RTX 3090, 24 GB VRAM - can be used
   ...
   1) GPU 0 (NVIDIA GeForce RTX 5080, 16 GB) + GPU 2 (NVIDIA GeForce RTX 3090, 24 GB) together   (recommended)
@@ -53,7 +53,7 @@ now on; the answer is kept.
 - Intel GPUs, and a mix of NVIDIA and AMD cards. (AMD cards share a model among themselves: `./setup.sh --backend
   hip --gpus 1,0`, see [AMD_HIP.md](AMD_HIP.md).)
 
-Or edit an existing config (`strata-*.json`), then restart:
+Or edit an existing config (`dacan-*.json`), then restart:
 
 ```json
 "gpu": [0, 2],
@@ -77,12 +77,12 @@ stays. On an R9700 32 GB + RX 9070 XT the R9700 holds all of the Coder's experts
 refilled after every request; on cards that hold nearly all their experts that cost short prompts up to a third of
 their speed. 0.1.32 refills all cards at once, uses a smaller streaming ring on a split, and lets a card with free
 VRAM keep its own prompt buffers - the same output as 0.1.31, measured on an R9700 + RX 9070 XT: 2K prompts 993 ->
-1,265 tok/s, 16K 1,852 -> 1,950, decode unchanged. `STRATA_SPLIT_OWN=1` (opt-in) gives every card its own buffers:
+1,265 tok/s, 16K 1,852 -> 1,950, decode unchanged. `DACAN_SPLIT_OWN=1` (opt-in) gives every card its own buffers:
 2K 1,450 and 16K 2,227 tok/s there, but a full card then keeps a different set of experts resident, so the output
-differs from the default's (stable and coherent); `STRATA_SPLIT_OWN=auto` does that only where the buffers are at
+differs from the default's (stable and coherent); `DACAN_SPLIT_OWN=auto` does that only where the buffers are at
 most 12% of each card's VRAM.
 
-**The idle card can help one-chunk prompts (opt-in, `STRATA_PREFILL_HELP=1`).** A prompt that fits one chunk runs the stages one after the other, so while
+**The idle card can help one-chunk prompts (opt-in, `DACAN_PREFILL_HELP=1`).** A prompt that fits one chunk runs the stages one after the other, so while
 one card reads its layers the other idles. With it on, each stage hands a share of its streamed experts to the idle card: it
 streams them over its own PCIe link into its own (lent) prompt buffers, computes their rows on the MMQ path and sends
 them back - `--peer-device`'s peer streaming, without P2P (the activations and the rows go through mapped host memory,
@@ -93,21 +93,21 @@ overlap anyway and no share paid. Measured on 2x RTX 3090 (UD-Q4_K_XL, no P2P), 
 costs no VRAM (the idle card's own prompt buffers) and ~110 KB of mapped host memory per token of the largest chunk it
 helped (~360 MB at 3.3K tokens). The rows it computes round like a different MMQ grouping, so the output is not
 bit-identical to the default's (it is repeatable: same prompt, same output), which is why it is **opt-in**:
-`STRATA_PREFILL_HELP=1` turns it on. Native packs on the MMQ prompt path only (not with the fused prompt kernels,
-`STRATA_PF_FUSED=1`, nor with `--peer-device`). With it on, `STRATA_PREFILL_HELP_FRAC=f` fixes the share.
+`DACAN_PREFILL_HELP=1` turns it on. Native packs on the MMQ prompt path only (not with the fused prompt kernels,
+`DACAN_PF_FUSED=1`, nor with `--peer-device`). With it on, `DACAN_PREFILL_HELP_FRAC=f` fixes the share.
 
 The engine flags behind it: `--layer-split K1[,K2..]|auto` and `--split-device D1[,D2..]` (the later stages'
 devices; default the next visible ones). `--layer-split K --split-device 0` runs both stages on one card sharing
 everything - the bit-exact check of the hand-off, not a speed mode.
 
-**The draft layer's prompt K/V in batches on a split (opt-in, `STRATA_SPLIT_MTP_BATCH=1`).** With `--mtp` the draft
+**The draft layer's prompt K/V in batches on a split (opt-in, `DACAN_SPLIT_MTP_BATCH=1`).** With `--mtp` the draft
 layer sits on the last card, and each prompt chunk ends by filling that layer's K/V for the chunk's rows. On one card the
 prompt path does it in batches (`Prefill::draft_kv`, a few large matrix products per chunk); on a split the drafter's own
 pass always did it, one graph launch and four device copies per group of 8 rows (1,024 groups per 8,192-token chunk).
 With the variable set, the last card's prompt path batches it as it does on one card. Restart-only; default off, so the
 default start is unchanged. It needs a `--native` pack (the GGUF-form token table) and a paged or ring (`--kv-resident`)
-draft K/V (`STRATA_MTP_BATCH_RING=0` sends a ring back to the old pass); otherwise it says why once and keeps the old pass:
-`strata serve: draft layer prompt K/V batched on CUDA<d> ...` or `strata serve: STRATA_SPLIT_MTP_BATCH=1 declined, the
+draft K/V (`DACAN_MTP_BATCH_RING=0` sends a ring back to the old pass); otherwise it says why once and keeps the old pass:
+`dacan serve: draft layer prompt K/V batched on CUDA<d> ...` or `dacan serve: DACAN_SPLIT_MTP_BATCH=1 declined, the
 drafter's own pass runs: <reason>`. The draft layer's K/V come out of Q8_1 x Q8_0 MMQ instead of its own mmvq, so the
 drafts, and how many are accepted, can move; the target's tokens are decided by the verify window.
 `tools/split_mtp_batch_parity.py` compares the greedy texts of the two arms. Measured on one machine (2x RTX 3080 20 GB
@@ -125,7 +125,7 @@ twice moved up to 4.7%, so two restarts per arm can neither confirm nor exclude 
 **Each card loads only its own layers' dense weights** (0.1.39, PR #639) with explicit split points (`--layer-split
 27`, not `auto`): every card used to keep a full copy (~3.4 GB for the Coder) though its stage reads only its own
 layers, and the VRAM it frees goes to that card's expert cache (2x MI50 16 GB, Coder: 8,819 -> 10,626 experts in
-VRAM, decode 39.2 -> 41.7 tok/s). Opt-in for now, on AMD and NVIDIA alike: `STRATA_STAGE_TRIM=1` (please report how
+VRAM, decode 39.2 -> 41.7 tok/s). Opt-in for now, on AMD and NVIDIA alike: `DACAN_STAGE_TRIM=1` (please report how
 it goes).
 A card holding more experts can change which experts run on the GPU, so the output can differ slightly from a run
 without it.
@@ -150,25 +150,25 @@ The split with `--mmap-experts` catches up once the OS file cache holds the expe
 running; the resident copy is there from the first request and stays locked when other programs need the RAM. With
 `--pcie-frac 0 --adapt-every 0` the split's greedy output is the same with either mode.
 
-**The prompt path's loan on a split and its streamed ring (`STRATA_SPLIT_RING`).** Under a split the prompt path borrows
+**The prompt path's loan on a split and its streamed ring (`DACAN_SPLIT_RING`).** Under a split the prompt path borrows
 the tail slots of each card's expert cache for its buffers (they are given back after the prompt), and the resident RAM
 copy keeps those experts too, so a borrowed expert is not read back from the model file during a prompt. How many slots
 are borrowed depends on the prompt path's streamed ring: a split uses 96 ring slots when at least 75% of the (layer,
-expert) pairs sit in some card's cache, and `STRATA_SPLIT_RING=N` sets N slots (`0` goes back to the pinned-share rule).
+expert) pairs sit in some card's cache, and `DACAN_SPLIT_RING=N` sets N slots (`0` goes back to the pinned-share rule).
 The ring used to be chosen after the RAM copy's regions were sized, so the regions were sized for a different ring than
-the prompt path then used: with `STRATA_SPLIT_RING=384` it borrowed 5,396 slots and the copy kept 4,662, and the
+the prompt path then used: with `DACAN_SPLIT_RING=384` it borrowed 5,396 slots and the copy kept 4,662, and the
 other 734 were read from the model file in every chunk. The ring is now chosen first (`Prefill::set_ring_override`
-says it must be set before the buffers are counted). The start-up line `strata serve: lend sizing: the prompt path
+says it must be set before the buffers are counted). The start-up line `dacan serve: lend sizing: the prompt path
 borrows N slots (ring R slots at chunk C), K of them keep their experts in RAM too` shows both numbers, and a
 `WARNING` follows when K is below N. Without a split, or without `--resident-experts`, nothing changes. With a split
 the order of the two steps changed for every ring choice, the 96-slot rule included: its regions used to be sized for
 the larger default ring, so there the copy probably kept more slots than were borrowed (not measured). The 5,396 /
 4,662 figures were measured on the test machine (2x RTX 3080 20 GB at 220 W, Xeon E5-2696 v4, UD-Q4_K_XL,
-`--layer-split 23`, resident RAM mode, `--prefill auto:16384`, 2 slots), one restart per arm, with `STRATA_SPLIT_RING=384`
-and `STRATA_PREFILL_RING` unset. Before the change a 104K-token prompt made 413 blob reads and read 10.3 GB of experts
+`--layer-split 23`, resident RAM mode, `--prefill auto:16384`, 2 slots), one restart per arm, with `DACAN_SPLIT_RING=384`
+and `DACAN_PREFILL_RING` unset. Before the change a 104K-token prompt made 413 blob reads and read 10.3 GB of experts
 from the model file per request; after it, 0, with all 5,396 borrowed slots kept in RAM, for 2.15 GiB more pinned RAM
 (13.61 -> 15.76 GiB). 25K and 51K prompts read nothing from the file in either case. With the override unset and
-`STRATA_PREFILL_RING=384` the lend lines are identical before and after (5,396 / 5,396, 15.76 GiB). No speed gain is
+`DACAN_PREFILL_RING=384` the lend lines are identical before and after (5,396 / 5,396, 15.76 GiB). No speed gain is
 shown: the medians of three 104K reads were 2,803 tok/s before and 2,907 after, but the spread before is 2,540-2,897
 (its first read faulted 4.2 GB in from NVMe) and there is no A/A restart. Here the page cache absorbed the 10 GB per
 request; with less spare page cache it would be disk traffic. Not measured: both ring variables unset.
@@ -182,8 +182,8 @@ keeps the one whose caches would hold the most of the expert profile, hottest pa
 placement that leaves the fullest card the most room. The startup log prints the choice:
 
 ```
-strata generate: layer split auto: K=19 - the caches hold 11767 of 12288 profiled pairs (fullest device 100%)
-strata serve: layer split: layers 0-18 (CUDA0), 19-47 (CUDA1), one hand-off per window
+dacan generate: layer split auto: K=19 - the caches hold 11767 of 12288 profiled pairs (fullest device 100%)
+dacan serve: layer split: layers 0-18 (CUDA0), 19-47 (CUDA1), one hand-off per window
 ```
 
 ## What each card holds
@@ -217,7 +217,7 @@ into the card that owns the layer.
 - Under WDDM (Windows, and WSL2) only 8 GiB of the expert arena is pinned (more, mapped into two GPU contexts,
   leaves WDDM refusing allocations); the rest streams through the pinned staging ring. A Linux driver has no such
   limit, so there the whole arena is pinned (since 0.1.31; the cap cost a 4090 + 3060 split two thirds of its
-  prompt speed, #253). `STRATA_ARENA_PIN_GIB=N` pins at most N GiB, `0` the whole arena, on any OS.
+  prompt speed, #253). `DACAN_ARENA_PIN_GIB=N` pins at most N GiB, `0` the whole arena, on any OS.
 - Every card needs compute capability 7.5 (RTX 20 or newer). The pre-sm_80 QSA scorer path is fp32 FMAs, so a
   Turing card runs the same kernels instead of the tensor-core prompt attention.
 
@@ -270,7 +270,7 @@ and the asynchronous tier stay two-stage. In the config:
   of the first card's recurrent state (about 3 MiB per GDN layer it runs) on the first card with `2` (on every front
   card with three or more stages; only the first card's room is kept out of its cache, the others allocate theirs after).
 - **Same text**: the last card only ever runs windows that are verified, and every window row computes what it
-  would in any other window, so the tokens are the serial loop's. With `STRATA_IQ_MT_MIN=1 --pcie-frac 0
+  would in any other window, so the tokens are the serial loop's. With `DACAN_IQ_MT_MIN=1 --pcie-frac 0
   --adapt-every 0` the greedy output is identical bit for bit to the serial loop's with the same expert caches. The pipeline keeps
   its VRAM out of the caches, so against a run without the flag a few experts move from a card to the CPU, which
   rounds them differently, and a near-tie can flip (a serial run given the same caches through `--vram-reserve-mib`
@@ -292,15 +292,15 @@ and the asynchronous tier stay two-stage. In the config:
 - **Measured on four stages** (Flash-Next GSQ-RCO IQ3_S, 262K context, int8 KV, layer split 12,24,36 on 4x RX 7900 XT,
   every expert in VRAM; greedy, reasoning off, 256 tokens, repository-text prompts): decode 59.4 -> 67.6 tok/s at 4K
   (median of 3) and 51.8 -> 65.6 at 32K. A guessed window that holds costs ~15 ms against ~43 ms for a fresh one; about
-  a third of the guesses held. The greedy text was identical to the serial loop's on all four prompts (`STRATA_IQ_MT_MIN=1
-  --pcie-frac 0 --adapt-every 0`), and with every guess forced wrong (`STRATA_PIPELINE_FORCE_MISS=1`).
+  a third of the guesses held. The greedy text was identical to the serial loop's on all four prompts (`DACAN_IQ_MT_MIN=1
+  --pcie-frac 0 --adapt-every 0`), and with every guess forced wrong (`DACAN_PIPELINE_FORCE_MISS=1`).
 - **HIP**: the draft layer's per-row `gr_read` used the last stage's session scratch (`ss.block.gr`), which that stage's
   verifier also uses; a chain launched at a verdict and the next window's last stage then ran on the card at once and
   the window's head read a clobbered mix (wrong tokens after a guess that held). The draft layer now has its own scratch.
 
-The `STRATA_PIPELINE_*` tuning and test variables (THETA, FORCE_MISS, SWITCH, LOG, TRACE, SPEC_DEPTH and the like) are read only with
-`STRATA_PIPELINE_DEBUG=1`. `--pipeline-windows` and `--adapt-async 1` combine: the engine turns the asynchronous tier
-off beside `--pipeline-windows 2` only when `STRATA_PIPELINE_ADAPT_ASYNC=0` is set. What switches either one off is
+The `DACAN_PIPELINE_*` tuning and test variables (THETA, FORCE_MISS, SWITCH, LOG, TRACE, SPEC_DEPTH and the like) are read only with
+`DACAN_PIPELINE_DEBUG=1`. `--pipeline-windows` and `--adapt-async 1` combine: the engine turns the asynchronous tier
+off beside `--pipeline-windows 2` only when `DACAN_PIPELINE_ADAPT_ASYNC=0` is set. What switches either one off is
 printed once at start ("is off: ..."). `--remote-expert-opt` does something only with a helper cache
 (`--expert-cache-device1..3`); on a plain layer split it is inert, and setup no longer writes it there (#1447).
 
@@ -315,13 +315,13 @@ noted (reported by adambenhassen, #1447; not repeated on our boxes):
 | setup defaults (two runs) | 137.0 / 136.9 | 1798 |
 | `--adapt-async 1` (two runs) | 145.2 / 143.7 | 1800 / 1797 |
 | `--adapt-async 1`, no `--remote-expert-opt` | 145.0 | 1807 |
-| `STRATA_ADAPT_LAG=2` | 142.8 | 1800 |
-| `STRATA_EXCHANGE_ROTATE=1` | 139.6 | 1800 |
-| `STRATA_PF_FUSED=1` | 137.2 | 1913 |
+| `DACAN_ADAPT_LAG=2` | 142.8 | 1800 |
+| `DACAN_EXCHANGE_ROTATE=1` | 139.6 | 1800 |
+| `DACAN_PF_FUSED=1` | 137.2 | 1913 |
 | `--pipeline-windows 2` | 136.7 | 2097 |
-| `STRATA_SPEC_COUPLED=1` | 137.6 | 1804 |
-| `STRATA_SPEC_PROB=1` | 137.2 | 1788 |
-| `STRATA_SPEC_COUPLED=1` + `STRATA_SPEC_GUMBEL=1` | 136.5 | 1805 |
+| `DACAN_SPEC_COUPLED=1` | 137.6 | 1804 |
+| `DACAN_SPEC_PROB=1` | 137.2 | 1788 |
+| `DACAN_SPEC_COUPLED=1` + `DACAN_SPEC_GUMBEL=1` | 136.5 | 1805 |
 | async + lag 2 + rotate + pf_fused | 145.0 | 1829 |
 | pw2 + lag 2 + rotate + pf_fused | 135.9 | 2296 |
 | pw2 + async + lag 2 + rotate + pf_fused | 142.0 | 2302 |

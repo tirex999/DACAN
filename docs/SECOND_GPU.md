@@ -35,7 +35,7 @@ compute capacity.
 The experiment requires the corresponding visible CUDA devices and a CUDA
 enabled build. Each card must keep at least 512 MiB free. Tiers must be enabled
 in order. Under WDDM (Windows, WSL2), CUDA registration of the host expert arena is capped at
-8 GiB to leave room for the contexts and MTP on CUDA0 (`STRATA_ARENA_PIN_GIB` overrides it; on Linux the whole
+8 GiB to leave room for the contexts and MTP on CUDA0 (`DACAN_ARENA_PIN_GIB` overrides it; on Linux the whole
 arena is registered). The rest remains
 available to the CPU pool; the PCIe expert path is available only for the
 registered layers. Without secondary GPUs, the original uncapped registration
@@ -56,7 +56,7 @@ On Windows, from PowerShell in the installation folder:
 To test the layer placement instead, add `--gpu-placement layer` to the setup
 command. To go back, run the same command with `--gpu-placement stripe`. After
 the new engine is built, the mode can also be changed without a rebuild: edit
-`--expert-cache-remote-placement` in `strata-iq3_xxs.json` from `layer` to
+`--expert-cache-remote-placement` in `dacan-iq3_xxs.json` from `layer` to
 `stripe` or vice versa and restart the server. If the argument is absent, the
 default is `stripe`.
 
@@ -65,7 +65,7 @@ installation when prompted. Setup recompiles the engine, updates its server
 configuration, and starts it. Later starts keep those settings. To tune the
 slots without recompiling, edit the values after `--expert-cache-device1`,
 `--expert-cache-device2` and `--expert-cache-device3` in the stored
-`strata-iq3_xxs.json`, then restart with `.\run-iq3_xxs.bat`.
+`dacan-iq3_xxs.json`, then restart with `.\run-iq3_xxs.bat`.
 
 Compare identical requests at one, two and four GPUs, preferably with several
 repeats. VRAM use alone does not show useful offload: compare the per-request
@@ -91,7 +91,7 @@ above. The engine's default is off; since 0.1.39b setup adds it to a config on
 two or more GPUs (`--gpus`, or "use both" at start). It acts only when a helper
 cache is configured; a layer split runs exactly as before. To leave it out:
 setup's `--no-remote-expert-opt`, or `"remote_expert_opt": false` in the
-model's `strata-*.json` (kept when setup runs again). Measured by the PR's
+model's `dacan-*.json` (kept when setup runs again). Measured by the PR's
 author: dual RTX 4090 +63% mixed / +132% code decode over the plain helper
 path; RTX 5090 + 4090 +28% / +63%. The primary cache avoids admitting experts already held
 by a helper, and helpers replace cold experts with frequently routed CPU
@@ -157,8 +157,8 @@ the device must be visible; it refuses otherwise. It also refuses
 `--layer-split` (a different second-GPU mode: use one or the other) and
 `--expert-cache-device1..3` (the peer tier already caches experts on that card):
 
-    strata generate: --peer-device cannot be combined with --layer-split (use one or the other)
-    strata generate: --peer-device cannot be combined with --expert-cache-device1..3 (the peer tier already caches experts there)
+    dacan generate: --peer-device cannot be combined with --layer-split (use one or the other)
+    dacan generate: --peer-device cannot be combined with --expert-cache-device1..3 (the peer tier already caches experts there)
 
 Without `--peer-device` the binary is unchanged; its output is byte-identical
 to the release. With `--peer-device` and the same expert set split across the
