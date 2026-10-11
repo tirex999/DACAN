@@ -26,6 +26,41 @@ for Windows x64 and Linux x64). Its source is not published; the installer and t
   newer, ...).
 - **A CPU with AVX2.** RAM depends on the model: the installer says what fits and offers only that.
 
+## How much VRAM
+
+What a card needs depends on the model's quant. The numbers below are for **one card** with the draft layer
+on (the installer's default Cyrillic subset), context 32K and an 8-bit KV cache. DACAN first places the model's always-used part
+on the card; whatever VRAM is left becomes the **expert cache** (the experts kept on the card; the rest are read from
+the PC's RAM).
+
+| Free VRAM on the card | Swift 1.5 **IQ3_XXS** (GSQ-RCO, 3 bit) | Swift 1.5 **NVFP4 + Q8** (DACAN) |
+|---|---|---|
+| needed before the expert cache | **5.43 GiB** | **6.78 GiB** |
+| 6 GB card | does not start (803 MiB short) | does not fit |
+| 8 GB card | starts: 831 experts on the card (1.37 GiB) | does not start (211 MiB short) |
+| 12 GB card | 3,140 experts on the card (5.12 GiB) | 1,445 experts on the card (3.72 GiB) |
+| 16 GB card | not measured (more than at 12 GB) | 2,902 experts on the card (7.47 GiB) |
+
+**The minimum:** IQ3_XXS from an **8 GB** card, NVFP4 + Q8 from a **12 GB** card.
+
+- Of IQ3_XXS's 5.43 GiB: the dense weights 3.17 GiB, the draft layer 0.82 GiB, a 32K session with its KV cache
+  0.56 GiB, the rest CUDA's own buffers.
+- These are **free** gigabytes. A card that also drives the monitor gives 0.3-1 GB to the desktop: count without
+  that, or plug the monitor into another card / the integrated graphics.
+- Without the draft layer the engine needs about 0.8 GiB less (IQ3_XXS 4.61 GiB, NVFP4 + Q8 5.95 GiB): then IQ3_XXS
+  started on a 6 GB card (327 experts on the card) and NVFP4 + Q8 on an 8 GB card (369). The installer always sets
+  the draft layer up, so these two are for reference.
+- If the start stops with "the draft head does not fit" or "no VRAM is left for the expert cache", the installer's
+  tips may help: `--draft-vocab en` (a smaller draft head, ~60 MiB less) and a shorter context (a smaller KV
+  cache).
+- The 2-bit quants (Q2_0, IQ2_XS) and IQ3_S have not been measured yet.
+- RAM is a separate matter: the experts that are not on the card are in RAM; the installer checks it.
+
+How it was measured (11.10.2026): one RTX 2080 Ti 22 GB on Linux, the DACAN 0.1.42 engine from the release with its
+server; the rest of the card was held by another process so that 5.59 / 7.59 / 11.34 / 15.09 GiB stayed free, as on
+6 / 8 / 12 / 16 GB cards without a monitor. "Does not start" means the engine stopped with an out-of-memory error at
+the start; the number of experts on the card is what the engine reported after the start.
+
 ## Install
 
 **Windows**
