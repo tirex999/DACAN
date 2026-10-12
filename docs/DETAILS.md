@@ -110,6 +110,8 @@ as well (#410): the PCIe share of the missed experts (computed on the GPU instea
 answer after a start differ from the next ones. Measured here (IQ3_XXS, a 3.6K-token prompt, 4 repeats): with all
 three switches 1 answer of 4, without `--pcie-frac 0` 2 of 4 (the first one differs), with the defaults 2 of 4.
 `--pcie-frac 0` costs decode speed (the missed experts all run on the CPU), so keep it for A/B runs.
+An 8-bit (Q8_0) model on two cards is the exception: there it is the faster setting (README, "Two cards and 8-bit
+models").
 
 **Coupled drafts with Gumbel-max picks (opt-in, `DACAN_SPEC_COUPLED=1` and `DACAN_SPEC_GUMBEL=1`):** for a request
 that samples (temperature above 0), `DACAN_SPEC_COUPLED=1` lets the draft layer sample its guesses with the target's own

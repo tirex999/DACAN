@@ -113,6 +113,23 @@ How the next word is chosen. The defaults are the model's recommended settings, 
   with the most likely word every time more of the guesses are kept. Sampling (temperature above 0) keeps fewer of
   them.
 
+## Two cards and 8-bit models
+
+With an 8-bit model (Q8_0) on **two cards**, add `"--pcie-frac", "0"` to the `"args"` of the model's config
+`dacan-<model>.json` next to `setup.py`, then restart the model.
+
+Measured on 12.10.2026: 2x RTX 2080 Ti 22 GB, 2x Xeon Platinum 8368, the DACAN 0.1.42 engine, Swift 1.5 Q8_0.
+
+| | code | Russian | English |
+|---|---|---|---|
+| `--pcie-frac 0` | **72.4 tok/s** | **58.6 tok/s** | **54.9 tok/s** |
+| without it, `--peer-device 1` | 21.3 tok/s | 20.8 tok/s | 19.6 tok/s |
+| without it, the default two-card split | 26.3 tok/s on a 25,132-token code answer (temperature 0.6) | | |
+
+The first two rows: the same three requests, temperature 0, 1,024-token answers.
+
+The other quants were measured with the defaults.
+
 ## Weights
 
 - **[tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN)**:
