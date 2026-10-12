@@ -115,8 +115,9 @@ How the next word is chosen. The defaults are the model's recommended settings, 
 
 ## Two cards and 8-bit models
 
-With an 8-bit model (Q8_0) on **two cards**, add `"--pcie-frac", "0"` to the `"args"` of the model's config
-`dacan-<model>.json` next to `setup.py`, then restart the model.
+With an 8-bit model (Q8_0) on **two cards**: the Linux engine of DACAN build 4 (12.10.2026, `./update.sh`) sets this
+by itself. On Windows, until its engine is updated too, add `"--pcie-frac", "0"` to the `"args"` of the model's
+config `dacan-<model>.json` next to `setup.py`, then restart the model.
 
 Measured on 12.10.2026: 2x RTX 2080 Ti 22 GB, 2x Xeon Platinum 8368, the DACAN 0.1.42 engine, Swift 1.5 Q8_0.
 

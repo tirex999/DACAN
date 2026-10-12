@@ -191,9 +191,10 @@ MIN_DRIVER = 580                       # CUDA 13.0
 CUDA13_MIN_ARCH = 75                   # the oldest compute capability CUDA 13 compiles for (sm_75, RTX 20)
 CUDA12_ASSET = "dacan-windows-x64-cuda12.zip" if WIN else "dacan-linux-x64-cuda12.zip"
 DACAN_ASSETS = ("dacan-windows-x64.zip", "dacan-linux-x64.zip")   # DACAN's own ready-made engines
-DACAN_BUILD = 3       # BUILD.json "dacan" of the current DACAN engine; a lower one (true = 1) is replaced
+DACAN_BUILD = 3 if WIN else 4   # BUILD.json "dacan" of the current DACAN engine; a lower one (true = 1) is replaced
                       # 2: scaled (NVFP4) packs load on Windows
                       # 3: the engine named dacan / dacan-vision, the Linux x64 engine
+                      # 4 (Linux so far): on two cards the engine sets its own PCIe share per card
 DACAN_NO_SOURCE = ("DACAN ships its engine ready-made: this folder has no engine source to compile",
                    "run UPDATE.bat (Windows) or ./update.sh (Linux) with internet: the engine comes from "
                    "https://github.com/tirex999/DACAN/releases (NVIDIA RTX 20 and newer, driver 580+)")
