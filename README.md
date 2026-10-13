@@ -119,7 +119,7 @@ With an 8-bit model (Q8_0) on **two cards**: the DACAN engine of build 4 (Linux 
 `./update.sh` or `UPDATE.bat` installs it) sets this by itself. With an older engine add `"--pcie-frac", "0"` to the
 `"args"` of the model's config `dacan-<model>.json` next to `setup.py`, then restart the model.
 
-Measured on 12.10.2026: 2x RTX 2080 Ti 22 GB, 2x Xeon Platinum 8368, the DACAN 0.1.42 engine, Swift 1.5 Q8_0.
+Measured on 12.10.2026: 2x RTX 2080 Ti 22 GB, 2x Xeon Ice Lake-SP with 32 cores each (engineering samples), the DACAN 0.1.42 engine, Swift 1.5 Q8_0.
 
 | | code | Russian | English |
 |---|---|---|---|
