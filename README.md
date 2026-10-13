@@ -132,6 +132,26 @@ The first three rows: the same three requests, temperature 0, 1,024-token answer
 
 The other quants were measured with the defaults.
 
+## Two cards: reading and answering with the NVFP4 + Q8 model
+
+Measured on 13.10.2026: 2x RTX 2080 Ti 22 GB, 2x Xeon Ice Lake-SP with 32 cores each (engineering samples), the DACAN
+engine of build 4 on both cards (layer split), Swift 1.5 in NVFP4 + Q8 (DACAN), `--max-context 524288`, vision on.
+A Windows VM was working on the same machine at the time.
+
+| prompt, new tokens | read, tok/s |
+|---|---|
+| 3,111 | 629 – 646 |
+| 11,156 | 1,016 – 1,025 |
+| 22,232 | 1,429 – 1,436 |
+| 39,056 | 1,560 |
+| 289,985 (a live conversation) | 1,398 |
+
+The answer (the same three requests as above, temperature 0, 1,024-token answers): code 77.8 – 78.5 tok/s,
+Russian 66.5 – 67.6 tok/s, English 64.5 – 66.4 tok/s. The engine's container with 72 of the machine's 128 CPU threads
+gives the same figures as with all 128.
+
+The Monitor tab shows the read speed while a prompt is read: `Reading prompt · 58% · 1,448 tok/s`.
+
 ## Weights
 
 - **[tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN)**:

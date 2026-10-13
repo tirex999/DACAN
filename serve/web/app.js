@@ -183,7 +183,10 @@ function render(m) {
   // the header pill
   if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
-    setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
+    // 13.10.2026 (DACAN): the read speed in the pill too; before the first chunk is read, how long it has been reading
+    const rate = live.prefill_tok_s_mean ? ` · ${fmt(live.prefill_tok_s_mean)} tok/s` : "";
+    setPill("reading", pct != null ? `Reading prompt · ${pct}%${rate}`
+                                   : `Reading prompt${live.elapsed_s != null ? ` · ${fmt(live.elapsed_s)} s` : ""}`);
   } else if (live.state === "generating") {
     setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
   } else {
@@ -248,9 +251,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     prog.dataset.tone = "info";
     if (live.prompt_total) {
       pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
+      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%` +
+               (live.prefill_tok_s_mean ? ` · ${fmt(live.prefill_tok_s_mean)} tok/s` : "");
     } else {
-      detail = `${fmt(live.prompt_tokens)} tokens`;
+      // the engine reports the read per chunk (8192 tokens): until the first one, the tokens and the time so far
+      detail = `${fmt(live.prompt_tokens)} tokens` + (live.elapsed_s != null ? ` · reading ${fmt(live.elapsed_s)} s` : "");
     }
   } else if (live.state === "generating") {
     label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
@@ -274,13 +279,15 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
             live.state === "generating" ? "Decode now" : lastDec ? `Decode last answer · ${fmt(lastDec.output_tokens)} tokens` : "Decode");
   // the prompt read of the last request that read enough fresh tokens to measure it: a few tokens take the engine's
   // fixed start-up time, not reading time
-  const MIN_PREFILL_TOKENS = 512;
+  // 13.10.2026 (DACAN): 512 -> 4096 — a follow-up that reads ~1300 new tokens spends ~5 s mostly on that start-up time
+  const MIN_PREFILL_TOKENS = 4096;
   const freshOf = (r) => Math.max(0, (r.prompt_tokens || 0) - (r.reused || 0));
   const lastRead = (requests || []).find((r) => r.prompt_ms > 0 && freshOf(r) >= MIN_PREFILL_TOKENS);
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
+  // 13.10.2026 (DACAN): the live figure only while reading; while generating it may be the previous read's
+  const prefill = live.state === "reading" ? live.prefill_tok_s_mean
                 : lastRead ? freshOf(lastRead) / (lastRead.prompt_ms / 1000) : null;
   setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
-            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request"
+            live.state === "reading" ? "Prefill now"
             : lastRead ? `Prefill last read · ${fmt(freshOf(lastRead))} new tokens` : "Prefill");
   spark("sp-speed", h.tok_s);
   spark("sp-prefill", h.prefill_tok_s_mean);
