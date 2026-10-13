@@ -1621,7 +1621,7 @@ Since 0.1.42, on CUDA with one GPU and no `--pcie-frac`, the share starts at the
 already times: the wall time of the CPU pool per missed expert. With `R` = expert bytes / that time (GB/s) and `L` = the probe's link speed, the share is
 `L / (L + 1.85 R)`, rounded to 0.05 and kept between 0.10 and 0.60; it is changed at most three times (after 48, 96 and 96 more windows, about 10 s of
 decoding), and only by a full step. Each change prints one `PCIe share:` line. A request that sets its own `pcie_frac` is left alone.
-**`--pcie-frac N` always wins; `DACAN_PCIE_FRAC_DEFAULT=old` keeps the 0.1.41 rule.** Not used with a layer split, `--batch`, a peer GPU, when every
+**`--pcie-frac N` always wins; `DACAN_PCIE_FRAC_DEFAULT=old` keeps the 0.1.41 rule.** DACAN build 4 uses it on a layer split too (two cards: each card by its own link, and the share may go down to 0). Not used with `--batch`, a peer GPU, when every
 expert is in VRAM, or on HIP and SYCL. The constant 1.85 is a fit to three machines, so it lands within a step of each machine's best, not on it.
 
 Measured (interleaved pairs of whole engine runs, new default against `DACAN_PCIE_FRAC_DEFAULT=old`, medians, route tail skip on):

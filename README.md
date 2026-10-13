@@ -115,19 +115,20 @@ How the next word is chosen. The defaults are the model's recommended settings, 
 
 ## Two cards and 8-bit models
 
-With an 8-bit model (Q8_0) on **two cards**: the Linux engine of DACAN build 4 (12.10.2026, `./update.sh`) sets this
-by itself. On Windows, until its engine is updated too, add `"--pcie-frac", "0"` to the `"args"` of the model's
-config `dacan-<model>.json` next to `setup.py`, then restart the model.
+With an 8-bit model (Q8_0) on **two cards**: the DACAN engine of build 4 (Linux 12.10.2026, Windows 13.10.2026;
+`./update.sh` or `UPDATE.bat` installs it) sets this by itself. With an older engine add `"--pcie-frac", "0"` to the
+`"args"` of the model's config `dacan-<model>.json` next to `setup.py`, then restart the model.
 
 Measured on 12.10.2026: 2x RTX 2080 Ti 22 GB, 2x Xeon Platinum 8368, the DACAN 0.1.42 engine, Swift 1.5 Q8_0.
 
 | | code | Russian | English |
 |---|---|---|---|
 | `--pcie-frac 0` | **72.4 tok/s** | **58.6 tok/s** | **54.9 tok/s** |
+| build 4, no flag (first / second request) | 59.3 / 65.6 tok/s | 56.7 / 58.5 tok/s | 53.9 / 56.0 tok/s |
 | without it, `--peer-device 1` | 21.3 tok/s | 20.8 tok/s | 19.6 tok/s |
 | without it, the default two-card split | 26.3 tok/s on a 25,132-token code answer (temperature 0.6) | | |
 
-The first two rows: the same three requests, temperature 0, 1,024-token answers.
+The first three rows: the same three requests, temperature 0, 1,024-token answers.
 
 The other quants were measured with the defaults.
 
