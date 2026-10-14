@@ -12,6 +12,13 @@ web chat.
 for Windows x64 and Linux x64). Its source is not published; the installer and the server are open (MIT,
 [LICENSE](LICENSE)).
 
+## Our own engine
+
+DACAN is our own engine. It started in September 2026 on the base of [Strata](https://github.com/Niko1221/Strata) (MIT)
+and has been developed separately since then, with its own kernels: NVFP4 + Q8 on RTX 20 (Turing) cards, one or two
+cards, one or two CPU sockets, a context up to 524K, vision and a live monitor. Strata's copyright notice is kept in
+[LICENSE](LICENSE), as MIT requires.
+
 ## What you need
 
 - **An NVIDIA card from the RTX 20 series up** (Turing, Ampere, Ada, Blackwell), **driver 580 or newer**:
