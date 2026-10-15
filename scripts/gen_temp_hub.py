@@ -32,10 +32,22 @@ page = u"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Температура выборки</title>
 <meta name="description" content="Один промт — пятнадцать температур от 0.1 до 1.5 на DACAN, 2x RTX 2080 Ti: файлы, снимки, цифры.">
+<script>try{var t=localStorage.getItem("dacan.theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
 <style>
+ /* theme: «Авто» follows the device; «День»/«Ночь» stamp data-theme on <html> (the same choice on every page of the site) */
  :root{--bg:#faf8f5;--fg:#241f1b;--mut:#6d635a;--line:#e2dbd2;--acc:#8a5a2b;--card:#fffdf9;
-   --cold:hsl(210 62%% 52%%);--hot:hsl(5 62%% 52%%)}
- @media (prefers-color-scheme:dark){:root{--bg:#17150f;--fg:#efe9e0;--mut:#a2988c;--line:#332e27;--acc:#d8a45f;--card:#1d1a14}}
+   --cold:hsl(210 62%% 52%%);--hot:hsl(5 62%% 52%%);color-scheme:light}
+ @media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#17150f;--fg:#efe9e0;--mut:#a2988c;--line:#332e27;
+   --acc:#d8a45f;--card:#1d1a14;color-scheme:dark}}
+ :root[data-theme=dark]{--bg:#17150f;--fg:#efe9e0;--mut:#a2988c;--line:#332e27;--acc:#d8a45f;--card:#1d1a14;color-scheme:dark}
+ .topline{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 16px}
+ .topline a.back{margin:0}
+ .theme{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--card)}
+ .theme button{font:600 12.5px/1 -apple-system,"Segoe UI",Roboto,sans-serif;color:var(--mut);background:none;border:0;
+   padding:7px 10px;cursor:pointer}
+ .theme button+button{border-left:1px solid var(--line)}
+ .theme button:hover{color:var(--fg)}
+ .theme button[aria-pressed=true]{background:var(--fg);color:var(--bg)}
  *{box-sizing:border-box}
  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 -apple-system,"Segoe UI",Roboto,sans-serif;padding:28px 20px 72px}
  .wrap{max-width:1100px;margin:0 auto}
@@ -59,7 +71,8 @@ page = u"""<!DOCTYPE html>
  .how{margin:34px 0 0;border:1px solid var(--line);border-radius:12px;padding:14px 18px;background:var(--card);max-width:80ch;font-size:14px;color:var(--mut)}
  .how b{color:var(--fg)}
 </style></head><body><div class="wrap">
-<a class="back" href="../index.html">← DACAN · главная</a>
+<div class="topline"><a class="back" href="../index.html">← DACAN · главная</a>
+<div class="theme" role="group" aria-label="Тема"><button type="button" data-t="auto">Авто</button><button type="button" data-t="light" title="День">☀</button><button type="button" data-t="dark" title="Ночь">☾</button></div></div>
 <h1>Один промт — пятнадцать <em>температур</em></h1>
 <div class="rail"></div><div class="ticks"><span>0.1 · точнее</span><span>0.8</span><span>1.5 · свободнее</span></div>
 <p class="sub">Температура решает, насколько свободно модель выбирает следующее слово: ближе к нулю — почти всегда самое
@@ -70,7 +83,20 @@ page = u"""<!DOCTYPE html>
 веб-чата: одно сообщение без системного промта, reasoning_effort high, top_p 0.95, top_k 20, температура задана явно,
 лимит ответа 65 536 токенов, по одному прогону на значение. Снимок — браузер 1280×860 через 4 с анимации. Скрипты:
 <a href="https://github.com/tirex999/DACAN/tree/gh-pages/scripts">scripts</a> (прогон, снимки, сборка страниц).</div>
-</div></body></html>
+</div>
+<script>
+(function(){ // theme: auto (device) / day / night, remembered for the whole site
+  var bs=document.querySelectorAll(".theme button");
+  function cur(){return document.documentElement.getAttribute("data-theme")||"auto";}
+  function show(){bs.forEach(function(b){b.setAttribute("aria-pressed",String(b.dataset.t===cur()));});}
+  bs.forEach(function(b){b.addEventListener("click",function(){
+    var t=b.dataset.t;
+    if(t==="auto")document.documentElement.removeAttribute("data-theme");else document.documentElement.setAttribute("data-theme",t);
+    try{if(t==="auto")localStorage.removeItem("dacan.theme");else localStorage.setItem("dacan.theme",t);}catch(e){}
+    show();});});
+  show();
+})();
+</script></body></html>
 """
 io.open(os.path.join(D, "index.html"), "w", encoding="utf-8", newline="\n").write(page % dict(cards="".join(cards)))
 print("temperature/index.html: промтов", len(cards))

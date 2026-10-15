@@ -82,11 +82,23 @@ page = u"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Температура: %(title)s</title>
 <meta name="description" content="Один промт, пятнадцать температур от 0.1 до 1.5: %(title)s — Swift 1.5 Flash-Next на DACAN, 2x RTX 2080 Ti.">
+<script>try{var t=localStorage.getItem("dacan.theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
 <style>
+ /* theme: «Авто» follows the device; «День»/«Ночь» stamp data-theme on <html> (the same choice on every page of the site) */
  :root{--bg:#faf8f5;--fg:#241f1b;--mut:#6d635a;--line:#e2dbd2;--acc:#8a5a2b;--pan:#f2ece4;--card:#fffdf9;
-   --cold:hsl(210 62%% 52%%);--hot:hsl(5 62%% 52%%)}
- @media (prefers-color-scheme:dark){:root{--bg:#17150f;--fg:#efe9e0;--mut:#a2988c;--line:#332e27;--acc:#d8a45f;
-   --pan:#201c15;--card:#1d1a14}}
+   --cold:hsl(210 62%% 52%%);--hot:hsl(5 62%% 52%%);--tl:45%%;--ts:58%%;--onacc:#fff;color-scheme:light}
+ @media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#17150f;--fg:#efe9e0;--mut:#a2988c;--line:#332e27;
+   --acc:#d8a45f;--pan:#201c15;--card:#1d1a14;--tl:64%%;--ts:70%%;--onacc:#1b160f;color-scheme:dark}}
+ :root[data-theme=dark]{--bg:#17150f;--fg:#efe9e0;--mut:#a2988c;--line:#332e27;--acc:#d8a45f;--pan:#201c15;--card:#1d1a14;
+   --tl:64%%;--ts:70%%;--onacc:#1b160f;color-scheme:dark}
+ .topline{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 16px}
+ .topline a.back{margin:0}
+ .theme{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--card)}
+ .theme button{font:600 12.5px/1 -apple-system,"Segoe UI",Roboto,sans-serif;color:var(--mut);background:none;border:0;
+   padding:7px 10px;cursor:pointer}
+ .theme button+button{border-left:1px solid var(--line)}
+ .theme button:hover{color:var(--fg)}
+ .theme button[aria-pressed=true]{background:var(--fg);color:var(--bg)}
  *{box-sizing:border-box}
  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 -apple-system,"Segoe UI",Roboto,sans-serif;
    padding:28px 20px 72px}
@@ -113,8 +125,7 @@ page = u"""<!DOCTYPE html>
    border-bottom:1px solid var(--line)}
  .scale-row{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
  .tbig{font:800 clamp(34px,5vw,52px)/1 ui-monospace,Menlo,Consolas,monospace;letter-spacing:-.03em;min-width:3.2ch;
-   color:hsl(var(--h,100) 58%% 46%%)}
- @media (prefers-color-scheme:dark){.tbig{color:hsl(var(--h,100) 70%% 64%%)}}
+   color:hsl(var(--h,100) var(--ts) var(--tl))}
  .rng{flex:1 1 300px;min-width:0}
  input[type=range]{width:100%%;accent-color:var(--acc);height:28px;cursor:pointer}
  .rail{height:8px;border-radius:4px;background:linear-gradient(90deg,var(--cold),hsl(100 55%% 48%%),var(--hot));
@@ -126,8 +137,7 @@ page = u"""<!DOCTYPE html>
  .btn{display:inline-flex;align-items:center;gap:6px;font-weight:600;font-size:13px;line-height:1;color:var(--fg);text-decoration:none;
    border:1px solid var(--line);border-radius:9px;padding:9px 13px;background:var(--card)}
  .btn:hover{border-color:var(--acc);color:var(--acc)}
- .btn.main{background:var(--acc);border-color:var(--acc);color:#fff}
- @media (prefers-color-scheme:dark){.btn.main{color:#1b160f}}
+ .btn.main{background:var(--acc);border-color:var(--acc);color:var(--onacc)}
 
  .stage{margin:16px 0 0;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#0d0d0d;
    box-shadow:0 22px 50px -32px rgba(0,0,0,.6);position:relative;border-top:4px solid hsl(var(--h,100) 62%% 52%%)}
@@ -142,8 +152,7 @@ page = u"""<!DOCTYPE html>
  .shot[aria-current=true]{box-shadow:0 0 0 2px hsl(var(--h) 62%% 52%%)}
  .shot img{display:block;width:100%%;height:auto;aspect-ratio:1280/860;object-fit:cover}
  .noimg{aspect-ratio:1280/860;display:grid;place-items:center;color:var(--mut);font-size:12px}
- .tlab{display:block;padding:7px 10px 0;font:800 18px/1 ui-monospace,Menlo,Consolas,monospace;color:hsl(var(--h) 58%% 44%%)}
- @media (prefers-color-scheme:dark){.tlab{color:hsl(var(--h) 70%% 64%%)}}
+ .tlab{display:block;padding:7px 10px 0;font:800 18px/1 ui-monospace,Menlo,Consolas,monospace;color:hsl(var(--h) var(--ts) var(--tl))}
  .smeta{display:block;padding:6px 10px 9px;font:12px/1.3 ui-monospace,Menlo,Consolas,monospace;color:var(--mut)}
  .shot .tlab+img,.shot .tlab+.noimg{margin-top:7px}
 
@@ -164,7 +173,8 @@ page = u"""<!DOCTYPE html>
  .foot{margin:34px 0 0;color:var(--mut);font-size:13px;max-width:80ch}
  @media (max-width:860px){.top{grid-template-columns:1fr}.scale{position:static}}
 </style></head><body><div class="wrap">
-<a class="back" href="../index.html">← Температура · все промты</a>
+<div class="topline"><a class="back" href="../index.html">← Температура · все промты</a>
+<div class="theme" role="group" aria-label="Тема"><button type="button" data-t="auto">Авто</button><button type="button" data-t="light" title="День">☀</button><button type="button" data-t="dark" title="Ночь">☾</button></div></div>
 <h1>%(title_cap)s: пятнадцать <em>температур</em></h1>
 <p class="sub">%(lede)s Модель Swift 1.5 Flash-Next (NVFP4 + Q8) на движке DACAN, две RTX 2080 Ti. Промт тот же, условия те
 же, меняется только температура: от 0.1 до 1.5 с шагом 0.1, по одному прогону на значение. Каждый файл можно открыть
@@ -205,6 +215,17 @@ page = u"""<!DOCTYPE html>
 и богатую. Скрипт прогона: <a href="../../scripts/temp_progon.py">temp_progon.py</a>.</p>
 </div>
 <script>
+(function(){ // theme: auto (device) / day / night, remembered for the whole site
+  var bs=document.querySelectorAll(".theme button");
+  function cur(){return document.documentElement.getAttribute("data-theme")||"auto";}
+  function show(){bs.forEach(function(b){b.setAttribute("aria-pressed",String(b.dataset.t===cur()));});}
+  bs.forEach(function(b){b.addEventListener("click",function(){
+    var t=b.dataset.t;
+    if(t==="auto")document.documentElement.removeAttribute("data-theme");else document.documentElement.setAttribute("data-theme",t);
+    try{if(t==="auto")localStorage.removeItem("dacan.theme");else localStorage.setItem("dacan.theme",t);}catch(e){}
+    show();});});
+  show();
+})();
 const RUNS=%(runs)s;
 const $=s=>document.querySelector(s);
 const rng=$("#rng"),fr=$("#fr");
