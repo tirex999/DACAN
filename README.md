@@ -102,13 +102,11 @@ the update.
 
 ## Sampling settings
 
-How the next word is chosen. DACAN's defaults are below. The temperature is low, 0.2: answers stay close to the most
-likely words, which keeps code and long agent work on track (the model's own recommendation is 0.6; set it in the web
-chat or the config if you prefer it):
+How the next word is chosen. The defaults are the model's recommended settings, and they are what DACAN uses:
 
 | setting | default | what it does |
 |---|---|---|
-| `temperature` | **0.2** | how freely words are picked: 0 = always the most likely word (the same question gives the same answer), higher = more varied |
+| `temperature` | **0.6** | how freely words are picked: 0 = always the most likely word (the same question gives the same answer), higher = more varied |
 | `top_p` | **0.95** | only the most likely words that together make up 95 % of the probability are considered |
 | `top_k` | **20** | at most this many of the most likely words are considered (DACAN takes 1 to 64) |
 | `presence_penalty`, `repetition_penalty`, `frequency_penalty` | **off** | push the model away from words it already used; turn on only if answers repeat themselves |
@@ -117,8 +115,7 @@ chat or the config if you prefer it):
   the web chat's settings the defaults for every API client.
 - **API clients** (Open WebUI, Claude Code, your own scripts) get the defaults for every field they do not send
   themselves: they are in the `"sampling"` block of the model's config `dacan-<model>.json` next to `setup.py`, and
-  you can change them there (restart the model afterwards). A request's own fields always win. A config written
-  by an earlier setup keeps its own `sampling` block (temperature 0.6): change it there to get 0.2.
+  you can change them there (restart the model afterwards). A request's own fields always win.
 - **Speed.** `temperature` 0 is the fastest: the engine guesses several tokens ahead and checks them in one step, and
   with the most likely word every time more of the guesses are kept. Sampling (temperature above 0) keeps fewer of
   them.

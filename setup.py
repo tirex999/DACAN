@@ -3877,10 +3877,9 @@ def data_folder(requested: str | None) -> tuple:
     return dest, elsewhere
 
 
-# The sampling an API client gets for the fields it does not send (the web page sends the same by default): a low
-# temperature 0.2 (since 15.10.2026; before, the model's recommended 0.6) - answers stay close to the most likely words,
-# which keeps code and long agent work on track; penalties off.  A "sampling" block of the user's own is never replaced.
-DEFAULT_SAMPLING = {"temperature": 0.2, "top_p": 0.95, "top_k": 20}
+# The sampling an API client gets for the fields it does not send (the web page sends the same by default): the
+# model's recommended settings, penalties off.  A "sampling" block of the user's own is never replaced.
+DEFAULT_SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
 
 
 def write_config(path: Path, cfg: dict):
