@@ -86,6 +86,19 @@ cd DACAN
 NVIDIA: Python 3.10+ с venv ставится через apt / dnf / pacman, если его нет (спросит пароль sudo), библиотеки CUDA 13
 приходят pip-пакетами в собственный `.venv` папки. Следующие запуски `./setup.sh` просто стартуют модель.
 
+**Наша модель: Swift 1.5 NVFP4 + Q8 (DACAN)**
+
+[tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN):
+NVIDIA RTX 20 и новее, ~80 ГБ ОЗУ. Это последний пункт первого вопроса «Which model?». Дальше установщик спросит,
+скачана ли она у вас: укажите эту папку (ту, где два файла модели и `pack-nvfp4`), и файлы будут работать на месте -
+проверка один раз (SHA-256, несколько минут), ничего не копируется; Enter - установщик скачает их сам (~132 ГБ).
+То же без вопросов:
+
+```
+START-HERE.bat --from-dir D:\models\DACAN        (Linux: ./setup.sh --from-dir ~/models/DACAN)
+START-HERE.bat --dacan-nvfp4                      (скачать файлы)
+```
+
 ## Обновление
 
 **`UPDATE.bat`** (Windows) или **`./update.sh`** (Linux): свежие файлы (`git pull`), новый движок DACAN, если вышел,

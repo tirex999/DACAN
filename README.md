@@ -89,6 +89,19 @@ The same questions as on Windows; the engine `dacan-linux-x64.zip` comes from th
 needed beforehand: Python 3.10+ with venv is installed through apt / dnf / pacman when missing (it asks for sudo), the
 CUDA 13 libraries come as pip packages into the folder's own `.venv`. Later runs of `./setup.sh` just start the model.
 
+**Our own model: Swift 1.5 NVFP4 + Q8 (DACAN)**
+
+[tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN](https://huggingface.co/tirex2001/Swift-1.5-Qwen3.8-Flash-Next-DACAN):
+NVIDIA RTX 20 or newer, ~80 GB of RAM. It is the last entry of the first question, "Which model?". Setup then asks
+whether you already downloaded it: type that folder (the one with the two model files and `pack-nvfp4`) and the files
+are used where they are - checked once (SHA-256, a few minutes), nothing is copied; press Enter and setup downloads
+them (~132 GB). The same without questions:
+
+```
+START-HERE.bat --from-dir D:\models\DACAN        (Linux: ./setup.sh --from-dir ~/models/DACAN)
+START-HERE.bat --dacan-nvfp4                      (download the files)
+```
+
 ## Update
 
 **`UPDATE.bat`** (Windows) or **`./update.sh`** (Linux): the newest files (`git pull`), a new DACAN engine when one is

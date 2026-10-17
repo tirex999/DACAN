@@ -4269,6 +4269,78 @@ DACAN_PACK = {"dense.bin": (1538035200, "6eba284f9e3caf50da37a1144c0210c6be925c8
               "tokenizer/vocab.json": (5737005, None)}
 DACAN_RAM_GB = 80          # the 63.3 GiB of experts in RAM, plus the engine, the server and the OS
 DACAN_TAG = "dacan-nvfp4"
+DACAN_PACK_DIR = "pack-nvfp4"   # the pack's folder in the Hugging Face repository, so in a download of it too
+
+
+def dacan_dir_problem(d: Path):
+    """What a folder given as a download of the NVFP4 + Q8 (DACAN) repository lacks; None when every file is there."""
+    if not d.is_dir():
+        return f"{d} is not a folder"
+    missing = [n for n in DACAN_FILES if not (d / n).is_file()]
+    missing += [f"{DACAN_PACK_DIR}/{r}" for r in DACAN_PACK if not (d / DACAN_PACK_DIR / r).is_file()]
+    if missing:
+        return f"{d} has no " + ", ".join(missing[:3]) + (f" (and {len(missing) - 3} more)" if len(missing) > 3 else "")
+    return None
+
+
+def dacan_files_dir(a):
+    """The folder of an NVFP4 + Q8 (DACAN) download the user already has (--from-dir, or asked once): its files are
+    used where they are, nothing is copied.  None: setup downloads them itself - also when it did so before (their
+    finish marks are there) or with --yes."""
+    if a.from_dir:
+        d = Path(a.from_dir.strip().strip('"').strip("'")).expanduser()
+        why = dacan_dir_problem(d)
+        if why:
+            fail(why, f"--from-dir takes the folder of a download of {DACAN_HF_REPO}: "
+                      f"{DACAN_DENSE}, {DACAN_EXPERTS} and the {DACAN_PACK_DIR} folder")
+        return d.resolve()
+    if a.yes or all(done(Path(a.models_dir) / DACAN_TAG / n) for n in DACAN_FILES):
+        return None
+    say()
+    say(f"  Already downloaded it from https://huggingface.co/{DACAN_HF_REPO} ?")
+    say(f"  Then type that folder (the one with {DACAN_DENSE},")
+    say(f"  {DACAN_EXPERTS} and {DACAN_PACK_DIR}): the files are used where they are, nothing is copied.")
+    while True:
+        flush_typed_ahead()
+        try:
+            ans = input("Folder [Enter = download them, ~132 GB]: ").strip().strip('"').strip("'")
+        except EOFError:
+            fail("input ended before a setup answer was received",
+                 "run setup in a terminal, or pass --from-dir FOLDER (or --yes to download the files)")
+        if not ans:
+            return None
+        d = Path(ans).expanduser()
+        why = dacan_dir_problem(d)
+        if why is None:
+            return d.resolve()
+        say(f"  {why}. Another folder, or Enter to download them.")
+
+
+def check_own_file(f: Path, size: int, sha) -> None:
+    """A file of the user's own download (--from-dir): its size, and its SHA-256 once - kept in its finish mark, as
+    verify_sha256 keeps it.  Unlike a file setup downloaded, a wrong one is never deleted: it is the user's."""
+    have = f.stat().st_size
+    if have != size:
+        fail(f"{f} is {have:,} bytes, not {size:,}: an unfinished download, or another version of the file",
+             f"download it again from https://huggingface.co/{DACAN_HF_REPO} (or press Enter at the folder question "
+             "and let setup download the files)")
+    if not sha:
+        return
+    m = f.with_name(f.name + ".done")
+    if m.exists() and f"sha256 {sha}" in m.read_text(encoding="utf-8", errors="replace"):
+        return
+    say(f"  checking {f.name} (SHA-256, {size / 1e9:.1f} GB; once) ...")
+    h = hashlib.sha256()
+    with open(f, "rb") as fh:
+        while True:
+            b = fh.read(16 << 20)
+            if not b:
+                break
+            h.update(b)
+    if h.hexdigest() != sha:
+        fail(f"{f} has the wrong SHA-256 ({h.hexdigest()}, expected {sha}): the file is damaged or another version",
+             f"download it again from https://huggingface.co/{DACAN_HF_REPO}")
+    mark(f, f"sha256 {sha}")
 
 
 def install_dacan_nvfp4(a, data, roots, port) -> int:
@@ -4294,8 +4366,9 @@ def install_dacan_nvfp4(a, data, roots, port) -> int:
         fail(f"{name} has no AVX2", "DACAN's CPU kernels need AVX2 (Intel Haswell / AMD Ryzen and newer)")
     ok(f"CPU: {name}" + (" (AVX-512: the NVFP4 experts the GPU does not hold run on DACAN's AVX-512 kernel)"
                          if avx512 else " (AVX2)"))
-    models_dir = Path(a.models_dir) / DACAN_TAG
-    pack = find_in(roots, f"packs/{DACAN_TAG}") or data / "packs" / DACAN_TAG
+    src = dacan_files_dir(a)                           # the user's own download, used where it is (None: download)
+    models_dir = src or Path(a.models_dir) / DACAN_TAG
+    pack = src / DACAN_PACK_DIR if src else find_in(roots, f"packs/{DACAN_TAG}") or data / "packs" / DACAN_TAG
     files = [models_dir / f for f in DACAN_FILES]
     left = sum(DACAN_FILES[f.name][0] - (f.stat().st_size if f.exists() and not done(f) else 0)
                for f in files if not done(f)) / 1e9
@@ -4319,23 +4392,32 @@ def install_dacan_nvfp4(a, data, roots, port) -> int:
     lib_dirs = meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs(13)
     ok(f"engine: {eng / EXE} (DACAN build {meta.get('dacan')})")
 
-    step(4, "downloading NVFP4 + Q8 (DACAN)")
-    say(f"  The model files go in {models_dir}")
-    base = hf(DACAN_HF_REPO)
-    for f in files:
-        download(base + f.name, f)
-        verify_sha256(f, *DACAN_FILES[f.name])
-    for rel, (size, sha) in DACAN_PACK.items():
-        dst = pack / rel
-        download(base + "pack-nvfp4/" + rel, dst)
-        if sha:
-            verify_sha256(dst, size, sha)
-        elif dst.stat().st_size != size:
-            dst.unlink(missing_ok=True)
-            dst.with_name(dst.name + ".done").unlink(missing_ok=True)
-            fail(f"{dst.name} is {dst.stat().st_size if dst.exists() else 0:,} bytes, not {size:,}: deleted",
-                 "run this again to download it again")
-    ok(f"model files present: {models_dir}, pack {pack}")
+    if src:                                            # the user's own download: checked, used where it is
+        step(4, "your NVFP4 + Q8 (DACAN) files")
+        say(f"  Using the files in {src} (nothing is downloaded or copied)")
+        for f in files:
+            check_own_file(f, *DACAN_FILES[f.name])
+        for rel, (size, sha) in DACAN_PACK.items():
+            check_own_file(pack / rel, size, sha)
+        ok(f"model files present: {src}")
+    else:
+        step(4, "downloading NVFP4 + Q8 (DACAN)")
+        say(f"  The model files go in {models_dir}")
+        base = hf(DACAN_HF_REPO)
+        for f in files:
+            download(base + f.name, f)
+            verify_sha256(f, *DACAN_FILES[f.name])
+        for rel, (size, sha) in DACAN_PACK.items():
+            dst = pack / rel
+            download(base + DACAN_PACK_DIR + "/" + rel, dst)
+            if sha:
+                verify_sha256(dst, size, sha)
+            elif dst.stat().st_size != size:
+                dst.unlink(missing_ok=True)
+                dst.with_name(dst.name + ".done").unlink(missing_ok=True)
+                fail(f"{dst.name} is {dst.stat().st_size if dst.exists() else 0:,} bytes, not {size:,}: deleted",
+                     "run this again to download it again")
+        ok(f"model files present: {models_dir}, pack {pack}")
 
     step(5, "the MTP draft layer")
     env = dict(os.environ, DACAN_GGUF_PY=str(llama / "gguf-py"))
@@ -5125,6 +5207,10 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--dacan-nvfp4", action="store_true",
                     help="DACAN: install Swift 1.5 as NVFP4 + Q8 (DACAN) - a ~132 GB download, ~80 GB of RAM, NVIDIA RTX 20 or newer")
+    ap.add_argument("--from-dir", metavar="FOLDER",
+                    help="DACAN: install NVFP4 + Q8 (DACAN) from the files you already downloaded from Hugging Face "
+                         "(the folder with its two model files and pack-nvfp4): used where they are, nothing is "
+                         "downloaded or copied (implies --dacan-nvfp4)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     migrate_old_names()                                # an install from before the DACAN rename
@@ -5160,7 +5246,7 @@ def main() -> int:
     have = installed_configs()
     if a.update:                                       # #475: UPDATE.bat / update.sh - never starts the model
         return update_install(have, a)
-    explicit = a.setup or a.model or a.family or a.check or a.no_start
+    explicit = a.setup or a.model or a.family or a.check or a.no_start or a.dacan_nvfp4 or a.from_dir
     adopted = None                                     # #629: the earlier install this copy is set up like
     if not have and not explicit:                      # a new copy of DACAN (an update unzipped elsewhere): set it
         prev = previous_config(elsewhere, load_settings())   # up like the last one, from the files already here
@@ -5192,7 +5278,7 @@ def main() -> int:
     # choice, and asked once when the PC has cards that could share the model
     run_gpu = start_gpus(a.gpus) or a.gpu
     port = a.port or 8080                              # a new install's port (issue #32: --port for an existing one)
-    if a.dacan_nvfp4:                                  # DACAN's own pack: an install of its own
+    if a.dacan_nvfp4 or a.from_dir:                    # DACAN's own pack: an install of its own
         return install_dacan_nvfp4(a, data, roots, port)
     if have and a.calibrate and not (a.setup or a.model or a.family or a.check):
         if not a.build:
@@ -5416,8 +5502,18 @@ def main() -> int:
             d = FAMILIES[f]
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
                 + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
-        family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)],
-                              str(fams.index(rec_fam) + 1), a.yes)) - 1]
+        # DACAN's own pack (NVIDIA only) beside the others, never the default; it asks for a folder of files already
+        # downloaded, so a download from Hugging Face needs no command-line key (a user asked for exactly that)
+        own = not hip
+        if own:
+            say(f"  {len(fams) + 1}) {'Swift 1.5 NVFP4 + Q8':20s} DACAN - our own pack from Hugging Face "
+                f"({DACAN_HF_REPO}): NVIDIA RTX 20 or newer, ~{DACAN_RAM_GB} GB of RAM, ~132 GB download "
+                "(or a folder you already downloaded)")
+        pick = int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1 + own)],
+                       str(fams.index(rec_fam) + 1), a.yes))
+        if pick > len(fams):
+            return install_dacan_nvfp4(a, data, roots, port)
+        family = fams[pick - 1]
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
     if fam.get("license"):
