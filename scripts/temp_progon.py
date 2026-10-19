@@ -22,6 +22,11 @@ ap.add_argument("prompt")
 ap.add_argument("out")
 ap.add_argument("--url", default="http://127.0.0.1:8000")
 ap.add_argument("--temps", default=",".join("%.1f" % (0.1 * i) for i in range(1, 16)))
+# 19.10.2026 (the Tidehaven prompt: a whole Three.js app, far longer than the pelican's SVG): the answer's ceiling, a
+# fixed seed, and what marks the answer's file as the asked one (the pelican's <svg by default)
+ap.add_argument("--max-tokens", type=int, default=65536)   # 0: none sent - until the model stops
+ap.add_argument("--seed", type=int, default=None)
+ap.add_argument("--mark", default="<svg")
 a = ap.parse_args()
 PROMPT = open(a.prompt, encoding="utf-8").read().strip()
 TEMPS = [float(x) for x in a.temps.split(",")]
@@ -59,7 +64,11 @@ for t in TEMPS:
     while idle_s() < 60 and time.time() - w0 < 300:
         time.sleep(10)
     body = {"model": model, "messages": [{"role": "user", "content": PROMPT}], "stream": False,
-            "reasoning_effort": "high", "temperature": t, "top_p": 0.95, "top_k": 20, "max_tokens": 65536}
+            "reasoning_effort": "high", "temperature": t, "top_p": 0.95, "top_k": 20, "max_tokens": a.max_tokens}
+    if a.seed is not None:
+        body["seed"] = a.seed
+    if a.max_tokens <= 0:   # 19.10.2026, Vadim: «макс токены ставь безлимитные» - none sent, as the web chat's empty field
+        body.pop("max_tokens")
     req = urllib.request.Request(a.url + "/v1/chat/completions", data=json.dumps(body).encode("utf-8"),
                                  headers={"Content-Type": "application/json"})
     log("t=%.1f отправляю (ждал паузу %.0f с)" % (t, time.time() - w0))
@@ -78,7 +87,7 @@ for t in TEMPS:
     row = {"t": t, "start": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t0)), "sec": round(time.time() - t0),
            "tokens": u.get("completion_tokens"), "finish": r["choices"][0].get("finish_reason"),
            "reasoning_chars": len(msg.get("reasoning_content") or msg.get("reasoning") or ""),
-           "html_bytes": len(html.encode("utf-8")), "has_html": "<svg" in html.lower()}
+           "html_bytes": len(html.encode("utf-8")), "has_html": a.mark.lower() in html.lower(), "seed": a.seed}
     with open(os.path.join(a.out, "itogi.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
     log("t=%.1f готово: %s с, %s ток., %s, HTML %d байт" % (t, row["sec"], row["tokens"], row["finish"], row["html_bytes"]))

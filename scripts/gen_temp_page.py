@@ -17,6 +17,24 @@ zam = {}
 if os.path.exists(os.path.join(D, "zametki.json")):
     zam = json.load(io.open(os.path.join(D, "zametki.json"), encoding="utf-8"))
 OBSHEE = zam.pop("_obshee", "")
+META = json.load(io.open(os.path.join(D, "meta.json"), encoding="utf-8"))
+# snimki_webgl.py: {t: {"errors": n, "buttons": n, "clicked": n, "ranges": n, "drawn": bool}} - a check per run
+PROV = {}
+if os.path.exists(os.path.join(D, "proverka.json")):
+    PROV = json.load(io.open(os.path.join(D, "proverka.json"), encoding="utf-8"))
+
+
+def check_text(c):
+    if not c:
+        return ""
+    if not c.get("drawn"):
+        return "сцена не рисуется" + (" · ошибок %d" % c["errors"] if c.get("errors") else "")
+    s = "ошибок %d" % (c.get("errors") or 0)
+    if c.get("buttons"):
+        s += " · кнопок %d/%d" % (c.get("clicked") or 0, c["buttons"])
+    if c.get("ranges"):
+        s += " · бегунков %d" % c["ranges"]
+    return s
 
 
 def hue(t):
@@ -31,7 +49,7 @@ for r in rows:
     runs.append({"t": t, "hue": hue(r["t"]), "tok": r.get("tokens") or 0, "sec": r.get("sec") or 0,
                  "kb": round((r.get("html_bytes") or 0) / 1024, 1), "fin": r.get("finish") or "",
                  "think": r.get("reasoning_chars") or 0, "svg": bool(r.get("has_html")),
-                 "start": r.get("start", ""), "note": zam.get(t, ""),
+                 "start": r.get("start", ""), "note": zam.get(t, ""), "chk": check_text(PROV.get(t)),
                  "png": os.path.exists(os.path.join(D, "t%s.png" % t))})
 maxtok = max([r["tok"] for r in runs] + [1])
 # a round axis: step 1/2/5 x 10^k so that four steps cover the largest answer
@@ -46,7 +64,7 @@ date = rows[0]["start"][:10] if rows else ""
 
 cards = []
 for r in runs:
-    img = ('<img src="t%s.png" alt="Пеликан при температуре %s" loading="lazy" width="1280" height="860">' % (r["t"], r["t"])
+    img = ('<img src="t%s.png" alt="%s при температуре %s" loading="lazy" width="1280" height="860">' % (r["t"], html.escape(META.get("alt", "Пеликан")), r["t"])
            if r["png"] else '<div class="noimg">нет снимка</div>')
     cards.append(
         '<button class="shot" data-t="%(t)s" style="--h:%(hue)d" aria-label="Температура %(t)s">'
@@ -75,7 +93,11 @@ for k in range(0, 5):
 
 # the prompt and the page's name live in the prompt's own folder, so the next prompt is a new folder, not a code change
 PROMPT = io.open(os.path.join(D, "prompt.txt"), encoding="utf-8").read().strip()
-META = json.load(io.open(os.path.join(D, "meta.json"), encoding="utf-8"))
+FILE = META.get("file", "pelican")
+LIMIT = META.get("limit", "65 536 токенов")
+SEED = (" · зерно %s" % META["seed"]) if META.get("seed") is not None else ""
+SHOT = META.get("shot", "снимок — первый кадр после 4 с анимации в браузере 1280×860")
+HAS_CHK = any(r["chk"] for r in runs)
 
 page = u"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
@@ -116,7 +138,7 @@ page = u"""<!DOCTYPE html>
  .box{border:1px solid var(--line);border-radius:12px;padding:15px 18px;background:var(--card)}
  .box h3{margin:0 0 8px;font:600 11px/1 ui-monospace,Menlo,Consolas,monospace;letter-spacing:.1em;text-transform:uppercase;
    color:var(--mut)}
- pre.prompt{margin:0;white-space:pre-wrap;font:13.5px/1.5 ui-monospace,Menlo,Consolas,monospace}
+ pre.prompt{margin:0;white-space:pre-wrap;font:13.5px/1.5 ui-monospace,Menlo,Consolas,monospace;max-height:21em;overflow:auto}
  dl.spec{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;margin:0;font-size:13.5px}
  dl.spec dt{color:var(--mut)} dl.spec dd{margin:0;font-family:ui-monospace,Menlo,Consolas,monospace}
 
@@ -183,8 +205,8 @@ page = u"""<!DOCTYPE html>
  <div class="box"><h3>Промт, дословно</h3><pre class="prompt">%(prompt)s</pre></div>
  <div class="box"><h3>Условия</h3><dl class="spec">
   <dt>Модель</dt><dd>%(model)s</dd><dt>Движок</dt><dd>DACAN, 2× RTX 2080 Ti</dd>
-  <dt>Размышление</dt><dd>reasoning_effort high</dd><dt>Выборка</dt><dd>top_p 0.95 · top_k 20</dd>
-  <dt>Температура</dt><dd>0.1 … 1.5, шаг 0.1</dd><dt>Лимит ответа</dt><dd>65 536 токенов</dd>
+  <dt>Размышление</dt><dd>reasoning_effort high</dd><dt>Выборка</dt><dd>top_p 0.95 · top_k 20%(seed)s</dd>
+  <dt>Температура</dt><dd>0.1 … 1.5, шаг 0.1</dd><dt>Лимит ответа</dt><dd>%(limit)s</dd>
   <dt>Дата</dt><dd>%(date)s</dd><dt>Прогонов</dt><dd>%(n)d, по одному на значение</dd></dl></div>
 </div>
 %(obshee)s
@@ -207,10 +229,10 @@ page = u"""<!DOCTYPE html>
 <div class="chart"><svg viewBox="0 0 %(W)d %(H)d" role="img" aria-label="Токены ответа по температуре">%(ticks)s%(bars)s</svg></div>
 
 <h2>Таблица</h2>
-<div class="tw"><table><thead><tr><th>Температура</th><th>Токенов ответа</th><th>Размышление, знаков</th><th>Время</th><th>Скорость</th><th>Файл</th><th>Конец</th></tr></thead>
+<div class="tw"><table><thead><tr><th>Температура</th><th>Токенов ответа</th><th>Размышление, знаков</th><th>Время</th><th>Скорость</th><th>Файл</th><th>Конец</th>%(chk_th)s</tr></thead>
 <tbody>%(rows)s</tbody></table></div>
 <p class="foot">Как мерили: запросы шли в боевую службу DACAN так же, как их шлёт её веб-чат (одно сообщение, без системного
-промта, температура задана явно), по одному на значение и подряд; снимок — первый кадр после 4 с анимации в браузере 1280×860.
+промта, температура задана явно), по одному на значение и подряд; %(shot)s.
 Одного прогона на значение мало, чтобы говорить о закономерности: одна и та же температура может дать и простую картинку,
 и богатую. Скрипт прогона: <a href="../../scripts/temp_progon.py">temp_progon.py</a>.</p>
 </div>
@@ -234,9 +256,9 @@ function pick(i,scroll){
   document.documentElement.style.setProperty("--h",r.hue);
   $("#tbig").textContent=r.t; $("#stage").style.setProperty("--h",r.hue);
   const f="t"+r.t+".html"; if(fr.dataset.f!==f){fr.src=f;fr.dataset.f=f;}
-  $("#dl").href=f; $("#dl").setAttribute("download","pelican_t"+r.t+".html"); $("#op").href=f;
+  $("#dl").href=f; $("#dl").setAttribute("download","%(file)s_t"+r.t+".html"); $("#op").href=f;
   const sp=r.sec?(r.tok/r.sec).toFixed(1):"–";
-  $("#stats").innerHTML="<span>ответ <b>"+r.tok.toLocaleString("ru")+"</b> ток.</span><span>размышление <b>"+r.think.toLocaleString("ru")+"</b> знаков</span><span>файл <b>"+r.kb.toLocaleString("ru")+"</b> КБ</span><span>время <b>"+Math.round(r.sec/60)+"</b> мин</span><span>скорость <b>"+sp+"</b> т/с</span>"+(r.fin==="length"?"<span><b>упёрся в лимит</b></span>":"");
+  $("#stats").innerHTML="<span>ответ <b>"+r.tok.toLocaleString("ru")+"</b> ток.</span><span>размышление <b>"+r.think.toLocaleString("ru")+"</b> знаков</span><span>файл <b>"+r.kb.toLocaleString("ru")+"</b> КБ</span><span>время <b>"+Math.round(r.sec/60)+"</b> мин</span><span>скорость <b>"+sp+"</b> т/с</span>"+(r.fin==="length"?"<span><b>упёрся в лимит</b></span>":"")+(r.chk?"<span>проверка <b>"+r.chk+"</b></span>":"");
   $("#note").textContent=r.note||"";
   document.querySelectorAll(".shot").forEach(b=>b.setAttribute("aria-current",String(b.dataset.t===r.t)));
   try{history.replaceState(null,"","#t"+r.t.replace(".","_"));}catch(e){}
@@ -254,10 +276,11 @@ trows = []
 for r in runs:
     sp = ("%.1f" % (r["tok"] / r["sec"])).replace(".", ",") if r["sec"] else "–"
     trows.append('<tr><td><span class="sw" style="background:hsl(%d 62%% 52%%)"></span><a href="#t%s" data-t="%s">%s</a></td>'
-                 '<td>%s</td><td>%s</td><td>%d мин %02d с</td><td>%s т/с</td><td><a href="t%s.html" download="pelican_t%s.html">%s КБ</a></td><td>%s</td></tr>'
+                 '<td>%s</td><td>%s</td><td>%d мин %02d с</td><td>%s т/с</td><td><a href="t%s.html" download="%s_t%s.html">%s КБ</a></td><td>%s</td>%s</tr>'
                  % (r["hue"], r["t"].replace(".", "_"), r["t"], r["t"], "{:,}".format(r["tok"]).replace(",", " "),
-                    "{:,}".format(r["think"]).replace(",", " "), r["sec"] // 60, r["sec"] % 60, sp, r["t"], r["t"],
-                    str(r["kb"]).replace(".", ","), "лимит" if r["fin"] == "length" else "сам"))
+                    "{:,}".format(r["think"]).replace(",", " "), r["sec"] // 60, r["sec"] % 60, sp, r["t"], FILE, r["t"],
+                    str(r["kb"]).replace(".", ","), "лимит" if r["fin"] == "length" else "сам",
+                    ("<td>%s</td>" % html.escape(r["chk"] or "—")) if HAS_CHK else ""))
 
 model = "Swift 1.5 Flash-Next NVFP4 + Q8"
 out = page % dict(prompt=html.escape(PROMPT), model=model, date=date, n=len(runs), maxi=max(len(runs) - 1, 0),
@@ -265,7 +288,8 @@ out = page % dict(prompt=html.escape(PROMPT), model=model, date=date, n=len(runs
                   lede=html.escape(META.get("lede", "")),
                   ticklabels="".join("<span>%s</span>" % r["t"] for r in runs), cards="".join(cards),
                   W=W, H=H, ticks="".join(ticks), bars="".join(bars), rows="".join(trows),
-                  runs=json.dumps(runs, ensure_ascii=False),
+                  runs=json.dumps(runs, ensure_ascii=False), seed=html.escape(SEED), limit=html.escape(LIMIT),
+                  shot=html.escape(SHOT), file=html.escape(FILE), chk_th="<th>Проверка</th>" if HAS_CHK else "",
                   obshee=('<div class="box" style="margin-top:18px"><h3>Что видно</h3><p style="margin:0">%s</p></div>'
                           % html.escape(OBSHEE)) if OBSHEE else "")
 io.open(os.path.join(D, "index.html"), "w", encoding="utf-8", newline="\n").write(out)
