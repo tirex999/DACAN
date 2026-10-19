@@ -13,6 +13,23 @@ cards = []
 for slug in sorted(os.listdir(D)):
     p = os.path.join(D, slug)
     if not os.path.isfile(os.path.join(p, "meta.json")):
+        # 19.10.2026: a temperature × seed page (a copy of its claude.ai page with its own data.json) has no meta.json;
+        # its card comes from karta.json (title, prompt line, meta line, cover), with the progress while it runs.
+        # Without this the regenerated list dropped the pelican × seed card (16137c1).
+        kp = os.path.join(p, "karta.json")
+        if os.path.isfile(kp):
+            k = json.load(io.open(kp, encoding="utf-8"))
+            pm = k["pm"]
+            if os.path.isfile(os.path.join(p, "data.json")):
+                dj = json.load(io.open(os.path.join(p, "data.json"), encoding="utf-8"))
+                if dj.get("current"):
+                    pm += " · идёт: %d из %d прогонов" % (dj["runs_done"], dj["runs_total"])
+            cover = k.get("cover") if k.get("cover") and os.path.exists(os.path.join(p, k["cover"])) else None
+            cards.append(
+                '<a class="pc" href="%s/index.html">%s<span class="pb"><span class="pt">%s</span>'
+                '<span class="pp">%s</span><span class="pm">%s</span></span></a>'
+                % (html.escape(slug), ('<img src="%s/%s" alt="" loading="lazy" width="1280" height="860">' % (html.escape(slug), cover))
+                   if cover else "", html.escape(k["title"]), html.escape(k["prompt"][:140]), html.escape(pm)))
         continue
     meta = json.load(io.open(os.path.join(p, "meta.json"), encoding="utf-8"))
     rows = [json.loads(l) for l in io.open(os.path.join(p, "itogi.jsonl"), encoding="utf-8") if l.strip()]
