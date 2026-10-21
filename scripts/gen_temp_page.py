@@ -103,7 +103,7 @@ page = u"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Температура: %(title)s</title>
-<meta name="description" content="Один промт, пятнадцать температур от 0.1 до 1.5: %(title)s — Swift 1.5 Flash-Next на DACAN, 2x RTX 2080 Ti.">
+<meta name="description" content="Один промт, пятнадцать температур от 0.1 до 1.5: %(title)s — %(model_desc)s на DACAN, 2x RTX 2080 Ti.">
 <script>try{var t=localStorage.getItem("dacan.theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
 <style>
  /* theme: «Авто» follows the device; «День»/«Ночь» stamp data-theme on <html> (the same choice on every page of the site) */
@@ -195,10 +195,10 @@ page = u"""<!DOCTYPE html>
  .foot{margin:34px 0 0;color:var(--mut);font-size:13px;max-width:80ch}
  @media (max-width:860px){.top{grid-template-columns:1fr}.scale{position:static}}
 </style></head><body><div class="wrap">
-<div class="topline"><a class="back" href="../index.html">← Температура · все промты</a>
+<div class="topline"><a class="back" href="../index.html">%(back)s</a>
 <div class="theme" role="group" aria-label="Тема"><button type="button" data-t="auto">Авто</button><button type="button" data-t="light" title="День">☀</button><button type="button" data-t="dark" title="Ночь">☾</button></div></div>
 <h1>%(title_cap)s: пятнадцать <em>температур</em></h1>
-<p class="sub">%(lede)s Модель Swift 1.5 Flash-Next (NVFP4 + Q8) на движке DACAN, две RTX 2080 Ti. Промт тот же, условия те
+<p class="sub">%(lede)s Модель %(model_sub)s на движке DACAN, две RTX 2080 Ti. Промт тот же, условия те
 же, меняется только температура: от 0.1 до 1.5 с шагом 0.1, по одному прогону на значение. Каждый файл можно открыть
 здесь же, скачать и посмотреть снимок.</p>
 <div class="top">
@@ -282,8 +282,13 @@ for r in runs:
                     str(r["kb"]).replace(".", ","), "лимит" if r["fin"] == "length" else "сам",
                     ("<td>%s</td>" % html.escape(r["chk"] or "—")) if HAS_CHK else ""))
 
-model = "Swift 1.5 Flash-Next NVFP4 + Q8"
+# 21.10.2026 (tab 180b): the model's texts from meta.json for the same pages of another model (flash/ — Qwen3.8-Flash-Next);
+# without these keys the page is byte for byte what it was (Swift 1.5)
+model = html.escape(META.get("model", "Swift 1.5 Flash-Next NVFP4 + Q8"))
 out = page % dict(prompt=html.escape(PROMPT), model=model, date=date, n=len(runs), maxi=max(len(runs) - 1, 0),
+                  model_desc=html.escape(META.get("model_desc", "Swift 1.5 Flash-Next")),
+                  model_sub=html.escape(META.get("model_sub", "Swift 1.5 Flash-Next (NVFP4 + Q8)")),
+                  back=html.escape(META.get("back", "← Температура · все промты")),
                   title=html.escape(META["title"]), title_cap=html.escape(META["title"][:1].upper() + META["title"][1:]),
                   lede=html.escape(META.get("lede", "")),
                   ticklabels="".join("<span>%s</span>" % r["t"] for r in runs), cards="".join(cards),

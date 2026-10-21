@@ -2,6 +2,9 @@
 # Builds temperature/index.html of the DACAN site: one card per prompt folder (meta.json, prompt.txt, itogi.jsonl,
 # t<T>.png), cover = the 0.6 shot. A new prompt is a new folder; re-run to list it.
 #     python gen_temp_hub.py <temperature folder>
+# 21.10.2026 (tab 180b, Vadim «поставь на точно такие же тесты флеш 3.8… создай еще одну страницу такую же с тестами»):
+# the same hub for another model — flash/ beside temperature/ — takes its texts from an optional <folder>/hub.json
+# (title, desc, h1, sub, how); without it the page is byte for byte what it was (the Swift tests).
 import html
 import io
 import json
@@ -9,9 +12,26 @@ import os
 import sys
 
 D = sys.argv[1]
+HUB = {"title": u"Температура выборки",
+       "desc": u"Один промт — пятнадцать температур от 0.1 до 1.5 на DACAN, 2x RTX 2080 Ti: файлы, снимки, цифры.",
+       "h1": u"Один промт — пятнадцать <em>температур</em>",
+       "sub": u"""Температура решает, насколько свободно модель выбирает следующее слово: ближе к нулю — почти всегда самое
+вероятное, выше — разнообразнее. Здесь один и тот же промт прогнан на DACAN при каждой температуре от 0.1 до 1.5 с шагом
+0.1. У каждого прогона — файл, который можно открыть и скачать, снимок и цифры.""",
+       "how": u"""<b>Как мерили.</b> Боевая служба DACAN (Swift 1.5 Flash-Next NVFP4 + Q8, две RTX 2080 Ti), запрос как из её
+веб-чата: одно сообщение без системного промта, reasoning_effort high, top_p 0.95, top_k 20, температура задана явно,
+лимит ответа 65 536 токенов, по одному прогону на значение. Снимок — браузер 1280×860 через 4 с анимации. Скрипты:
+<a href="https://github.com/tirex999/DACAN/tree/gh-pages/scripts">scripts</a> (прогон, снимки, сборка страниц)."""}
+if os.path.isfile(os.path.join(D, "hub.json")):
+    HUB.update(json.load(io.open(os.path.join(D, "hub.json"), encoding="utf-8")))
 cards = []
-for slug in sorted(os.listdir(D)):
+slugs = sorted(os.listdir(D))
+if HUB.get("poryadok"):   # hub.json: these folders first, in this order (flash/: the house first, Vadim 21.10 23:1x)
+    slugs = [s for s in HUB["poryadok"] if s in slugs] + [s for s in slugs if s not in HUB["poryadok"]]
+for slug in slugs:
     p = os.path.join(D, slug)
+    if not os.path.isdir(p):
+        continue
     if not os.path.isfile(os.path.join(p, "meta.json")):
         # 19.10.2026: a temperature × seed page (a copy of its claude.ai page with its own data.json) has no meta.json;
         # its card comes from karta.json (title, prompt line, meta line, cover), with the progress while it runs.
@@ -47,8 +67,8 @@ for slug in sorted(os.listdir(D)):
 page = u"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Температура выборки</title>
-<meta name="description" content="Один промт — пятнадцать температур от 0.1 до 1.5 на DACAN, 2x RTX 2080 Ti: файлы, снимки, цифры.">
+<title>%(title)s</title>
+<meta name="description" content="%(desc)s">
 <script>try{var t=localStorage.getItem("dacan.theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
 <style>
  /* theme: «Авто» follows the device; «День»/«Ночь» stamp data-theme on <html> (the same choice on every page of the site) */
@@ -90,16 +110,11 @@ page = u"""<!DOCTYPE html>
 </style></head><body><div class="wrap">
 <div class="topline"><a class="back" href="../index.html">← DACAN · главная</a>
 <div class="theme" role="group" aria-label="Тема"><button type="button" data-t="auto">Авто</button><button type="button" data-t="light" title="День">☀</button><button type="button" data-t="dark" title="Ночь">☾</button></div></div>
-<h1>Один промт — пятнадцать <em>температур</em></h1>
+<h1>%(h1)s</h1>
 <div class="rail"></div><div class="ticks"><span>0.1 · точнее</span><span>0.8</span><span>1.5 · свободнее</span></div>
-<p class="sub">Температура решает, насколько свободно модель выбирает следующее слово: ближе к нулю — почти всегда самое
-вероятное, выше — разнообразнее. Здесь один и тот же промт прогнан на DACAN при каждой температуре от 0.1 до 1.5 с шагом
-0.1. У каждого прогона — файл, который можно открыть и скачать, снимок и цифры.</p>
+<p class="sub">%(sub)s</p>
 <div class="grid">%(cards)s</div>
-<div class="how"><b>Как мерили.</b> Боевая служба DACAN (Swift 1.5 Flash-Next NVFP4 + Q8, две RTX 2080 Ti), запрос как из её
-веб-чата: одно сообщение без системного промта, reasoning_effort high, top_p 0.95, top_k 20, температура задана явно,
-лимит ответа 65 536 токенов, по одному прогону на значение. Снимок — браузер 1280×860 через 4 с анимации. Скрипты:
-<a href="https://github.com/tirex999/DACAN/tree/gh-pages/scripts">scripts</a> (прогон, снимки, сборка страниц).</div>
+<div class="how">%(how)s</div>
 </div>
 <script>
 (function(){ // theme: auto (device) / day / night, remembered for the whole site
@@ -115,5 +130,5 @@ page = u"""<!DOCTYPE html>
 })();
 </script></body></html>
 """
-io.open(os.path.join(D, "index.html"), "w", encoding="utf-8", newline="\n").write(page % dict(cards="".join(cards)))
-print("temperature/index.html: промтов", len(cards))
+io.open(os.path.join(D, "index.html"), "w", encoding="utf-8", newline="\n").write(page % dict(cards="".join(cards), **HUB))
+print("%s/index.html: промтов %d" % (os.path.basename(os.path.normpath(D)), len(cards)))
