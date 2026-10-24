@@ -674,11 +674,8 @@ function buildCutawayFaces(){
   const mat = new THREE.MeshStandardMaterial({ roughness:1, metalness:0 });
   mat.onBeforeCompile = sh => {
     inject(sh);
-    sh.vertexShader = `varying vec3 vWP; varying float vTop;
-      attribute float aTop;
-      void main(){ vTop = aTop; vec4 wp = modelMatrix*vec4(position,1.0); vWP = wp.xyz;
-        gl_Position = projectionMatrix*viewMatrix*wp; }`
-      .replace(/^\s*attribute float aTop;attribute float aTop;/,'attribute float aTop;');
+    sh.vertexShader = 'varying vec3 vWP; varying float vTop;\nattribute float aTop;\n' + sh.vertexShader.replace('#include <begin_vertex>',
+      '#include <begin_vertex>\n  vTop = aTop; vWP = (modelMatrix*vec4(transformed,1.0)).xyz;');
     sh.fragmentShader = `varying vec3 vWP; varying float vTop; uniform float uTime, uWaterY;
       ${GLSL_WAVE}\n` + sh.fragmentShader.replace('#include <color_fragment>',
       `#include <color_fragment>
@@ -929,7 +926,7 @@ function buildRays(){
   const geo = mantaGeometry();
   const mat = new THREE.MeshStandardMaterial({ vertexColors:true, roughness:0.55, metalness:0.02, side:THREE.DoubleSide });
   mat.onBeforeCompile = sh=>{
-    sh.uniforms = { uTime:uRays.time, uWave:uRays.wave, uPhase:{value:0} };
+    Object.assign(sh.uniforms, { uTime:uRays.time, uWave:uRays.wave, uPhase:{value:0} });
     sh.vertexShader = 'uniform float uTime,uWave,uPhase;\n' + sh.vertexShader.replace('#include <begin_vertex>',
       `#include <begin_vertex>
        float span = clamp(abs(position.x)/1.35, 0.0, 1.0);
@@ -1017,9 +1014,9 @@ function updateRays(dt){
     r.pos.set(clamp(nx,-10.6,10.6), clamp(ny,-2.55,-0.35), clamp(nz,-6.9,6.9));
     r.mesh.position.copy(r.pos);
     const sp = Math.hypot(vx,vz);
-    if(sp > 1e-4){
+    let d = 0; if(sp > 1e-4){
       const want = Math.atan2(vx, vz);
-      let d = want - r.head; while(d>Math.PI)d-=6.283; while(d<-Math.PI)d+=6.283;
+      d = want - r.head; while(d>Math.PI)d-=6.283; while(d<-Math.PI)d+=6.283;
       r.head += d*damp(dt,4.5);
     }
     r.mesh.rotation.y = r.head;

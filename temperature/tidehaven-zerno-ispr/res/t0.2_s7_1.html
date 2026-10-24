@@ -242,6 +242,7 @@ class IUniformX{constructor(v){this.value=v;}} /* fix: THREE.IUniform is a TypeS
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+const lamps=[];
 
 /* ═══════════════ 0 · helpers ═══════════════ */
 const clamp=(v,a,b)=>v<a?a:v>b?b:v;
@@ -579,10 +580,11 @@ volume.renderOrder=6; scene.add(volume);
 /* 5c · animated surface -------------------------------------------------- */
 const surfMat=new THREE.ShaderMaterial({
   transparent:true,depthWrite:false,side:THREE.DoubleSide,fog:true,
-  uniforms:{uTime:uni.time,uWaterY:uni.waterY,uWind:uni.wind,uSunDir:uni.sunDir,uSun:uni.sunCol,
+  uniforms:{...THREE.UniformsLib.fog,uTime:uni.time,uWaterY:uni.waterY,uWind:uni.wind,uSunDir:uni.sunDir,uSun:uni.sunCol,
     uSunI:uni.sunI,uShallow:uni.shallow,uDeep:uni.deep,uLagoon:uni.lagoon,uSky:uni.skyHor,uNight:uni.night},
   vertexShader:`
     uniform float uTime,uWaterY,uWind;
+    #include <fog_pars_vertex>
     varying vec3 vW; varying vec3 vN; varying float vFoam,vShallow,vCrest;
     ${GLSL_ISLAND}
     float wh(vec2 p,float t,float w){
@@ -604,13 +606,14 @@ const surfMat=new THREE.ShaderMaterial({
       float d=hh-(uWaterY-0.06);
       vFoam=smoothstep(0.30,0.02,abs(d))*(0.62+0.38*sin(t*2.3+p.x*2.0+p.y*1.7));
       vFoam+=vCrest*0.25;
-      vec4 mv=viewMatrix*wp; gl_Position=projectionMatrix*mv;
+      vec4 mvPosition=viewMatrix*wp; gl_Position=projectionMatrix*mvPosition;
       #include <fog_vertex>
     }`,
   fragmentShader:`
     varying vec3 vW; varying vec3 vN; varying float vFoam,vShallow,vCrest;
     uniform vec3 uSunDir,uSun,uShallow,uDeep,uLagoon,uSky;
-    uniform float uSunI,uNight,uTime;
+    uniform float uSunI,uNight,uTime,uWaterY;
+    #include <fog_pars_fragment>
     ${GLSL_ISLAND}
     void main(){
       vec3 N=normalize(vN)*(gl_FrontFacing?1.0:-1.0);
@@ -1075,7 +1078,7 @@ const pier=new THREE.Group(); scene.add(pier);
     -0.72,PIER_Y-0.22,-len+0.5+i*0.42,0.09,0.13,0.09,pier);
 })();
 function UNIT_TORUS(){ if(!UNIT_TORUS.g) UNIT_TORUS.g=new THREE.TorusGeometry(1,0.22,8,14); return UNIT_TORUS.g; }
-const lamps=[]; // collected glowing lantern bulbs (emissive ramps at night)
+ // collected glowing lantern bulbs (emissive ramps at night)
 // re-scan pier for lamps built above (they were pushed inline)
 scene.traverse(o=>{ if(o.userData&&o.userData.lamp&&lamps.indexOf(o)<0) lamps.push(o); });
 
