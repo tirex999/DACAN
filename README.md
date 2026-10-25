@@ -23,7 +23,8 @@ cards, one or two CPU sockets, a context up to 524K, vision and a live monitor. 
 
 - **An NVIDIA card from the RTX 20 series up** (Turing, Ampere, Ada, Blackwell), **driver 580 or newer**:
   - RTX 20 (Turing): RTX 2060 / 2070 / 2080 / 2080 Ti (including the 22 GB 2080 Ti), Titan RTX, Quadro RTX;
-  - the Turing and Ampere mining cards **CMP 30HX / 40HX / 50HX** (Turing) and **CMP 70HX / 90HX** (Ampere) — accepted
+  - the Turing and Ampere mining cards **CMP 30HX / 40HX / 50HX** (Turing), **CMP 70HX / 90HX** (Ampere) and
+    **CMP 170HX** (Ampere, GA100: the Linux engine has its code since 25.10.2026, the Windows one not yet) — accepted
     by the installer like the cards above; we have not run them ourselves. Their PCIe link is cut down, so loading the
     model and moving experts to the card take longer;
   - RTX 30, RTX 40, RTX 50 and the workstation cards of those generations.
