@@ -25,8 +25,9 @@ cards, one or two CPU sockets, a context up to 524K, vision and a live monitor. 
   - RTX 20 (Turing): RTX 2060 / 2070 / 2080 / 2080 Ti (including the 22 GB 2080 Ti), Titan RTX, Quadro RTX;
   - the Turing and Ampere mining cards **CMP 30HX / 40HX / 50HX** (Turing), **CMP 70HX / 90HX** (Ampere) and
     **CMP 170HX** (Ampere, GA100: the engine has its code since 25.10.2026) — accepted
-    by the installer like the cards above; we have not run them ourselves. Their PCIe link is cut down, so loading the
-    model and moving experts to the card take longer;
+    by the installer like the cards above. Their PCIe link is cut down, so loading the
+    model and moving experts to the card take longer. We have run the **CMP 170HX unlocked to 64 GB**
+    ourselves — the numbers and the setup are below, under "The CMP 170HX: numbers and setup";
   - RTX 30, RTX 40, RTX 50 and the workstation cards of those generations.
 
   Older cards (GTX 10, Volta), AMD and Intel are not supported.
@@ -251,6 +252,31 @@ Russian 66.5 – 67.6 tok/s, English 64.5 – 66.4 tok/s. The engine's container
 gives the same figures as with all 128.
 
 The Monitor tab shows the read speed while a prompt is read: `Reading prompt · 58% · 1,448 tok/s`.
+
+## The CMP 170HX: numbers and setup
+
+We ran the mining **CMP 170HX unlocked to 64 GB** (GA100) on 2026-10-25 on a user's machine:
+Swift 1.5 Qwen3.8-Flash-Next (NVFP4 + Q8), a 524K context, 8-bit KV, two Xeon E5-2686 v4 CPUs,
+a PCIe 2.0 x4 link. The same request each time, temperature 0, a 400-token answer.
+
+| The card's power limit | First token | Generation |
+|---|---|---|
+| 250 W (as it ships) | 1.9 s | 77 tok/s |
+| 300 W (the card's ceiling) | 0.1 s | **89 tok/s** |
+
+Two commands worth running on this card:
+
+```
+sudo nvidia-smi -pl 300    # the card's ceiling is 300 W, it ships at 250
+sudo nvidia-smi -pm 1      # the card stays awake between requests
+```
+
+Raising the limit gave **+15%**: at 250 W the card hit the power ceiling and dropped its clock.
+Put both commands in a startup script so the setting survives a reboot.
+
+**Do not lock the clock.** On this card `nvidia-smi -lgc` does not push the clock past its own
+ceiling (about 1470 MHz), and it slows the answer down: in our run 89 -> 81 tok/s, with the first
+token going from 0.1 s to 9 s. If you have already locked it: `sudo nvidia-smi -rgc`.
 
 ## Weights
 
