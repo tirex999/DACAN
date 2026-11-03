@@ -55,8 +55,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
-                            tool_choice_of, unmark_think_literals)
+                            forced_call, images_of, literal_tags, mark_think_literals, model_format,
+                            openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
@@ -1006,6 +1006,27 @@ class DacanEngine:
             ac = tune.get("aux_cpus")
             if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
                 keys += f" aux_cpus={int(ac)}"
+            # the minimax_m3 path's drafts for this request (26.10.2026): spec_t = the widest verify window (0/1 = none),
+            # spec_force = 1 verifies every proposal's drafts without the policy (a measurement of the windows)
+            st = tune.get("spec_t")
+            if isinstance(st, int) and not isinstance(st, bool) and 0 <= st <= 8:
+                keys += f" spec_t={st}"
+            sf = tune.get("spec_force")
+            if isinstance(sf, bool) or (isinstance(sf, int) and sf in (0, 1)):
+                keys += f" spec_force={int(sf)}"
+            # spec_src: 0 = DSpark's drafts when the engine has the draft head, else the lookup's; 1 = the lookup's
+            ss = tune.get("spec_src")
+            if isinstance(ss, int) and not isinstance(ss, bool) and ss in (0, 1):
+                keys += f" spec_src={ss}"
+            # dbg: the earlier way of the minimax_m3 path for this request, to time it against the new one in the same
+            # engine and expert cache - bits: 1 decode without the queue a layer ahead, 2 (27.10) DSpark's old yield
+            # gate, 4 (27.10) no expert from the cards' cache, 8 the cache does not follow the answer, 16 the cache back to
+            # its start at the first decode step, 32 the K/V arrays from the least (they grow through the request), 64 the
+            # cards' work queued by the pool's thread 0 as before the launcher thread, 128 the cached picks one at a time
+            # (not a layer's batch), 256 the CPU's router (not the card's)
+            db = tune.get("dbg")
+            if isinstance(db, int) and not isinstance(db, bool) and 0 <= db <= 511:
+                keys += f" dbg={db}"
         # "dacan_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("dacan_checkpoint") is False:
@@ -1077,6 +1098,9 @@ class DacanEngine:
                     self._send("STOP")
                     stopped = True
                 yield None
+            elif line.startswith("INFO busy"):
+                self._busy_progress(line)
+                yield None
             elif line.startswith("DONE"):
                 self._parse_done(line)
                 self._last_done = line
@@ -1094,6 +1118,20 @@ class DacanEngine:
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
+
+    def _busy_progress(self, line: str) -> None:
+        """26.10.2026: the minimax_m3 path's heartbeat, `INFO busy layer=L layers=N pos=P chunk=T total=X` (at most every
+        10 s of a long step), while a prompt is read: how far the read is - the chunk at P plus L of its N layers.  A
+        chunk of a cold model takes minutes, and with only the PP line at its end the page showed no progress at all
+        (Vadim: «вообще не понятно работает ли»).  total 0 (the engine writes) or an older heartbeat: nothing."""
+        kv = dict(x.split("=", 1) for x in line.split()[2:] if "=" in x)
+        try:
+            total, pos, chunk = int(kv["total"]), int(kv["pos"]), int(kv["chunk"])
+            layer, layers = int(kv["layer"]), max(1, int(kv["layers"]))
+        except (KeyError, ValueError):
+            return
+        if total > 0 and pos < total:
+            self.progress = (min(total, pos + chunk * layer // layers), total)
 
     def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None):
         """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
@@ -1572,8 +1610,18 @@ class DacanEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
-            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
-            return
+            waits = 0
+            while True:
+                try:
+                    yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
+                    return
+                except ValueError as e:
+                    # the engine refused the admission (no free slot its own way): wait for a slot and try again
+                    # instead of failing the request with 400 - the caller waits for its turn, it does not give up
+                    if "no such free slot" not in str(e) or waits > SLOT_WAITS_MAX:
+                        raise
+                    waits += 1
+                    time.sleep(0.5)
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
@@ -1643,6 +1691,11 @@ class DacanEngine:
                             allow = max(silence, PP_SLACK * chunk / rate)
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
+                    yield None
+                elif line.startswith("INFO busy"):        # the minimax_m3 path's heartbeat in a long step: progress too
+                    self._busy_progress(line)
+                    if cancel.is_set():
+                        return
                     yield None
                 elif line.startswith("RESUME "):          # the reused tokens: the first chunk starts after them
                     try:
@@ -2306,6 +2359,7 @@ def engine_args(cfg: dict) -> list[str]:
     return learned_profile_args(cfg, args)
 
 
+SLOT_WAITS_MAX = 40   # how many times a request may be refused a batch slot before it gives up
 PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
 
 
@@ -2796,8 +2850,10 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        # DACAN (25.10.2026): the model family's own format - its end-of-turn tokens, reasoning end and tool-call
+        # parser - from its chat template (frontend.model_format); Qwen's is <|im_end|> and <|endoftext|> as before
+        self.fmt = model_format(getattr(template, "source", "") or "")
+        self.stop_ids = set(t for s in self.fmt.end_tokens for t in tokenizer.encode(s, parse_special=True))
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -3094,11 +3150,13 @@ class Service:
                     print(f"[dacan] idle unload: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
-    def restart_threads(self, cfg: dict) -> str:
-        """DACAN 19.10.2026 (the web page's CPU threads slider): the engine's start command takes the config's thread
-        option (runconfig.threads_flag) and the engine starts again between requests, in the background; when it
-        does not start, it starts again with the earlier threads.  "restarting", "saved" (not loaded now: the next
-        load uses it), "unchanged" or "next start" (several engines, or an engine without a start command)."""
+    def restart_engine(self, cfg: dict) -> str:
+        """DACAN 19.10.2026 (the web page's CPU threads slider), 21.10.2026 (Vadim: the context size and the KV
+        cache's quant right in the web page): the engine's start command takes the config's thread option
+        (runconfig.threads_flag), --max-context and --kv, and the engine starts again between requests, in the
+        background; when it does not start, it starts again with the earlier command.  "restarting", "saved" (not
+        loaded now: the next load uses it), "unchanged" or "next start" (several engines, or an engine without a
+        start command)."""
         eng = self.engine
         spawn = getattr(eng, "spawn", None)
         if not isinstance(eng, DacanEngine) or not isinstance(spawn, tuple) or len(spawn) < 2:
@@ -3118,20 +3176,38 @@ class Service:
             args += [flag, str(want)]
             if "--threads-smt" in (cfg.get("args") or []):   # past the physical cores (runconfig.apply)
                 args.append("--threads-smt")
+        for opt in ("--max-context", "--kv"):              # 21.10: the context size and the KV cache's storage
+            v = runconfig._arg(cfg, opt)
+            if opt in args[:-1]:
+                j = args.index(opt)
+                if v is None:
+                    del args[j:j + 2]
+                else:
+                    args[j + 1] = str(v)
+            elif v is not None:
+                args += [opt, str(v)]
         if args == old:
             return "unchanged"
         eng.spawn = (spawn[0], args, *spawn[2:])
         if not eng.alive():
             return "saved"
-        what = f"{flag} {want}" if want is not None else "every physical core"
+
+        def val(a, opt):
+            return a[a.index(opt) + 1] if opt in a[:-1] else None
+        parts = []
+        for o in (flag, "--max-context", "--kv"):
+            if val(args, o) != val(old, o):
+                parts.append(f"{o} {val(args, o)}" if val(args, o) is not None else
+                             "every physical core" if o == flag else f"no {o} (the engine's default)")
+        what = ", ".join(parts) or "the same options"
 
         def run():
             with self.fifo:                             # after the request running now
-                print(f"[dacan] CPU threads from the web page: the engine starts again with {what}", flush=True)
+                print(f"[dacan] Settings from the web page: the engine starts again with {what}", flush=True)
                 try:
                     eng.restart()
                 except Exception as e:                  # noqa: BLE001 - the earlier command, so the model comes back
-                    print(f"[dacan] the engine did not start with {what} ({e}); again with the earlier threads",
+                    print(f"[dacan] the engine did not start with {what} ({e}); again with the earlier options",
                           flush=True)
                     eng.spawn = (spawn[0], old, *spawn[2:])
                     try:
@@ -3671,7 +3747,7 @@ class Service:
                 print(f"[dacan] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        parser = self.fmt.parser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -3704,6 +3780,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
+        loop_wrap = False               # "recover" with no xhigh sentence to swap: the loop closes the thinking
         raw_ids = []                                    # every generated id (DACAN_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
@@ -3811,7 +3888,7 @@ class Service:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
                                 if t in self.stop_ids:
-                                    if force and parser.state == "reasoning" and parser.buf == THINK_END:
+                                    if force and parser.state == "reasoning" and parser.buf == self.fmt.think_end:
                                         opens = True    # #537: the held </think> was the end: the call opens there
                                         break
                                     finish = "stop"
@@ -3857,6 +3934,13 @@ class Service:
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
                                             if recover_prompt is not None:
                                                 break
+                                        # 27.10.2026: no xhigh sentence to swap (effort high or lower, or a request
+                                        # with pictures) - a 108K-token loop at effort high ran on with "recover".
+                                        # Close the thinking as the budget does and let it answer, at the
+                                        # recovery's temperature and presence penalty (the wrap-up below).
+                                        wrap = loop_wrap = True
+                                        recovery_count += 1
+                                        break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
@@ -3915,7 +3999,7 @@ class Service:
                             continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
-                                and parser.buf != THINK_END         # #537: not after a held </think>, the end
+                                and parser.buf != self.fmt.think_end   # #537: not after a held </think>, the end
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
@@ -3951,7 +4035,19 @@ class Service:
                         extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        if wrap:
+                        if wrap and loop_wrap:
+                            want = (max(1.0, float((sampling or {}).get("temperature") or 0)),
+                                    max(1.5, float((sampling or {}).get("presence_penalty") or 0)))
+                            sampling = {**(sampling or {}), "temperature": want[0], "presence_penalty": want[1]}
+                            with self.status_lock:
+                                st["reasoning_recoveries"] = recovery_count
+                            if trace is not None:
+                                trace["reasoning_recoveries"] = recovery_count
+                                trace["reasoning_repeat_coverage"] = round(repeat_coverage, 3)
+                            print(f"[dacan] repeated reasoning detected at {n} tokens (coverage={repeat_coverage:.3f}) "
+                                  "and no xhigh instruction to swap: wrapping up the thinking at temperature "
+                                  f"{want[0]:g}, presence penalty {want[1]:g} (reasoning_loop_recovery)", flush=True)
+                        elif wrap:
                             print(f"[dacan] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
@@ -5173,7 +5269,7 @@ def make_handler(svc: Service):
             if changed:
                 print(f"[dacan] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
                       f"(the earlier file: {bak.name}); used from the next start", flush=True)
-            engine = svc.restart_threads(new) if "cpu_threads" in changed else None   # DACAN: the slider, now
+            engine = svc.restart_engine(new) if set(changed) & set(runconfig.RESTART_KEYS) else None   # DACAN: now
             self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed,
                              **({"engine": engine} if engine else {})})
         def _foreign_origin(self) -> bool:
@@ -6137,7 +6233,10 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        # DACAN (25.10.2026): the pre-tokenizer the model's GGUF names (tools/gguf_tokenizer_dir.py writes pre.txt);
+        # a folder without it is Qwen's, as every pack before it
+        pre = (tpath / "pre.txt").read_text(encoding="utf-8").strip() if (tpath / "pre.txt").exists() else "qwen35"
+        tok = ST.Tokenizer(tokens, merges, types, pre=pre)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "dacan":
         if not cfg:

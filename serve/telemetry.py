@@ -29,6 +29,11 @@ class _Nvml:
     class Mem(ctypes.Structure):
         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
+    class Pci(ctypes.Structure):     # nvmlPciInfo_t (DACAN: the card's bus and NUMA node for the monitor)
+        _fields_ = [("busIdLegacy", ctypes.c_char * 16), ("domain", ctypes.c_uint), ("bus", ctypes.c_uint),
+                    ("device", ctypes.c_uint), ("pciDeviceId", ctypes.c_uint), ("pciSubSystemId", ctypes.c_uint),
+                    ("busId", ctypes.c_char * 32)]
+
     def __init__(self, index=0):
         self.lib = self.dev = None
         names = ["nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
@@ -58,6 +63,27 @@ class _Nvml:
 
     def ok(self):
         return self.lib is not None and self.dev is not None
+
+    def pci(self):
+        """DACAN: -> (bus id like 0000:98:00.0, NUMA node or None)"""
+        p = self.Pci()
+        try:
+            fn = getattr(self.lib, "nvmlDeviceGetPciInfo_v3", None) or getattr(self.lib, "nvmlDeviceGetPciInfo_v2", None) \
+                or self.lib.nvmlDeviceGetPciInfo
+            if fn(self.dev, ctypes.byref(p)) != 0:
+                return None, None
+        except (AttributeError, OSError):
+            return None, None
+        bus = (p.busId or p.busIdLegacy).decode(errors="replace").lower()
+        if bus.count(":") == 2 and len(bus.split(":")[0]) == 8:      # NVML pads the domain to 8 digits
+            bus = bus[4:]
+        node = None
+        try:
+            node = int(open(f"/sys/bus/pci/devices/{bus}/numa_node").read().strip())
+            node = node if node >= 0 else None
+        except (OSError, ValueError):
+            pass
+        return bus, node
 
     def _uint(self, fn, *args):
         v = ctypes.c_uint()
@@ -326,6 +352,76 @@ class _CpuRamFallback:
             return None, None
 
 
+def _cpu_list(text):
+    """'0-31,64-95' -> [0..31, 64..95]"""
+    out = []
+    for part in text.strip().split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            out.extend(range(int(a), int(b) + 1))
+        elif part:
+            out.append(int(part))
+    return out
+
+
+class _Sockets:
+    """DACAN: each NUMA node (= a CPU socket on a two-socket server) on its own - the load of its logical CPUs from
+    /proc/stat and the RAM of its memory controllers from /sys/devices/system/node/nodeN/meminfo.  Linux only; empty
+    elsewhere (one socket, Windows), and the monitor then shows no socket cards."""
+    BASE = "/sys/devices/system/node"
+
+    def __init__(self):
+        self.nodes = []
+        try:
+            for d in os.listdir(self.BASE):
+                if d.startswith("node") and d[4:].isdigit():
+                    cpus = _cpu_list(open(f"{self.BASE}/{d}/cpulist").read())
+                    if cpus:
+                        self.nodes.append((int(d[4:]), cpus))
+        except (OSError, ValueError):
+            self.nodes = []
+        self.nodes.sort()
+        self.prev = self._times()
+
+    @staticmethod
+    def _times():
+        t = {}
+        try:
+            for line in open("/proc/stat"):
+                if line.startswith("cpu") and line[3:4].isdigit():
+                    f = line.split()
+                    v = [int(x) for x in f[1:]]
+                    t[int(f[0][3:])] = (v[3] + v[4], sum(v[:8]))   # idle + iowait, and all of the first eight
+        except (OSError, ValueError):
+            pass
+        return t
+
+    def read(self):
+        cur = self._times()
+        prev, self.prev = self.prev, cur
+        out = []
+        for node, cpus in self.nodes:
+            idle = total = 0
+            for c in cpus:
+                if c in cur and c in prev:
+                    idle += cur[c][0] - prev[c][0]
+                    total += cur[c][1] - prev[c][1]
+            s = {"node": node, "cpu": max(0.0, min(100.0, 100.0 * (1 - idle / total))) if total > 0 else None}
+            try:
+                info = {}
+                for line in open(f"{self.BASE}/node{node}/meminfo"):
+                    f = line.split()        # "Node 0 MemTotal:  131713012 kB"
+                    if len(f) >= 4:
+                        info[f[2].rstrip(":")] = int(f[3]) * 1024
+                s["ram_total"] = info.get("MemTotal")
+                if "MemTotal" in info and "MemFree" in info:   # without the page cache, which the kernel gives back
+                    s["ram_used"] = info["MemTotal"] - info["MemFree"] - info.get("FilePages", 0)
+            except (OSError, ValueError):
+                pass
+            out.append(s)
+        return out
+
+
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
@@ -348,6 +444,12 @@ class Telemetry:
         except ImportError:
             self.ps = None
         self.fallback = _CpuRamFallback()
+        sk = _Sockets()
+        self.sockets = sk if len(sk.nodes) > 1 else None   # DACAN: two sockets (NUMA nodes) -> a card each
+        gstatic = []
+        for i, g in self.gpus:                              # DACAN: each card's name, bus and NUMA node
+            bus, node = g.pci() if hasattr(g, "pci") and g.ok() else (None, None)
+            gstatic.append({"index": i, "name": g.name() if g.ok() else None, "bus": bus, "numa": node})
         self.static = {
             "gpu_name": " + ".join(g.name() or "?" for _, g in self.gpus) if self.gpu.ok() else None,
             "gpu_count": len(self.gpus),
@@ -359,6 +461,8 @@ class Telemetry:
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),
             "psutil": self.ps is not None,
+            "gpus": gstatic,
+            "sockets": [{"node": n, "threads": len(c)} for n, c in self.sockets.nodes] if self.sockets else [],
         }
         self._disk_prev = None
         self._stop = threading.Event()
@@ -395,9 +499,7 @@ class Telemetry:
                 g["util"] = sum(u) / len(u) if u else None
                 t = vals("temp")
                 g["temp"] = max(t) if t else None
-                s["gpus"] = [{"index": i, "util": r.get("util"), "mem_used": r.get("mem_used"),
-                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
-                             for i, r in reads]
+            s["gpus"] = [{"index": i, **r} for i, r in reads]   # DACAN: each card's full reading, one card or several
             s.update({f"gpu_{k}": v for k, v in g.items()})
         if self.ps:
             try:
@@ -409,6 +511,7 @@ class Telemetry:
         else:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
+        s["sockets"] = self.sockets.read() if self.sockets else []
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
         if self.extra:
             try:
@@ -430,6 +533,13 @@ class Telemetry:
                           "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
+                for n, g in enumerate(s.get("gpus") or []):     # DACAN: a series per card and per socket
+                    for k in ("util", "mem_used", "power"):
+                        v = g.get(k)
+                        self.hist[f"gpu{n}_{k}"].append(round(v, 2) if isinstance(v, float) else v)
+                for n, c in enumerate(s.get("sockets") or []):
+                    v = c.get("cpu")
+                    self.hist[f"socket{n}_cpu"].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)
 
     def snapshot(self):

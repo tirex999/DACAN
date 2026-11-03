@@ -6,7 +6,8 @@ const $ = (id) => document.getElementById(id);
 const SPRITE = "web/sprite.svg";
 const icon = (name, cls = "st-icon") => `<svg class="${cls}" aria-hidden="true"><use href="${SPRITE}#i-${name}"/></svg>`;
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d}));
+// numbers in the page's language (web/i18n.js: 1,234.5 / 1 234,5)
+const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–" : Number(n).toLocaleString(locale(), {maximumFractionDigits: d, minimumFractionDigits: d}));
 const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000 ? 0 : 1)}k` : fmt(n));
 // a context size: 32768 -> "32K" (powers of two), else like kfmt
 const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
@@ -50,7 +51,7 @@ async function copyText(text, btn) {
     use.setAttribute("href", `${SPRITE}#i-check`);
     setTimeout(() => use.setAttribute("href", `${SPRITE}#i-copy`), 1500);
   }
-  toast("success", "Copied to clipboard", "", 1800);
+  toast("success", t("Copied to clipboard"), "", 1800);
 }
 
 // ------------------------------------------------------------------ theme and tabs
@@ -94,15 +95,19 @@ function headers(json = false) {
   return h;
 }
 $("api-key").value = store.get("apikey", "");
-$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
+$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", t("API key saved"), t("Kept in this browser only.")); };
 
-let health = {model: "dacan", images: false, max_context: 0};
+let health = {model: "dacan", images: false, max_context: 0}, healthLoaded = false;
+// the texts that come from /health: the attach button's tip, the empty chat's line with the model's name
+function healthTexts() {
+  $("attach-btn").title = t(health.images ? "Attach a text file or a picture (or drop it here)" : "Attach a text file (or drop it here)");
+  if (healthLoaded) $("chat-empty-sub").textContent = t("{model} runs on this PC. Nothing leaves it.", {model: health.model});
+}
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
-    $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
-                                          : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+    healthLoaded = true;
+    healthTexts();
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
@@ -119,12 +124,14 @@ const METRICS = [
   {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
 ];
-$("metrics").innerHTML = METRICS.map((m) => `
+// the eight cards, in the page's language (built again on a language switch)
+function buildMetricCards() {
+  $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
-    <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
+    <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(t(m.label))}</span>
     ${m.key === "speed" ? `<div class="speed-values">
-      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
-      <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
+      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">${esc(t("Decode"))}</span></div>
+      <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">${esc(t("Prefill"))}</span></div>
     </div>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
     <span class="st-metric__sub" id="ms-${m.key}"></span>`}
     <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
@@ -134,6 +141,42 @@ $("metrics").innerHTML = METRICS.map((m) => `
         <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
         stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
   </div></div>`).join("");
+}
+buildMetricCards();
+
+// DACAN: a card per GPU (load, VRAM, temperature, power, PCIe) and per CPU socket (load, the RAM of its NUMA node)
+const sparkSvg = (id, tone) => `<svg class="st-metric__spark" id="${id}" viewBox="0 0 100 32" preserveAspectRatio="none"${tone ? ` data-tone="${tone}"` : ""}>
+      <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
+      stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>`;
+let devicesKey = "";
+function buildDevices(st) {
+  const gpus = st.gpus || [], sockets = st.sockets || [];
+  const key = `${gpus.map((g) => `${g.index}:${g.bus}`).join(",")}|${sockets.map((s) => s.node).join(",")}`;
+  if (key === devicesKey) return;
+  devicesKey = key;
+  const box = $("devices");
+  box.hidden = gpus.length < 2 && sockets.length < 2;
+  const row = (id, label) => `<dt>${esc(t(label))}</dt><dd id="${id}">–</dd>`;
+  box.innerHTML = gpus.map((g, i) => `
+    <div class="st-card dev-card" data-kind="gpu">
+      <div class="dev-card__head">${icon("gpu", "st-icon st-icon--sm")}<span>${esc(t("GPU {n}", {n: String(g.index)}))}</span>
+        <span class="dev-card__tag">${g.numa != null ? `NUMA ${g.numa} · ` : ""}${esc((g.bus || "").replace(/^0000:/, ""))}</span></div>
+      <div class="dev-card__name">${esc(g.name || "GPU")}</div>
+      <div class="dev-card__value"><span class="st-metric__value" id="dv-gpu${i}">–</span><span class="muted small">${esc(t("load"))}</span></div>
+      ${sparkSvg(`sp-gpu${i}`)}
+      <dl class="dev-card__rows">${row(`dv-gpu${i}-mem`, "VRAM")}${row(`dv-gpu${i}-temp`, "Temperature")}
+        ${row(`dv-gpu${i}-power`, "Power")}${row(`dv-gpu${i}-pcie`, "PCIe")}</dl>
+    </div>`).join("") + sockets.map((s, i) => `
+    <div class="st-card dev-card" data-kind="cpu">
+      <div class="dev-card__head">${icon("cpu", "st-icon st-icon--sm")}<span>${esc(t("CPU socket {n}", {n: String(i)}))}</span>
+        <span class="dev-card__tag">NUMA ${s.node} · ${esc(t("{n} threads", {n: s.threads}))}</span></div>
+      <div class="dev-card__name">${esc(st.cpu_name || "CPU")}</div>
+      <div class="dev-card__value"><span class="st-metric__value" id="dv-cpu${i}">–</span><span class="muted small">${esc(t("load"))}</span></div>
+      ${sparkSvg(`sp-cpu${i}`, "info")}
+      <dl class="dev-card__rows">${row(`dv-cpu${i}-ram`, "RAM of this node")}${row(`dv-cpu${i}-gpu`, "GPU on this node")}</dl>
+    </div>`).join("");
+}
+function setText(id, text) { const el = $(id); if (el) el.textContent = text == null || text === "" ? "–" : text; }
 
 function spark(id, values, max) {
   const svg = $(id);
@@ -156,8 +199,8 @@ async function poll() {
   try {
     const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
     if (r.status === 401) {
-      setPill("error", "API key needed");
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+      setPill("error", t("API key needed"));
+      if (!keyWarned) { keyWarned = true; toast("warn", t("API key needed"), t("This server needs a key: add it under About > Settings."), 6000); }
     } else if (r.ok) {
       lastMetrics = await r.json();
       metricsFailures = 0;
@@ -166,7 +209,7 @@ async function poll() {
       throw new Error(`HTTP ${r.status}`);
     }
   } catch (e) {
-    if (++metricsFailures === 3) setPill("error", "Server not reachable");
+    if (++metricsFailures === 3) setPill("error", t("Server not reachable"));
   }
   if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
   setTimeout(poll, 1000);
@@ -184,15 +227,15 @@ function render(m) {
   if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
     // 13.10.2026 (DACAN): the read speed in the pill too; before the first chunk is read, how long it has been reading
-    const rate = live.prefill_tok_s_mean ? ` · ${fmt(live.prefill_tok_s_mean)} tok/s` : "";
-    setPill("reading", pct != null ? `Reading prompt · ${pct}%${rate}`
-                                   : `Reading prompt${live.elapsed_s != null ? ` · ${fmt(live.elapsed_s)} s` : ""}`);
+    const rate = live.prefill_tok_s_mean ? ` · ${fmt(live.prefill_tok_s_mean)} ${t("tok/s")}` : "";
+    setPill("reading", pct != null ? t("Reading prompt · {pct}%", {pct}) + rate
+                                   : t("Reading prompt") + (live.elapsed_s != null ? ` · ${fmt(live.elapsed_s)} ${t("s")}` : ""));
   } else if (live.state === "generating") {
-    setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
+    setPill("generating", t("Generating · {x} tok/s", {x: fmt(live.tok_s, 1)}));
   } else {
-    setPill("idle", "Idle");
+    setPill("idle", t("Idle"));
   }
-  if (live.queued > 0) setPill("queued", `${live.queued} queued`);
+  if (live.queued > 0) setPill("queued", t("{n} queued", {n: live.queued}));
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "about") renderAbout(eng, hw, st);
@@ -203,7 +246,7 @@ function render(m) {
 function since(t) {
   if (!t) return "";
   const s = Math.max(0, Date.now() / 1000 - t);
-  return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
+  return s < 60 ? tr("just now") : s < 3600 ? tr("{x} min ago", {x: fmt(s / 60)}) : tr("{x} h ago", {x: fmt(s / 3600, 1)});
 }
 function renderConvCache(c) {
   $("cc-card").hidden = !c;
@@ -214,62 +257,73 @@ function renderConvCache(c) {
     $("cc-slots-text").textContent = `${fmt(c.parked)} / ${fmt(c.slots)}`;
     $("cc-slots-bar").style.width = pct(c.parked, c.slots);
     const budget = c.budget_mib * 1048576;
-    $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} GB`;
+    $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} ${t("GB")}`;
     $("cc-mem-bar").style.width = pct(c.bytes, budget);
   }
-  $("cc-sum").textContent = c.requests ? `${fmt(c.requests_reused)} of ${fmt(c.requests)} requests reused part of their prompt` : "";
-  const share = c.prompt_tokens ? ` (${fmt((100 * c.reused_tokens) / c.prompt_tokens)}% of all prompt tokens)` : "";
-  const event = c.last_event ? `${c.last_event === "parked" ? "Parked" : "Restored"} ${fmt(c.last_tokens)} tokens, ${since(c.last_at)}` : null;
+  $("cc-sum").textContent = c.requests ? t("{a} of {b} requests reused part of their prompt", {a: c.requests_reused || 0, b: c.requests}) : "";
+  const share = c.prompt_tokens ? t(" ({x}% of all prompt tokens)", {x: fmt((100 * c.reused_tokens) / c.prompt_tokens)}) : "";
+  const event = c.last_event ? t(c.last_event === "parked" ? "Parked {n} tokens, {since}" : "Restored {n} tokens, {since}",
+                                 {n: c.last_tokens || 0, since: since(c.last_at)}) : null;
   facts($("cc-facts"), [
-    ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
-    ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
-    ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
-    ["Last switch", c.enabled ? event : null],
+    [t("Last request"), c.last_prompt != null ? t("{a} of {b} prompt tokens reused", {a: c.last_reused || 0, b: c.last_prompt}) : null],
+    [t("Reused since start"), c.requests ? t("{n} tokens", {n: c.reused_tokens || 0}) + share : null],
+    [t("Parked / restored"), c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? t(" · {n} evicted", {n: c.evictions}) : ""}` : null],
+    [t("Last switch"), c.enabled ? event : null],
   ]);
   $("cc-note").textContent = c.enabled
-    ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
-    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+    ? t("A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full.")
+    : t("The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).");
 }
 
 function renderTotals(t) {
   if (!t || !t.requests) return "";
-  const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
+  const since = new Date(t.since * 1000).toLocaleString(locale(), {weekday: "short", hour: "2-digit", minute: "2-digit"});
   const read = t.prompt_tokens - t.reused;
-  const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
-  const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
-  return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
-         `${fmt(t.output_tokens)} written${oSpeed}`;
+  const pSpeed = t.prompt_ms > 0 && read > 0 ? tr(" at {x} tok/s", {x: fmt(read / (t.prompt_ms / 1000))}) : "";
+  const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? tr(" at {x} tok/s", {x: fmt(t.output_tokens / (t.decode_ms / 1000), 1)}) : "";
+  return tr("Since {since}: {n} requests · {read} prompt tokens read{pSpeed} ({reused} reused) · {out} written{oSpeed}",
+            {since, n: t.requests, read, pSpeed, reused: t.reused, out: t.output_tokens, oSpeed});
+}
+// the engine's phase while it writes (server.py: thinking, answering, "writing a tool call: X", "tool call complete")
+const PHASES = {thinking: ["Thinking", "Думает"], answering: ["Answering", "Отвечает"],
+                "tool call complete": ["Tool call complete", "Вызов инструмента готов"]};
+function phaseLabel(p) {
+  if (!p) return t("Generating");
+  const w = /^writing a tool call: (.*)$/.exec(p);
+  if (w) return t("Writing a tool call: {name}", {name: w[1]});
+  if (PHASES[p]) return PHASES[p][LANG === "ru" ? 1 : 0];
+  return p[0].toUpperCase() + p.slice(1);
 }
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // model state
   const on = live.queued > 0 ? "queued" : live.state;
   for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
   const prog = $("state-progress");
-  let label = "Waiting for a request", detail = "", pct = 0;
+  let label = t("Waiting for a request"), detail = "", pct = 0;
   if (live.state === "reading") {
-    label = "Reading prompt";
+    label = t("Reading prompt");
     prog.dataset.tone = "info";
     if (live.prompt_total) {
       pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%` +
-               (live.prefill_tok_s_mean ? ` · ${fmt(live.prefill_tok_s_mean)} tok/s` : "");
+      detail = t("{a} / {b} tokens · {pct}%", {a: live.prompt_read, b: live.prompt_total, pct}) +
+               (live.prefill_tok_s_mean ? ` · ${fmt(live.prefill_tok_s_mean)} ${t("tok/s")}` : "");
     } else {
       // the engine reports the read per chunk (8192 tokens): until the first one, the tokens and the time so far
-      detail = `${fmt(live.prompt_tokens)} tokens` + (live.elapsed_s != null ? ` · reading ${fmt(live.elapsed_s)} s` : "");
+      detail = t("{n} tokens", {n: live.prompt_tokens}) + (live.elapsed_s != null ? t(" · reading {x} s", {x: fmt(live.elapsed_s)}) : "");
     }
   } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
+    label = phaseLabel(live.phase);
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+    detail = t("{n} tokens · {x} tok/s", {n: live.generated, x: fmt(live.tok_s, 1)});
   } else if (last) {
     delete prog.dataset.tone;
-    detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
+    detail = t("last: {n} tokens", {n: last.output_tokens}) + (last.decode_tok_s ? t(" at {x} tok/s", {x: fmt(last.decode_tok_s, 1)}) : "");
   }
   $("state-label").textContent = label;
   if (live.parallel > 1) {
-    const busy = (live.slots || []).filter((slot) => slot.state !== "idle").length;
-    const concurrency = `Requests: ${fmt(live.running || 0)} · busy slots: ${fmt(busy)}/${fmt(live.parallel)}`;
+    const busy = (live.slots || []).filter((s) => s.state !== "idle").length;
+    const concurrency = t("Requests: {n} · busy slots: {a}/{b}", {n: live.running || 0, a: busy, b: live.parallel});
     detail = detail ? `${detail} · ${concurrency}` : concurrency;
   }
   $("state-detail").textContent = detail;
@@ -280,8 +334,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // a few tokens is mostly its first step and has none
   const lastDec = (requests || []).find((r) => r.decode_tok_s != null);
   const speed = live.state === "generating" ? live.tok_s : lastDec ? lastDec.decode_tok_s : null;
-  setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-            live.state === "generating" ? (live.parallel > 1 ? "Decode now · total" : "Decode now") : lastDec ? `Decode last answer · ${fmt(lastDec.output_tokens)} tokens` : "Decode");
+  setMetric("speed", speed == null ? null : fmt(speed, 1), t("t/s"),
+            live.state === "generating" ? t(live.parallel > 1 ? "Decode now · total" : "Decode now")
+            : lastDec ? t("Decode last answer · {n} tokens", {n: lastDec.output_tokens}) : t("Decode"));
   // the prompt read of the last request that read enough fresh tokens to measure it: a few tokens take the engine's
   // fixed start-up time, not reading time
   // 13.10.2026 (DACAN): 512 -> 4096 — a follow-up that reads ~1300 new tokens spends ~5 s mostly on that start-up time
@@ -291,43 +346,68 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // 13.10.2026 (DACAN): the live figure only while reading; while generating it may be the previous read's
   const prefill = live.state === "reading" ? live.prefill_tok_s_mean
                 : lastRead ? freshOf(lastRead) / (lastRead.prompt_ms / 1000) : null;
-  setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
-            live.state === "reading" ? "Prefill now"
-            : lastRead ? `Prefill last read · ${fmt(freshOf(lastRead))} new tokens` : "Prefill");
+  setMetric("prefill", prefill == null ? null : fmt(prefill), t("t/s"),
+            live.state === "reading" ? t("Prefill now")
+            : lastRead ? t("Prefill last read · {n} new tokens", {n: freshOf(lastRead)}) : t("Prefill"));
   spark("sp-speed", h.tok_s);
   spark("sp-prefill", h.prefill_tok_s_mean);
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
   const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
   const multi = (hw.gpus || []).length > 1;
   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
-            multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || (st.gpu_note ? "not available" : ""));
+            multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || (st.gpu_note ? t("not available") : ""));
   spark("sp-gpu", h.gpu_util, 100);
-  setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
-            multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
-                  : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : (st.gpu_note ? "not available on Windows AMD yet" : ""));
+  setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} ${t("GB")}` : t("GB"),
+            multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} ${t("GB")}`))
+                  : eng.expert_slots ? t("{n} experts cached", {n: eng.expert_slots}) : (st.gpu_note ? t("not available on Windows AMD yet") : ""));
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
             multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
   spark("sp-temp", h.gpu_temp, 90);
-  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
+  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), t("W"),
+            hw.gpu_power_limit ? t("of {x} W limit", {x: fmt(hw.gpu_power_limit)}) : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
-  // Each current link is shown separately so one GPU cannot hide another GPU's narrower link.
+  // Show each current link: a healthy first GPU must not hide a narrow second one.
   const links = (hw.gpus || []).length ? hw.gpus : [{pcie_gen: hw.gpu_pcie_gen, pcie_width: hw.gpu_pcie_width}];
-  const linkText = (gpu) => gpu.pcie_gen ? `Gen${gpu.pcie_gen} x${gpu.pcie_width || "?"}` : "–";
-  setMetric("pcie", links.map((gpu) => `x${gpu.pcie_width || "?"}`).join(" / "), "",
-            links.map((gpu) => `${gpu.index == null ? "" : `GPU ${gpu.index}: `}${linkText(gpu)}`).join(" · ") +
-            (hw.gpu_pcie_rx_mb == null ? "" : ` · to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s`));
+  const linkText = (g) => g.pcie_gen ? `Gen${g.pcie_gen} x${g.pcie_width || "?"}` : "–";
+  setMetric("pcie", links.map((g) => `x${g.pcie_width || "?"}`).join(" / "), "",
+            links.map((g) => `${g.index == null ? "" : `GPU ${g.index}: `}${linkText(g)}`).join(" · ") +
+            (hw.gpu_pcie_rx_mb == null ? "" : " · " + t("to GPU {x} MB/s", {x: fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)})));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
-  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
+  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", [(st.sockets || []).length > 1 ? t("{n} sockets", {n: st.sockets.length}) : "",
+            st.threads ? `${st.cores ? `${t("{n} cores", {n: st.cores})} · ` : ""}${t("{n} threads", {n: st.threads})}` : "",
+            hw.ram_total ? t("RAM {a} / {b} GB", {a: gb(hw.ram_used), b: gb(hw.ram_total, 0)}) : ""].filter(Boolean).join(" · "));
   spark("sp-cpu", h.cpu, 100);
   if (hw.disk_read_mb == null) {
-    setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
+    setMetric("disk", null, "", st.psutil ? "" : t("needs psutil (setup installs it)"));
   } else {
     const big = hw.disk_read_mb >= 1000;
-    setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",
-              hw.disk_write_mb == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`);
+    setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), t(big ? "GB/s" : "MB/s"),
+              hw.disk_write_mb == null ? "" : t("write {x} MB/s", {x: fmt(hw.disk_write_mb, 1)}));
   }
   spark("sp-disk", h.disk_read_mb);
+
+  // DACAN: a card per GPU and per socket
+  buildDevices(st);
+  const sg = st.gpus || [];
+  (hw.gpus || []).forEach((g, i) => {
+    setText(`dv-gpu${i}`, g.util == null ? null : `${fmt(g.util)}%`);
+    if ($(`sp-gpu${i}`)) spark(`sp-gpu${i}`, h[`gpu${i}_util`], 100);
+    setText(`dv-gpu${i}-mem`, g.mem_total ? `${gb(g.mem_used)} / ${gb(g.mem_total, 0)} ${t("GB")}` : null);
+    setText(`dv-gpu${i}-temp`, g.temp == null ? null : `${fmt(g.temp)} °C`);
+    const te = $(`dv-gpu${i}-temp`); if (te) te.dataset.hot = g.temp >= 80 ? "1" : "";
+    setText(`dv-gpu${i}-power`, g.power == null ? null : `${fmt(g.power)} ${t("W")}${g.power_limit ? t(" of {x}", {x: fmt(g.power_limit)}) : ""}`);
+    const gn = g.pcie_gen;
+    setText(`dv-gpu${i}-pcie`, gn ? `Gen${gn} x${g.pcie_width || "?"}${g.pcie_rx_mb == null ? "" :
+            ` · ↓${fmt(g.pcie_rx_mb, g.pcie_rx_mb < 10 ? 1 : 0)} ↑${fmt(g.pcie_tx_mb || 0, (g.pcie_tx_mb || 0) < 10 ? 1 : 0)} ${t("MB/s")}`}` : null);
+  });
+  (hw.sockets || []).forEach((s, i) => {
+    setText(`dv-cpu${i}`, s.cpu == null ? null : `${fmt(s.cpu)}%`);
+    if ($(`sp-cpu${i}`)) spark(`sp-cpu${i}`, h[`socket${i}_cpu`], 100);
+    setText(`dv-cpu${i}-ram`, s.ram_total ? `${gb(s.ram_used || 0)} / ${gb(s.ram_total, 0)} ${t("GB")}` : null);
+    const near = sg.filter((g) => g.numa === s.node).map((g) => `GPU ${g.index}`);
+    setText(`dv-cpu${i}-gpu`, near.length ? near.join(", ") : t("none"));
+  });
 
   // context fill: the running request, else the last one
   const ctx = eng.max_context || 0;
@@ -340,9 +420,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
   $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
-  $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
+  $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} ${t("GB")}` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
-  $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
+  $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} ${t("GB")}` : "–";
   const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : 0;
   $("ram-bar").style.width = `${ramPct}%`;
   if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
@@ -352,68 +432,73 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // recent requests
   const body = $("req-body");
   if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+    body.innerHTML = `<tr><td colspan="9" class="muted">${esc(t("No requests yet"))}</td></tr>`;
   } else {
-    const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
-                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
+    const badge = {stop: ["", t("Done")], length: ["", t("Max tokens")], cancel: ["st-badge--queued", t("Stopped")],
+                   disconnect: ["st-badge--queued", t("Closed")], error: ["st-badge--error", t("Error")]};
+    const projTitle = {true: t("experimental speed projection on"), false: t("experimental speed projection off")};
+    const pcieTitle = t("routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed");
     body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
-      const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
-      const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
+      const when = new Date(r.time * 1000).toLocaleTimeString(locale(), {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+      const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="${esc(projTitle[!!r.projection])}">${r.projection ? "ESP" : esc(t("stock"))}</span>`;
       // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
-        (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
+        (r.pcie_share ? ` <span class="muted" title="${esc(pcieTitle)}">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
       // Reused tokens are not prefetched again. Match the Monitor's existing Prefill metric.
       const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
       const prefillRate = fresh >= 512 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;   // MIN_PREFILL_TOKENS
-      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
+      return `<tr><td>${esc(when)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
         <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
-        <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+        <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} ${esc(t("s"))}</td></tr>`;
     }).join("");
   }
   const all = $("req-all");
   kept = kept == null ? requests.length : kept;
   all.hidden = kept <= 12;
-  all.textContent = reqShowAll ? "Show fewer" : `Show all (${kept})`;
+  all.textContent = reqShowAll ? t("Show fewer") : t("Show all ({n})", {n: kept});
   $("req-wrap").classList.toggle("all", reqShowAll);
   $("req-totals").textContent = renderTotals(totals);
 }
 
 function facts(el, rows) {
   el.innerHTML = rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v, copy]) =>
-    `<dt>${esc(k)}</dt><dd>${copy ? `<code>${esc(v)}</code><button class="st-btn st-btn--icon" data-copy="${esc(v)}" aria-label="Copy">${icon("copy")}</button>` : esc(v)}</dd>`).join("");
+    `<dt>${esc(k)}</dt><dd>${copy ? `<code>${esc(v)}</code><button class="st-btn st-btn--icon" data-copy="${esc(v)}" aria-label="${esc(t("Copy"))}">${icon("copy")}</button>` : esc(v)}</dd>`).join("");
 }
 // INFO cvec=project:4-44[:singleL] | add:A-B | 0
 function projectionText(c) {
   if (!c || c === "0" || c === 0) return null;
   const [mode, range, single] = String(c).split(":");
   const [a, b] = (range || "").split("-");
-  return `${mode === "project" ? "Projection" : "Additive"} control vector on layers ${a}–${b}` +
-         `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
-         "describes the vector as a refusal-direction projection; measure the speed yourself";
+  return t(mode === "project" ? "Projection control vector on layers {a}–{b}" : "Additive control vector on layers {a}–{b}",
+           {a: a || "", b: b || ""}) +
+         (single ? t(" (layer {n}'s direction)", {n: single.replace("single", "")}) : "") +
+         t(". Per chat in Sampling. Its package describes the vector as a refusal-direction projection; measure the speed yourself");
 }
 function renderAbout(eng, hw, st) {
-  const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
+  // the K/V cache's format; the minimax_m3 path (INFO arch) keeps its 4-bit rows without the rotation
+  const kv = {int8: t("8-bit"), q4_0: t(eng.arch === "minimax_m3" ? "4-bit" : "4-bit (Hadamard-rotated)"), fp16: t("16-bit"),
+              k8v4: t("K 8-bit + V 4-bit"), f32: t("32-bit")}[eng.kv] || eng.kv;
   facts($("facts-engine"), [
-    ["Model", eng.model],
-    ["Engine", eng.version ? `v${eng.version}` : "built from source"],
-    ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
-    ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
-    ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
-    ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
-    ["Images", eng.images ? "on" : "off"],
-    ["Experimental speed projection", projectionText(eng.cvec)],
+    [t("Model"), eng.model],
+    [t("Engine"), eng.version ? `v${eng.version}` : t("built from source")],
+    [t("Context"), eng.max_context ? t("{n} tokens", {n: eng.max_context}) : null],
+    [t("KV cache"), kv ? `${kv}${eng.kv_resident ? t(", streamed: {n} positions per layer in VRAM, the rest in RAM", {n: eng.kv_resident}) : t(", all in VRAM")}` : null],
+    [t("Experts in VRAM"), eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} ${t("GB")})` : null],
+    [t("Speculation"), eng.spec ? t("MTP drafts up to {n} tokens", {n: Math.max(0, (eng.mtp_max || eng.spec) - 1)}) + (eng.lookup ? t(", prompt lookup on") : "") : null],
+    [t("Images"), eng.images ? t("on") : t("off")],
+    [t("Experimental speed projection"), projectionText(eng.cvec)],
   ]);
   facts($("facts-hw"), [
-    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : (st.gpu_note || "not readable (NVML)")],
-    ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
-    ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
+    [t("GPU"), st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} ${t("GB")}` : ""}` : (st.gpu_note || t("not readable (NVML)"))],
+    [t("CPU"), st.cpu_name ? `${st.cpu_name}${st.threads ? t(", {n} threads", {n: st.threads}) : ""}` : null],
+    [t("RAM"), hw.ram_total ? `${gb(hw.ram_total, 0)} ${t("GB")}` : null],
   ]);
   const base = location.origin;
   facts($("facts-api"), [
-    ["OpenAI base URL", `${base}/v1`, true],
-    ["Anthropic base URL", base, true],
-    ["Model name", eng.model, true],
+    [t("OpenAI base URL"), `${base}/v1`, true],
+    [t("Anthropic base URL"), base, true],
+    [t("Model name"), eng.model, true],
   ]);
 }
 document.addEventListener("click", (e) => {
@@ -443,14 +528,15 @@ function renderMcp() {
   $("mcp-card").hidden = !servers.length;
   $("mcp-row").hidden = !servers.length;
   const ready = servers.filter((s) => s.status === "ready" || s.status === "stopped");
-  $("mcp-sum").textContent = servers.length ? `${fmt(mcpInfo.tools)} tools · ${ready.length} of ${servers.length} servers connected` : "";
-  $("mcp-row-sub").textContent = mcpInfo.tools ? `${fmt(mcpInfo.tools)} tools from ${ready.map((s) => s.name).join(", ")}; the model calls them when it decides to`
-                                               : "no server is connected yet (see the Monitor)";
+  $("mcp-sum").textContent = servers.length ? t("{n} tools · {a} of {b} servers connected", {n: mcpInfo.tools || 0, a: ready.length, b: servers.length}) : "";
+  $("mcp-row-sub").textContent = mcpInfo.tools ? t("{n} tools from {names}; the model calls them when it decides to",
+                                                   {n: mcpInfo.tools, names: ready.map((s) => s.name).join(", ")})
+                                               : t("no server is connected yet (see the Monitor)");
   $("mcp-list").innerHTML = servers.map((s) => {
-    const [cls, text] = MCP_STATE[s.status] || ["", s.status];
+    const [cls, text] = MCP_STATE[s.status] ? [MCP_STATE[s.status][0], t(MCP_STATE[s.status][1])] : ["", s.status];
     const info = s.info && s.info.name ? ` · ${s.info.name}${s.info.version ? ` ${s.info.version}` : ""}` : "";
     return `<div class="mcp-server"><div class="mcp-server__head"><span class="st-badge ${cls}">${esc(text)}</span>` +
-      `<strong>${esc(s.name)}</strong><span class="muted small">${esc(s.transport)} · ${fmt(s.tools.length)} tools${esc(info)}</span></div>` +
+      `<strong>${esc(s.name)}</strong><span class="muted small">${esc(s.transport)} · ${esc(t("{n} tools", {n: s.tools.length}))}${esc(info)}</span></div>` +
       (s.error ? `<div class="msg-error">${esc(s.error)}</div>` : "") +
       (s.tools.length ? `<div class="mcp-server__tools">${s.tools.map((t) => `<span class="chip" title="${esc(t.description || "")}">${esc(t.tool)}</span>`).join("")}</div>` : "") +
       `</div>`;
@@ -472,16 +558,18 @@ async function loadConfig() {
     const id = `cfg-${i}`, v = k.value;
     let input;
     if (k.kind === "bool" || k.kind === "enum") {
-      const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.choices.map((x) => [x, x]);
+      const opts = k.kind === "bool" ? [["true", t("on")], ["false", t("off")]] : k.choices.map((x) => [x, x]);
       const cur = v == null ? "" : String(v);
-      input = `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>default</option>` +
+      input = `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>${esc(t("default"))}</option>` +
         opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
     } else {
       const text = v == null ? "" : Array.isArray(v) ? v.join(", ") : String(v);
       input = `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
-        `value="${esc(text)}" placeholder="default" autocomplete="off">`;
+        `value="${esc(text)}" placeholder="${esc(t("default"))}" autocomplete="off">`;
     }
-    return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
+    // the help text comes from the server (serve/runconfig.py EDITABLE) in English; the dictionary has each one
+    const help = t(k.help || "");
+    return `<label for="${id}" title="${esc(help)}">${esc(help)}<code>${esc(k.key)}</code></label>${input}`;
   }).join("");
   $("cfg-card").hidden = false;
 }
@@ -499,17 +587,18 @@ $("cfg-save").addEventListener("click", async () => {
     const old = Array.isArray(k.value) ? k.value.join(", ") : k.value;
     if (JSON.stringify(v) !== JSON.stringify(old ?? null)) set[k.key] = v;
   });
-  if (!Object.keys(set).length) { $("cfg-msg").textContent = "Nothing changed."; return; }
+  if (!Object.keys(set).length) { $("cfg-msg").textContent = t("Nothing changed."); return; }
   try {
     const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set})});
     const b = await r.json();
     if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
     $("cfg-msg").textContent = b.changed.length
-      ? `Saved (${b.changed.join(", ")}); the earlier file is ${b.file}.bak. Start the model again to use it.` : "Nothing changed.";
+      ? t("Saved ({list}); the earlier file is {file}.bak. Start the model again to use it.", {list: b.changed.join(", "), file: b.file})
+      : t("Nothing changed.");
     loadConfig();
   } catch (e) {
     $("cfg-msg").textContent = "";
-    toast("error", "Not saved", String(e.message || e), 6000);
+    toast("error", t("Not saved"), String(e.message || e), 6000);
   }
 });
 
@@ -524,8 +613,8 @@ function inline(s) {
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="inline">${esc(codes[+i])}</code>`);
 }
 function codeBlock(lang, code) {
-  return `<div class="st-code"><div class="st-code__head"><span>${esc(lang || "code")}</span>` +
-    `<button class="st-btn st-btn--icon" data-code-copy aria-label="Copy code">${icon("copy")}</button></div>` +
+  return `<div class="st-code"><div class="st-code__head"><span>${esc(lang || t("code"))}</span>` +
+    `<button class="st-btn st-btn--icon" data-code-copy aria-label="${esc(t("Copy code"))}">${icon("copy")}</button></div>` +
     `<pre><code>${esc(code)}</code></pre></div>`;
 }
 function blocks(text) {
@@ -581,7 +670,7 @@ function markdown(text) {
 
 // ------------------------------------------------------------------ Chat
 const DEFAULTS = {thinking: "high", temperature: 0.9, top_p: 0.95, top_k: 20, max: "", seed: "7", show: true, esp: true, mcp: true};
-// 19.10.2026: temperature 0.9 and seed 7 by default. A browser that kept an earlier default untouched
+// DACAN 19.10.2026: temperature 0.9 and seed 7 by default. A browser that kept an earlier default untouched
 // (temperature 0.6 / 0.55 / 0.2 with top_p 0.95, top_k 20 and no seed) takes the new one; a value the user set stays.
 const OLD_DEFAULT_TEMPERATURES = [0.6, 0.55, 0.2];
 let settings = (() => {
@@ -600,7 +689,7 @@ function saveChat() {
   store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
                                            files: (m.files || []).map((f) => ({name: f.name}))})));
 }
-function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
+function timeStr(ms) { return new Date(ms).toLocaleTimeString(locale(), {hour: "2-digit", minute: "2-digit"}); }
 
 function msgEl(m, i) {
   const el = document.createElement("div");
@@ -623,8 +712,8 @@ function msgEl(m, i) {
       const wrap = document.createElement("div");
       wrap.className = "msg-images";
       for (const im of m.images) {
-        if (im.url) { const img = document.createElement("img"); img.src = im.url; img.alt = im.name || "image"; wrap.appendChild(img); }
-        else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || "image"); wrap.appendChild(c); }
+        if (im.url) { const img = document.createElement("img"); img.src = im.url; img.alt = im.name || t("image"); wrap.appendChild(img); }
+        else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || t("image")); wrap.appendChild(c); }
       }
       el.appendChild(wrap);
     }
@@ -634,13 +723,13 @@ function msgEl(m, i) {
     el.appendChild(b);
     const meta = document.createElement("div");
     meta.className = "st-msg__meta";
-    meta.textContent = `You · ${timeStr(m.time)}`;
+    meta.textContent = t("You · {time}", {time: timeStr(m.time)});
     el.appendChild(meta);
   } else {
     el.innerHTML = `<details class="st-collapse think" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
       `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body thinking"></div></details>` +
       `<div class="st-bubble"></div><div class="st-msg__meta"><span class="meta-text"></span>` +
-      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button></div>`;
+      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="${esc(t("Copy the answer"))}" title="${esc(t("Copy"))}">${icon("copy")}</button></div>`;
     updateAssistant(el, m, false);
   }
   return el;
@@ -649,23 +738,23 @@ function msgEl(m, i) {
 // the result as the model read it.  Its body is built only while open: a result can be 20,000 characters.
 const TOOL_STATE = {writing: ["st-badge--reading", "Writing"], running: ["st-badge--generating", "Running"], done: ["", "Done"],
                     error: ["st-badge--error", "Error"], skipped: ["st-badge--queued", "Not run"]};
-function toolHtml(t, k) {
-  const [cls, label] = TOOL_STATE[t.state] || ["", t.state];
-  const args = t.arguments == null ? "" : JSON.stringify(t.arguments, null, 2);
-  const preview = t.result != null ? t.result : args.replace(/\s+/g, " ");
+function toolHtml(tc, k) {
+  const [cls, label] = TOOL_STATE[tc.state] ? [TOOL_STATE[tc.state][0], t(TOOL_STATE[tc.state][1])] : ["", tc.state];
+  const args = tc.arguments == null ? "" : JSON.stringify(tc.arguments, null, 2);
+  const preview = tc.result != null ? tc.result : args.replace(/\s+/g, " ");
   let body = "";
-  if (t.open) {
-    body = `<div class="tool-call__label">Arguments</div><pre class="tool-call__pre">${esc(args || "(being written)")}</pre>`;
-    if (t.result != null) {
-      body += `<div class="tool-call__label">${t.ok ? "Result" : "Error"}${t.chars ? ` · ${fmt(t.chars)} characters` : ""}` +
-              `${t.truncated ? ", cut for the model" : ""}</div><pre class="tool-call__pre">${esc(t.result)}</pre>`;
+  if (tc.open) {
+    body = `<div class="tool-call__label">${esc(t("Arguments"))}</div><pre class="tool-call__pre">${esc(args || t("(being written)"))}</pre>`;
+    if (tc.result != null) {
+      body += `<div class="tool-call__label">${esc(t(tc.ok ? "Result" : "Error"))}${tc.chars ? esc(t(" · {n} characters", {n: tc.chars})) : ""}` +
+              `${tc.truncated ? esc(t(", cut for the model")) : ""}</div><pre class="tool-call__pre">${esc(tc.result)}</pre>`;
     }
   }
-  return `<details class="st-collapse tool-call" data-tool="${k}" data-state="${esc(t.state)}"${t.open ? " open" : ""}>` +
-    `<summary>${icon("tool", "st-icon st-icon--sm")}<span class="tool-call__name" title="${esc(t.name || "")}">${esc(t.tool || t.name || "tool")}</span>` +
-    (t.server ? `<span class="muted small">${esc(t.server)}</span>` : "") +
+  return `<details class="st-collapse tool-call" data-tool="${k}" data-state="${esc(tc.state)}"${tc.open ? " open" : ""}>` +
+    `<summary>${icon("tool", "st-icon st-icon--sm")}<span class="tool-call__name" title="${esc(tc.name || "")}">${esc(tc.tool || tc.name || t("tool"))}</span>` +
+    (tc.server ? `<span class="muted small">${esc(tc.server)}</span>` : "") +
     `<span class="tool-call__preview muted">${esc(preview.slice(0, 200))}</span>` +
-    `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
+    `<span class="st-badge ${cls}">${esc(label)}</span>${tc.ms != null && tc.state !== "skipped" ? `<span class="muted small">${fmt(tc.ms / 1000, 1)} ${esc(t("s"))}</span>` : ""}` +
     `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>`;
 }
 // the answer's text with the tool blocks where the model called them
@@ -698,8 +787,8 @@ function updateAssistant(el, m, streaming) {
   if (m.reasoning) {
     det.hidden = false;
     const thinkingNow = streaming && !m.text;
-    el.querySelector(".think-title").textContent = thinkingNow ? "Thinking…" :
-      m.thinkSecs != null ? `Thought for ${fmt(m.thinkSecs, 1)} s` : "Thoughts";
+    el.querySelector(".think-title").textContent = thinkingNow ? t("Thinking…") :
+      m.thinkSecs != null ? t("Thought for {x} s", {x: fmt(m.thinkSecs, 1)}) : t("Thoughts");
     const body = el.querySelector(".thinking");
     if (det.open || thinkingNow) body.textContent = m.reasoning;
     else body.dataset.pending = "1";
@@ -712,12 +801,12 @@ function updateAssistant(el, m, streaming) {
     bubble.innerHTML = `<div class="msg-error"></div>`;
     bubble.firstChild.textContent = m.error;
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
-    bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
+    bubble.innerHTML = m.reasoning ? `<span class="muted cursor">${esc(t("Writing"))}</span>` : `<span class="cursor"></span>`;
   } else {
     bubble.innerHTML = answerHtml(m);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
-  el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
+  el.querySelector(".meta-text").textContent = metaText(m) || (streaming ? "" : m.stopped ? t("Stopped") : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
 }
 function renderChat() {
@@ -798,7 +887,23 @@ function assistantMessages(m) {
 function setBusy(on) {
   $("stop-btn").hidden = !on;
   $("send-btn").disabled = on;
-  $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
+  $("composer-hint").textContent = on ? "" : t("Shift+Enter: new line");
+}
+// the line under an answer, written in the page's language from its facts (metaInfo); a chat kept by an older page
+// has the English line itself (meta)
+function metaText(m) {
+  const f = m.metaInfo;
+  if (!f) return m.meta || "";
+  let s = "";
+  if (f.n) {
+    s = t("{n} tokens", {n: f.n}) + (f.rate ? ` · ${fmt(f.rate, 1)} ${t("tok/s")}` : "") + (f.stopped ? t(" · stopped") : "") +
+        (f.projection == null ? "" : t(f.projection ? " · projection on" : " · projection off"));
+  } else if (f.stopped) {
+    s = t("Stopped");
+  }
+  if (f.tools) s = (s ? `${s} · ` : "") + t("{n} tool calls", {n: f.tools});
+  if (f.limit) s += t(" · stopped at the limit of {n} tool rounds (mcp.max_rounds)", {n: f.limit});
+  return s;
 }
 
 async function send() {
@@ -838,7 +943,7 @@ async function send() {
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-      if (r.status === 401) msg = "This server needs an API key: add it under About > Settings.";
+      if (r.status === 401) msg = t("This server needs an API key: add it under About > Settings.");
       throw new Error(msg);
     }
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -856,7 +961,7 @@ async function send() {
         if (data === "[DONE]") continue;
         let j;
         try { j = JSON.parse(data); } catch (e) { continue; }
-        if (j.error) throw new Error(j.error.message || "the engine reported an error");
+        if (j.error) throw new Error(j.error.message || t("the engine reported an error"));
         if (j.usage) usage = j.usage;
         if (j.dacan_mcp) onTool(m, j.dacan_mcp);
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
@@ -878,27 +983,31 @@ async function send() {
     }
   } catch (e) {
     if (e.name === "AbortError") m.stopped = true;
-    else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
+    else { m.error = e.message || String(e); toast("error", t("The request failed"), m.error, 6000); }
   }
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
+  // the line under the answer: its facts, written in the page's language when shown (metaText)
   const n = usage ? usage.completion_tokens : null;
+  const info = {};
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
-    m.meta = `${fmt(n)} tokens${n >= 32 && secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
-             (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
+    Object.assign(info, {n, rate: n >= 32 && secs > 0.25 ? n / secs : null, stopped: !!m.stopped,
+                         projection: projectionLoaded() ? !!settings.esp : null});
   } else if (m.stopped) {
-    m.meta = "Stopped";
+    info.stopped = true;
   }
-  for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null; }
-  const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
-  if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${ran} tool call${ran > 1 ? "s" : ""}`;
-  if (m.limit) m.meta = `${m.meta || ""} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
+  for (const tc of m.tools || []) if (tc.state === "writing" || tc.state === "running") { tc.state = "skipped"; tc.ms = null; }
+  const ran = (m.tools || []).filter((tc) => tc.state === "done" || tc.state === "error").length;
+  if (ran) info.tools = ran;
+  if (m.limit) info.limit = m.limit;
+  if (Object.keys(info).length) m.metaInfo = info;
   busy = null;
   setBusy(false);
   if (frame) cancelAnimationFrame(frame);
   updateAssistant(el, m, false);
   saveChat();
   scrollDown();
+  if (chatStale) { chatStale = false; renderChat(); }   // the language changed while it was writing
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
@@ -910,21 +1019,21 @@ function autosize() { const t = $("input"); t.style.height = "auto"; t.style.hei
 $("input").addEventListener("input", autosize);
 
 $("new-btn").onclick = () => {
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (busy) { toast("warn", t("Still writing"), t("Stop the answer first.")); return; }
   if (!messages.length) return;
   const backup = messages;
   messages = [];
   saveChat();
   renderChat();
-  toast("info", "New chat", "The last one was cleared.", 6000, {label: "Undo", run: () => { messages = backup; saveChat(); renderChat(); }});
+  toast("info", t("New chat"), t("The last one was cleared."), 6000, {label: t("Undo"), run: () => { messages = backup; saveChat(); renderChat(); }});
 };
 $("export-btn").onclick = () => {
-  if (!messages.length) { toast("info", "Nothing to save yet"); return; }
-  const tools = (m) => (m.tools || []).filter((t) => t.result != null).map((t) =>
-    `<details><summary>Tool ${t.server ? `${t.server} / ` : ""}${t.tool || t.name}${t.ok ? "" : " (error)"}</summary>\n\n` +
-    `\`\`\`json\n${JSON.stringify(t.arguments || {}, null, 2)}\n\`\`\`\n\n\`\`\`\n${t.result}\n\`\`\`\n\n</details>\n\n`).join("");
-  const md = messages.map((m) => m.role === "user" ? `## You\n\n${m.text}\n` :
-    `## ${health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
+  if (!messages.length) { toast("info", t("Nothing to save yet")); return; }
+  const tools = (m) => (m.tools || []).filter((tc) => tc.result != null).map((tc) =>
+    `<details><summary>${t("Tool")} ${tc.server ? `${tc.server} / ` : ""}${tc.tool || tc.name}${tc.ok ? "" : t(" (error)")}</summary>\n\n` +
+    `\`\`\`json\n${JSON.stringify(tc.arguments || {}, null, 2)}\n\`\`\`\n\n\`\`\`\n${tc.result}\n\`\`\`\n\n</details>\n\n`).join("");
+  const md = messages.map((m) => m.role === "user" ? `## ${t("You")}\n\n${m.text}\n` :
+    `## ${health.model}\n\n${m.reasoning ? `<details><summary>${t("Thinking")}</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([md], {type: "text/markdown"}));
   a.download = `dacan-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
@@ -942,19 +1051,23 @@ function isTextFile(f) {
 function addFiles(files) {
   for (const f of files) {
     if (f.type.startsWith("image/")) {
-      if (!health.images) { toast("warn", "Pictures are off", "This model was set up for text only."); continue; }
-      if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
+      if (!health.images) { toast("warn", t("Pictures are off"), t("This model was set up for text only.")); continue; }
+      if (f.size > 20e6) { toast("warn", t("Picture too large"), t("{name} is over 20 MB.", {name: f.name})); continue; }
       const r = new FileReader();
-      r.onload = () => { attachments.push({kind: "image", name: f.name || "pasted image", url: r.result}); renderAttachments(); };
+      r.onload = () => { attachments.push({kind: "image", name: f.name || t("pasted image"), url: r.result}); renderAttachments(); };
       r.readAsDataURL(f);
       continue;
     }
-    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${health.images ? " or pictures" : ""}.`); continue; }
-    if (f.size > MAX_TEXT_FILE) { toast("warn", "File too large", `${f.name} is over 512 KB.`); continue; }
+    if (!isTextFile(f)) {
+      toast("warn", t("Not a text file"), t(health.images ? "{name}: attach text files (code, notes, logs, data) or pictures."
+                                                          : "{name}: attach text files (code, notes, logs, data).", {name: f.name}));
+      continue;
+    }
+    if (f.size > MAX_TEXT_FILE) { toast("warn", t("File too large"), t("{name} is over 512 KB.", {name: f.name})); continue; }
     const r = new FileReader();
     r.onload = () => {
       const text = String(r.result);
-      if (text.includes("\u0000")) { toast("warn", "Not a text file", `${f.name} looks like a binary file.`); return; }
+      if (text.includes("\u0000")) { toast("warn", t("Not a text file"), t("{name} looks like a binary file.", {name: f.name})); return; }
       attachments.push({kind: "file", name: f.name, text});
       renderAttachments();
     };
@@ -981,7 +1094,7 @@ function renderAttachments() {
     c.innerHTML = icon(a.kind === "file" ? "attach" : "image", "st-icon st-icon--sm");
     c.append(a.name);
     const x = document.createElement("button");
-    x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", "Remove");
+    x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", t("Remove"));
     x.innerHTML = icon("trash");
     x.onclick = () => { attachments.splice(i, 1); renderAttachments(); };
     c.appendChild(x);
@@ -1021,14 +1134,37 @@ function openDrawer(open) {
   if (open) { loadDrawer(); loadShared(); loadMcp(); loadThreads(); }
 }
 // 19.10.2026: the CPU threads slider - the run config's cpu_threads (GET / POST /config); the server starts the
-// engine again with them.  Hidden when the server has no such key (an older server, or no run config).
-let threadsKey = null;
+// engine again with them.  21.10.2026 (Vadim: the context size and the KV cache's quant right in the web page): the
+// run config's max_context and kv_cache the same way; Apply sends what changed at once, so the model restarts once.
+// Each control is hidden when the server has no such key (an older server, or no run config).
+let threadsKey = null, ctxKey = null, kvKey = null;
+const KV_TEXT = {fp16: "fp16 - full precision", int8: "int8 - half the memory", q4_0: "q4_0 - a quarter, 4-bit",
+                 k8v4: "k8v4 - int8 K + 4-bit V"};
+function fmtCtx(n) { return n % 1024 === 0 ? t("{x}K tokens", {x: String(n / 1024)}) : t("{n} tokens", {n}); }
+function engineOptions(now, list, text) {
+  return (now == null ? `<option value="" selected>${esc(t("engine default"))}</option>` : "") +
+    list.map((x) => `<option value="${esc(String(x))}"${x === now ? " selected" : ""}>${esc(text(x))}</option>`).join("");
+}
 async function loadThreads() {
-  threadsKey = null;
+  threadsKey = ctxKey = kvKey = null;
   try {
     const r = await fetch("config", {headers: headers()});
-    if (r.ok) threadsKey = ((await r.json()).keys || []).find((k) => k.key === "cpu_threads") || null;
-  } catch (e) { /* the slider stays hidden */ }
+    if (r.ok) {
+      const keys = (await r.json()).keys || [];
+      threadsKey = keys.find((k) => k.key === "cpu_threads") || null;
+      ctxKey = keys.find((k) => k.key === "max_context") || null;
+      kvKey = keys.find((k) => k.key === "kv_cache") || null;
+      if (kvKey && !(kvKey.choices || []).length) kvKey = null;   // an engine without --kv
+    }
+  } catch (e) { /* the controls stay hidden */ }
+  $("ctx-field").hidden = !ctxKey;
+  if (ctxKey) {
+    const now = ctxKey.value ?? null;
+    const list = [...new Set([...(ctxKey.choices || []), ...(now == null ? [] : [now])])].sort((a, b) => a - b);
+    $("s-ctx").innerHTML = engineOptions(now, list, fmtCtx);
+  }
+  $("kv-field").hidden = !kvKey;
+  if (kvKey) $("s-kv").innerHTML = engineOptions(kvKey.value ?? null, kvKey.choices, (x) => (KV_TEXT[x] ? t(KV_TEXT[x]) : x));
   $("threads-field").hidden = !threadsKey;
   if (!threadsKey) return;
   const el = $("s-threads");
@@ -1039,22 +1175,30 @@ async function loadThreads() {
 function outputThreads() {
   if (!threadsKey) return;
   const v = +$("s-threads").value, max = +threadsKey.max, usable = +threadsKey.usable || max;
-  $("o-threads").textContent = `${v} of ${max} threads${v === max ? " (all)" : ""}`;
-  $("threads-note").textContent = (usable < max ? `this system lets the engine use ${usable} of the CPU's ${max} threads ` +
-    `(more than ${usable} runs on those ${usable}); ` : "") + "a change restarts the model (about a minute)";
+  $("o-threads").textContent = t("{v} of {max} threads", {v, max}) + (v === max ? t(" (all)") : "");
+  $("threads-note").textContent = (usable < max ? t("this system lets the engine use {u} of the CPU's {max} threads (more than {u} runs on those {u}); ",
+                                                    {u: usable, max}) : "") + t("a change restarts the model (about a minute)");
 }
-async function saveThreads() {
-  if (!threadsKey) return;
-  const v = +$("s-threads").value, now = threadsKey.value ?? +threadsKey.max;
-  if (v === +now) return;
+async function saveEngine() {
+  const set = {};
+  if (threadsKey) {
+    const v = +$("s-threads").value, now = threadsKey.value ?? +threadsKey.max;
+    if (v !== +now) set.cpu_threads = v;
+  }
+  if (ctxKey && $("s-ctx").value !== "" && +$("s-ctx").value !== (ctxKey.value ?? null)) set.max_context = +$("s-ctx").value;
+  if (kvKey && $("s-kv").value !== "" && $("s-kv").value !== (kvKey.value ?? null)) set.kv_cache = $("s-kv").value;
+  const names = Object.keys(set);
+  if (!names.length) return;
+  const what = names.map((k) => k === "cpu_threads" ? t("CPU threads: {v}", {v: String(set[k])}) :
+                                k === "max_context" ? t("context: {x}", {x: fmtCtx(set[k])}) : t("KV cache: {x}", {x: set[k]})).join(", ");
   try {
-    const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set: {cpu_threads: v}})});
+    const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set})});
     const b = await r.json();
     if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
-    toast("success", `CPU threads: ${v}`, b.engine === "restarting" ? "The model restarts with them (about a minute); requests wait meanwhile."
-                                       : "Saved: the model uses them from its next start.", 6000);
+    toast("success", what, b.engine === "restarting" ? t("The model restarts with it (about a minute); requests wait meanwhile.")
+                                 : t("Saved: the model uses it from its next start."), 6000);
   } catch (e) {
-    toast("error", "CPU threads not changed", e.message, 6000);
+    toast("error", t("Not changed - {what}", {what}), e.message, 6000);
   }
 }
 function loadDrawer(s = settings) {
@@ -1101,13 +1245,13 @@ function projectionLoaded() {
   return !!c && c !== "0";
 }
 function outputs() {
-  const t = +$("s-temp").value;
-  $("o-temp").textContent = t === 0 ? "0 · greedy" : t.toFixed(2);
+  const temp = +$("s-temp").value;
+  $("o-temp").textContent = temp === 0 ? t("0 · greedy") : temp.toFixed(2);
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
   $("o-topk").textContent = $("s-topk").value;
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  $("o-thinking").textContent = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v] : "";
-  for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
+  $("o-thinking").textContent = sel ? t({none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v]) : "";
+  for (const id of ["s-topp", "s-topk"]) $(id).disabled = temp === 0;
 }
 for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
@@ -1126,28 +1270,54 @@ $("s-apply").onclick = async () => {
               mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
   store.set("sampling", settings);
   const share = $("s-share").getAttribute("aria-checked") === "true";
-  saveThreads();
+  saveEngine();
   openDrawer(false);
   if (share || sharedOn) {
     try {
       await saveShared(share, settings);
-      toast("success", "Sampling saved", share ? "Other apps (omp, API clients) use these settings from their next request."
-                                               : "Other apps use their own settings again.");
+      toast("success", t("Sampling saved"), share ? t("Other apps (omp, API clients) use these settings from their next request.")
+                                                  : t("Other apps use their own settings again."));
     } catch (e) {
-      toast("error", "Saved here, but not for other apps", e.message, 6000);
+      toast("error", t("Saved here, but not for other apps"), e.message, 6000);
     }
     return;
   }
-  toast("success", "Sampling saved", settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "");
+  toast("success", t("Sampling saved"), settings.temperature === 0 ? t("Greedy: the same question gives the same answer.") : "");
 };
 $("sampling-btn").onclick = () => openDrawer(true);
 $("drawer-close").onclick = () => openDrawer(false);
 $("scrim").onclick = () => openDrawer(false);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
 
+// ------------------------------------------------------------------ the page's language (web/i18n.js)
+// 26.10.2026 (Vadim: «сделай выбор языка в веб морде, на анг и рус, для совсем глупых»): EN | RU in the header and
+// under About > Settings.  A switch rewrites the fixed texts (applyI18n) and draws again what the page wrote itself;
+// an answer being written is drawn again once it ends (its element is the one the stream writes into).
+let chatStale = false;
+function relocalize() {
+  buildMetricCards();
+  devicesKey = "";                                  // the GPU / socket cards are built again by the next render
+  healthTexts();
+  setBusy(!!busy);
+  outputs();
+  if (threadsKey) outputThreads();
+  if ($("drawer").dataset.open === "true") loadThreads();
+  renderMcp();
+  if (tab === "about") loadConfig();
+  if (lastMetrics) render(lastMetrics);
+  if (busy) chatStale = true; else renderChat();
+}
+for (const b of document.querySelectorAll("[data-lang]")) {
+  b.addEventListener("click", () => { if (b.dataset.lang !== LANG && setLangValue(b.dataset.lang)) relocalize(); });
+}
+
 // ------------------------------------------------------------------ start
 setBusy(false);
+healthTexts();
 renderChat();
+// /?lang=ru (or en): a link that opens the page in that language - kept, as a click on the switch is
+const langParam = new URLSearchParams(location.search).get("lang");
+if (langParam && langParam !== LANG && setLangValue(langParam)) relocalize();
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
 loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });

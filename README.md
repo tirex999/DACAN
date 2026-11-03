@@ -16,8 +16,17 @@ for Windows x64 and Linux x64). Its source is not published; the installer and t
 
 DACAN is our own engine. It started in September 2026 on the base of [Strata](https://github.com/Niko1221/Strata) (MIT)
 and has been developed separately since then, with its own kernels: NVFP4 + Q8 on RTX 20 (Turing) cards, one or two
-cards, one or two CPU sockets, a context up to 524K, vision and a live monitor. Strata's copyright notice is kept in
+cards, one or two CPU sockets, a context up to 1M (1,048,576 tokens), vision and a live monitor. Strata's copyright notice is kept in
 [LICENSE](LICENSE), as MIT requires.
+
+## Current release: build 5
+
+Build 5 ships the current DACAN engine code and the same server and web interface used in our running installation.
+The chat settings include context (up to **1M = 1,048,576 tokens = 1024K**), KV cache format and CPU threads.
+Changing an engine setting waits for the current request before restarting the model. Applying unchanged settings
+keeps the selected context. The installer and MCP server also offer 1M; setup uses **YaRN ×4** at that size.
+The recommendation still depends on your hardware: a longer context needs more RAM and VRAM. Existing installs
+keep their chosen context when updated. Historical measurements above retain their original context and build.
 
 ## What you need
 

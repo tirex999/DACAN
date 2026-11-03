@@ -1,0 +1,387 @@
+// serve/web/i18n.js - the web app's two languages, English and Russian (26.10.2026, Vadim: «сделай выбор языка в
+// веб морде, на анг и рус, для совсем глупых»).  EN | RU in the header and under About > Settings; the choice is
+// kept in this browser, the first visit follows the browser's language.  The English text is the key: t("Idle") is
+// "Ожидание" in Russian, and a text with no Russian entry stays English.  {name} takes a value; {n|a|b|c} is the
+// word for the number n: English one|other, Russian one|few|many (1 токен, 2 токена, 5 токенов).
+// Markup: data-i18n (the element's text), data-i18n-title / -placeholder / -label (aria-label), data-lang (a button).
+"use strict";
+
+const I18N_LANGS = ["en", "ru"];
+let LANG = (() => {
+  try { const v = localStorage.getItem("dacan.lang"); if (I18N_LANGS.includes(v)) return v; } catch (e) { /* none */ }
+  return /^ru(\b|-)/i.test(navigator.language || "") ? "ru" : "en";
+})();
+const locale = () => (LANG === "ru" ? "ru-RU" : "en-US");
+
+// the dictionary stays plain JSON between its two marker lines (tools/check of the keys reads it)
+const RU = {
+"Decode now · total": "Генерация сейчас · суммарно",
+"Requests: {n} · busy slots: {a}/{b}": "Запросов: {n} · занято слотов: {a}/{b}",
+"Views": "Разделы",
+"Chat": "Чат",
+"Monitor": "Монитор",
+"About": "О программе",
+"Connecting…": "Подключение…",
+"Light / dark": "Светлая / тёмная",
+"Switch between light and dark": "Переключить светлую и тёмную тему",
+"Language": "Язык",
+"Ask anything": "Спросите что угодно",
+"The model runs on this PC. Nothing leaves it.": "Модель работает на этом компьютере. Ничего не уходит наружу.",
+"{model} runs on this PC. Nothing leaves it.": "{model} работает на этом компьютере. Ничего не уходит наружу.",
+"Ask anything…": "Спросите что угодно…",
+"Message": "Сообщение",
+"Attach a text file (or drop it here)": "Прикрепить текстовый файл (или перетащите его сюда)",
+"Attach a text file or a picture (or drop it here)": "Прикрепить текстовый файл или картинку (или перетащите сюда)",
+"Attach a file": "Прикрепить файл",
+"New chat": "Новый чат",
+"Save this chat as Markdown": "Сохранить этот чат в Markdown",
+"Save this chat": "Сохранить этот чат",
+"Sampling and thinking": "Настройки ответа",
+"Stop": "Стоп",
+"Send": "Отправить",
+"Model state": "Состояние модели",
+"Idle": "Ожидание",
+"Reading": "Читает",
+"Generating": "Пишет",
+"Queued": "В очереди",
+"Error": "Ошибка",
+"Waiting for a request": "Ждёт запроса",
+"Context fill": "Заполнение контекста",
+"Experts in VRAM": "Эксперты в видеопамяти",
+"System RAM": "Оперативная память",
+"GPU temperature": "Температура видеокарты",
+"Recent requests": "Последние запросы",
+"Show all": "Показать все",
+"Time": "Время",
+"Status": "Итог",
+"Prompt": "Промпт",
+"Reused": "Из кэша",
+"Output": "Ответ",
+"Prefill t/s": "Чтение т/с",
+"New prompt tokens per second, excluding reused cache tokens (engine prompt time)": "Новых токенов промпта в секунду, без взятых из кэша (время чтения промпта движком)",
+"Decode t/s": "Генерация т/с",
+"VRAM hit rate": "Попадания в видеопамять",
+"While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)": "Пока пишется ответ: доля нужных экспертов, которые уже лежали в видеопамяти. Эксперты, которые видеокарта читала по PCIe (--pcie-frac), сюда не входят; их доля среди всех выбранных экспертов показана следом (+N% PCIe)",
+"Duration": "Длительность",
+"No requests yet": "Запросов пока нет",
+"Conversation cache": "Кэш разговоров",
+"Parked conversations": "Отложенные разговоры",
+"Their memory (RAM)": "Их память (ОЗУ)",
+"MCP servers": "Серверы MCP",
+"Their tools run on this PC with your rights, when the model decides to call them (in this page's chat only; switch it off in Sampling).": "Их инструменты работают на этом компьютере с вашими правами, когда модель решит их вызвать (только в чате этой страницы; выключаются в настройках ответа).",
+"Model and engine": "Модель и движок",
+"This PC": "Этот компьютер",
+"Connect your tools": "Подключить свои программы",
+"Any OpenAI- or Anthropic-compatible client works with these addresses.": "С этими адресами работает любой клиент, совместимый с OpenAI или Anthropic.",
+"Settings": "Настройки",
+"API key": "Ключ API",
+"only if the server was started with one": "только если сервер запущен с ключом",
+"Not needed": "Не нужен",
+"Dark theme": "Тёмная тема",
+"Chats, settings and the key are kept in this browser only.": "Чаты, настройки и ключ хранятся только в этом браузере.",
+"DACAN on GitHub": "DACAN на GitHub",
+"Model settings": "Настройки модели",
+"Kept in the model's run config for every client. An empty field is the default. They take effect the next time the model starts (close DACAN's window and start it again).": "Хранятся в файле запуска модели и действуют для всех клиентов. Пустое поле — значение по умолчанию. Применяются со следующего запуска модели (закройте окно DACAN и запустите его снова).",
+"Save": "Сохранить",
+"Sampling": "Настройки ответа",
+"Close": "Закрыть",
+"Thinking": "Размышления",
+"Off": "Нет",
+"Low": "Мало",
+"Medium": "Средне",
+"High": "Много",
+"Temperature": "Температура",
+"0 = always the most likely word (exact, repeatable)": "0 — всегда самое вероятное слово (точно и повторяемо)",
+"Max tokens": "Лимит токенов",
+"empty = until done": "пусто — до конца ответа",
+"Until done": "До конца ответа",
+"Seed": "Зерно",
+"empty = random": "пусто — случайное",
+"Random": "Случайное",
+"CPU threads": "Потоки процессора",
+"the CPU's logical threads; a change restarts the model (about a minute)": "логические потоки процессора; при смене модель перезапустится (около минуты)",
+"Context": "Контекст",
+"how many tokens the model holds - prompt, thinking and answer; a change restarts the model (about a minute)": "сколько токенов держит модель — промпт, размышления и ответ; при смене модель перезапустится (около минуты)",
+"KV cache": "KV-кэш",
+"how the context is stored: fewer bits - less memory, slightly less precise; a change restarts the model (about a minute)": "как хранится контекст: меньше бит — меньше памяти, чуть менее точно; при смене модель перезапустится (около минуты)",
+"Show thinking": "Показывать размышления",
+"expanded while it streams": "раскрыты, пока идут",
+"Use tools from MCP servers": "Инструменты серверов MCP",
+"the model may call them while it answers": "модель может вызывать их, пока отвечает",
+"Experimental speed projection": "Экспериментальная проекция скорости",
+"the engine's control vector; off = the stock model. Switching reads the chat again once": "управляющий вектор движка; выключено — обычная модель. При переключении чат один раз читается заново",
+"Use for other apps too": "И для других программ",
+"omp and other API clients get these settings for anything they don't set themselves": "omp и другие клиенты API получают эти настройки для всего, что не задают сами",
+"Reset": "Сбросить",
+"Apply": "Применить",
+"Copied to clipboard": "Скопировано",
+"API key saved": "Ключ API сохранён",
+"Kept in this browser only.": "Хранится только в этом браузере.",
+"Speed": "Скорость",
+"GPU load": "Загрузка видеокарты",
+"VRAM": "Видеопамять",
+"GPU temp": "Температура видеокарты",
+"Power": "Мощность",
+"CPU": "Процессор",
+"Disk read": "Чтение с диска",
+"Decode": "Генерация",
+"Prefill": "Чтение промпта",
+"GPU {n}": "Видеокарта {n}",
+"CPU socket {n}": "Процессор {n}",
+"{n} threads": "{n} {n|поток|потока|потоков}",
+"load": "загрузка",
+"RAM of this node": "Память этого узла",
+"GPU on this node": "Видеокарты этого узла",
+"API key needed": "Нужен ключ API",
+"This server needs a key: add it under About > Settings.": "Серверу нужен ключ: добавьте его в «О программе» > «Настройки».",
+"Server not reachable": "Сервер недоступен",
+"Reading prompt": "Читает промпт",
+"Reading prompt · {pct}%": "Читает промпт · {pct}%",
+"Generating · {x} tok/s": "Пишет · {x} т/с",
+"{n} queued": "в очереди: {n}",
+"just now": "только что",
+"{x} min ago": "{x} мин назад",
+"{x} h ago": "{x} ч назад",
+"{a} of {b} requests reused part of their prompt": "{a} из {b} {b|запроса|запросов|запросов} взяли часть промпта из кэша",
+" ({x}% of all prompt tokens)": " ({x}% всех токенов промпта)",
+"Parked {n} tokens, {since}": "Отложено {n} {n|токен|токена|токенов}, {since}",
+"Restored {n} tokens, {since}": "Возвращено {n} {n|токен|токена|токенов}, {since}",
+"Last request": "Последний запрос",
+"{a} of {b} prompt tokens reused": "{a} из {b} {b|токена|токенов|токенов} промпта взято из кэша",
+"Reused since start": "Из кэша с запуска",
+"{n} tokens": "{n} {n|токен|токена|токенов}",
+"Parked / restored": "Отложено / возвращено",
+" · {n} evicted": " · вытеснено {n}",
+"Last switch": "Последнее переключение",
+"A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full.": "Запрос, который продолжает отложенный разговор, получает его состояние обратно и не читает его заново; когда места или память заканчиваются, уходит самый старый.",
+"The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).": "Движок держит состояние последнего разговора, поэтому следующий вопрос читает только новое. Чтобы держать несколько разговоров (агенты по очереди), добавьте \"--conversation-cache-mib\", \"8192\" в args файла запуска (docs/DETAILS.md).",
+"Since {since}: {n} requests · {read} prompt tokens read{pSpeed} ({reused} reused) · {out} written{oSpeed}": "С {since}: {n} {n|запрос|запроса|запросов} · прочитано {read} {read|токен|токена|токенов} промпта{pSpeed} ({reused} из кэша) · написано {out}{oSpeed}",
+" at {x} tok/s": " — {x} т/с",
+"{a} / {b} tokens · {pct}%": "{a} / {b} {b|токен|токена|токенов} · {pct}%",
+" · reading {x} s": " · читает {x} с",
+"{n} tokens · {x} tok/s": "{n} {n|токен|токена|токенов} · {x} т/с",
+"last: {n} tokens": "последний: {n} {n|токен|токена|токенов}",
+"Writing a tool call: {name}": "Пишет вызов инструмента: {name}",
+"t/s": "т/с",
+"tok/s": "т/с",
+"GB": "ГБ",
+"GB/s": "ГБ/с",
+"MB/s": "МБ/с",
+"W": "Вт",
+"s": "с",
+"Decode now": "Генерация сейчас",
+"Decode last answer · {n} tokens": "Генерация, последний ответ · {n} {n|токен|токена|токенов}",
+"Prefill now": "Чтение промпта сейчас",
+"Prefill last read · {n} new tokens": "Последнее чтение · {n} {n|новый токен|новых токена|новых токенов}",
+"not available": "недоступно",
+"{n} experts cached": "{n} {n|эксперт|эксперта|экспертов} в кэше",
+"not available on Windows AMD yet": "пока недоступно на Windows с AMD",
+"of {x} W limit": "из {x} Вт лимита",
+"to GPU {x} MB/s": "к видеокарте {x} МБ/с",
+" · idle Gen{g}": " · в простое Gen{g}",
+"{n} sockets": "{n} {n|процессор|процессора|процессоров}",
+"{n} cores": "{n} {n|ядро|ядра|ядер}",
+"RAM {a} / {b} GB": "ОЗУ {a} / {b} ГБ",
+"needs psutil (setup installs it)": "нужен psutil (его ставит установщик)",
+"write {x} MB/s": "запись {x} МБ/с",
+" of {x}": " из {x}",
+"none": "нет",
+"Done": "Готово",
+"Stopped": "Остановлено",
+"Closed": "Закрыто",
+"experimental speed projection on": "экспериментальная проекция скорости включена",
+"experimental speed projection off": "экспериментальная проекция скорости выключена",
+"stock": "обычная",
+"routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed": "выбранные эксперты, которые видеокарта прочитала по PCIe (--pcie-frac) или посчитала другая видеокарта",
+"Show fewer": "Показать меньше",
+"Show all ({n})": "Показать все ({n})",
+"Copy": "Копировать",
+"Projection control vector on layers {a}–{b}": "Проекционный управляющий вектор на слоях {a}–{b}",
+"Additive control vector on layers {a}–{b}": "Аддитивный управляющий вектор на слоях {a}–{b}",
+" (layer {n}'s direction)": " (направление слоя {n})",
+". Per chat in Sampling. Its package describes the vector as a refusal-direction projection; measure the speed yourself": ". Включается для чата в настройках ответа. В его пакете вектор описан как проекция направления отказа; скорость измерьте сами",
+"8-bit": "8 бит",
+"4-bit (Hadamard-rotated)": "4 бита (с поворотом Адамара)",
+"16-bit": "16 бит",
+"4-bit": "4 бита",
+"K 8-bit + V 4-bit": "K 8 бит + V 4 бита",
+"32-bit": "32 бита",
+"Model": "Модель",
+"Engine": "Движок",
+"built from source": "собран из исходников",
+", streamed: {n} positions per layer in VRAM, the rest in RAM": ", по частям: {n} {n|позиция|позиции|позиций} на слой в видеопамяти, остальное в ОЗУ",
+", all in VRAM": ", весь в видеопамяти",
+"Speculation": "Черновики (спекуляция)",
+"MTP drafts up to {n} tokens": "MTP-черновики до {n} {n|токена|токенов|токенов}",
+", prompt lookup on": ", поиск по промпту включён",
+"Images": "Картинки",
+"on": "вкл",
+"off": "выкл",
+"GPU": "Видеокарта",
+"not readable (NVML)": "не читается (NVML)",
+", {n} threads": ", {n} {n|поток|потока|потоков}",
+"RAM": "ОЗУ",
+"OpenAI base URL": "Адрес для OpenAI",
+"Anthropic base URL": "Адрес для Anthropic",
+"Model name": "Имя модели",
+"Connected": "Подключён",
+"Starting": "Запускается",
+"Failed": "Сбой",
+"Waiting": "Ожидает",
+"{n} tools · {a} of {b} servers connected": "{n} {n|инструмент|инструмента|инструментов} · подключено {a} из {b}",
+"{n} tools from {names}; the model calls them when it decides to": "{n} {n|инструмент|инструмента|инструментов} от {names}; модель вызывает их, когда сочтёт нужным",
+"no server is connected yet (see the Monitor)": "пока ни один сервер не подключён (см. «Монитор»)",
+"{n} tools": "{n} {n|инструмент|инструмента|инструментов}",
+"default": "по умолчанию",
+"Default temperature for requests that send none (0 = greedy, the default without a sampling block)": "Температура по умолчанию для запросов без своей (0 — всегда самое вероятное слово; так и без блока sampling)",
+"Default top_p for requests that send none": "top_p по умолчанию для запросов без своего",
+"Default top_k for requests that send none (1-64)": "top_k по умолчанию для запросов без своего (1–64)",
+"Default min_p for requests that send none": "min_p по умолчанию для запросов без своего",
+"Cap the thinking of every request at this many tokens (0 or empty: no cap)": "Ограничить размышления каждого запроса этим числом токенов (0 или пусто — без ограничения)",
+"Shorten a max_tokens that does not fit the context instead of answering 400": "Укорачивать max_tokens, который не влезает в контекст, вместо ответа 400",
+"Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)": "Запросы Anthropic без просьбы думать: думать, как привыкла модель (model), или нет (on_request)",
+"Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)": "Куда ставить нестандартную глубину размышлений: в начало (по умолчанию) или в конец (кэш сохраняется при её смене)",
+"Other model names the server lists and answers to (comma-separated)": "Другие имена модели, которые сервер показывает и на которые отвечает (через запятую)",
+"Unload the model after this many seconds without requests (0 or empty: never)": "Выгружать модель после стольких секунд без запросов (0 или пусто — никогда)",
+"Start without loading the model; the first request loads it (text only)": "Запускаться без загрузки модели; её загрузит первый запрос (только текст)",
+"End a request when the engine says nothing for this long (default 300 s, 0 = wait)": "Прерывать запрос, если движок молчит столько секунд (по умолчанию 300 с, 0 — ждать)",
+"Keep the last 100 requests' prompts and answers in memory for /api-monitor": "Хранить промпты и ответы последних 100 запросов в памяти для /api-monitor",
+"Open the chat page in the browser when the model is ready": "Открывать страницу чата в браузере, когда модель готова",
+"VRAM in MiB the engine leaves free for other programs (engine default 700)": "Сколько видеопамяти (МиБ) движок оставляет свободной другим программам (по умолчанию 700)",
+"CPU threads (logical processors) of the engine's expert pool, its own loop counted - up to every logical thread of the CPU; empty: the engine's own count; a change restarts the model": "Потоки процессора (логические) для пула экспертов движка, вместе с его собственным циклом — вплоть до всех потоков процессора; пусто — сколько решит движок; при смене модель перезапустится",
+"Context size in tokens - how many the model holds (prompt, thinking and answer); a change restarts the model": "Размер контекста в токенах — сколько держит модель (промпт, размышления и ответ); при смене модель перезапустится",
+"How the KV cache is stored: fp16 (full precision), int8 (half the memory), q4_0 (a quarter, 4-bit after a rotation, slightly less precise), k8v4 (int8 K + 4-bit V); a change restarts the model": "Как хранится KV-кэш: fp16 (полная точность), int8 (половина памяти), q4_0 (четверть, 4 бита после поворота, чуть менее точно), k8v4 (K в int8 + V в 4 битах); при смене модель перезапустится",
+"Nothing changed.": "Ничего не изменилось.",
+"Saved ({list}); the earlier file is {file}.bak. Start the model again to use it.": "Сохранено ({list}); прежний файл — {file}.bak. Запустите модель заново, чтобы применить.",
+"Not saved": "Не сохранено",
+"code": "код",
+"Copy code": "Копировать код",
+"image": "картинка",
+"You · {time}": "Вы · {time}",
+"Copy the answer": "Копировать ответ",
+"Writing": "Пишет",
+"Running": "Выполняется",
+"Not run": "Не выполнен",
+"Arguments": "Аргументы",
+"(being written)": "(пишется)",
+"Result": "Результат",
+" · {n} characters": " · {n} {n|символ|символа|символов}",
+", cut for the model": ", обрезан для модели",
+"tool": "инструмент",
+"Thinking…": "Думает…",
+"Thought for {x} s": "Думал {x} с",
+"Thoughts": "Размышления",
+"Shift+Enter: new line": "Shift+Enter — новая строка",
+"This server needs an API key: add it under About > Settings.": "Серверу нужен ключ API: добавьте его в «О программе» > «Настройки».",
+"the engine reported an error": "движок сообщил об ошибке",
+"The request failed": "Запрос не удался",
+" · stopped": " · остановлено",
+" · projection on": " · проекция включена",
+" · projection off": " · проекция выключена",
+"{n} tool calls": "{n} {n|вызов инструмента|вызова инструментов|вызовов инструментов}",
+" · stopped at the limit of {n} tool rounds (mcp.max_rounds)": " · остановлено на пределе в {n} {n|раунд|раунда|раундов} инструментов (mcp.max_rounds)",
+"Still writing": "Ещё пишет",
+"Stop the answer first.": "Сначала остановите ответ.",
+"The last one was cleared.": "Прошлый чат очищен.",
+"Undo": "Вернуть",
+"Nothing to save yet": "Пока нечего сохранять",
+"You": "Вы",
+"Tool": "Инструмент",
+" (error)": " (ошибка)",
+"Pictures are off": "Картинки выключены",
+"This model was set up for text only.": "Эта модель настроена только на текст.",
+"Picture too large": "Картинка слишком большая",
+"{name} is over 20 MB.": "{name} больше 20 МБ.",
+"pasted image": "вставленная картинка",
+"Not a text file": "Не текстовый файл",
+"{name}: attach text files (code, notes, logs, data).": "{name}: прикрепляйте текстовые файлы (код, заметки, логи, данные).",
+"{name}: attach text files (code, notes, logs, data) or pictures.": "{name}: прикрепляйте текстовые файлы (код, заметки, логи, данные) или картинки.",
+"File too large": "Файл слишком большой",
+"{name} is over 512 KB.": "{name} больше 512 КБ.",
+"{name} looks like a binary file.": "{name} похож на двоичный файл.",
+"Remove": "Убрать",
+"fp16 - full precision": "fp16 — полная точность",
+"int8 - half the memory": "int8 — половина памяти",
+"q4_0 - a quarter, 4-bit": "q4_0 — четверть памяти, 4 бита",
+"k8v4 - int8 K + 4-bit V": "k8v4 — K в int8 + V в 4 битах",
+"{x}K tokens": "{x}K токенов",
+"engine default": "как решит движок",
+"{v} of {max} threads": "{v} из {max} {max|потока|потоков|потоков}",
+" (all)": " (все)",
+"this system lets the engine use {u} of the CPU's {max} threads (more than {u} runs on those {u}); ": "система даёт движку {u} из {max} {max|потока|потоков|потоков} процессора (больше {u} работает на тех же {u}); ",
+"a change restarts the model (about a minute)": "при смене модель перезапустится (около минуты)",
+"CPU threads: {v}": "Потоки процессора: {v}",
+"context: {x}": "контекст: {x}",
+"KV cache: {x}": "KV-кэш: {x}",
+"The model restarts with it (about a minute); requests wait meanwhile.": "Модель перезапускается с этим (около минуты); запросы пока подождут.",
+"Saved: the model uses it from its next start.": "Сохранено: модель возьмёт это при следующем запуске.",
+"Not changed - {what}": "Не изменено — {what}",
+"0 · greedy": "0 · самое вероятное слово",
+"answers right away": "отвечает сразу",
+"short": "коротко",
+"medium": "средне",
+"thorough (default)": "подробно (по умолчанию)",
+"Sampling saved": "Настройки ответа сохранены",
+"Other apps (omp, API clients) use these settings from their next request.": "Другие программы (omp, клиенты API) берут эти настройки со следующего запроса.",
+"Other apps use their own settings again.": "Другие программы снова берут свои настройки.",
+"Saved here, but not for other apps": "Сохранено здесь, но не для других программ",
+"Greedy: the same question gives the same answer.": "Самое вероятное слово: на один и тот же вопрос — один и тот же ответ."
+};
+// end of the dictionary
+
+// the word for n: English one|other, Russian one|few|many; a fraction takes the Russian «few» (1,5 токена)
+function pluralForm(n, forms) {
+  if (forms.length === 2) return n === 1 ? forms[0] : forms[1];
+  if (!Number.isFinite(n)) return forms[forms.length - 1];
+  if (!Number.isInteger(n)) return forms[1];
+  const a = Math.abs(n) % 100, b = a % 10;
+  if (b === 1 && a !== 11) return forms[0];
+  if (b >= 2 && b <= 4 && (a < 12 || a > 14)) return forms[1];
+  return forms[2];
+}
+
+// t("Idle") - the text in the chosen language; t("{n} tokens", {n: 5}) fills the values: a number is written in
+// the language's way (1,234 / 1 234), anything else as it is, a missing one as "–"
+function t(s, v) {
+  const out = LANG === "ru" && Object.prototype.hasOwnProperty.call(RU, s) ? RU[s] : s;
+  if (!v) return out;
+  return out.replace(/\{(\w+)((?:\|[^|{}]*)+)?\}/g, (m, k, forms) => {
+    const x = v[k];
+    if (forms) return pluralForm(typeof x === "number" ? x : NaN, forms.slice(1).split("|"));
+    if (x == null) return "–";
+    return typeof x === "number" ? x.toLocaleString(locale(), {maximumFractionDigits: 0}) : String(x);
+  });
+}
+
+// the same, for code where a local `t` (a time, a tool, a temperature) hides the global one
+const tr = t;
+
+// the page's fixed texts: data-i18n keeps an element's English text as its key the first time, then every switch
+// writes that key's text; the same for the title, placeholder and aria-label attributes
+const I18N_ATTRS = [["title", "i18nTitle"], ["placeholder", "i18nPlaceholder"], ["aria-label", "i18nLabel"]];
+function applyI18n() {
+  document.documentElement.lang = LANG;
+  for (const el of document.querySelectorAll("[data-i18n]")) {
+    if (!el.dataset.i18n) el.dataset.i18n = el.textContent.trim().replace(/\s+/g, " ");
+    el.textContent = t(el.dataset.i18n);
+  }
+  for (const [attr, key] of I18N_ATTRS) {
+    const flag = attr === "aria-label" ? "label" : attr;
+    for (const el of document.querySelectorAll(`[data-i18n-${flag}]`)) {
+      if (!el.dataset[key]) el.dataset[key] = el.getAttribute(attr) || "";
+      el.setAttribute(attr, t(el.dataset[key]));
+    }
+  }
+  for (const b of document.querySelectorAll("[data-lang]")) b.setAttribute("aria-checked", String(b.dataset.lang === LANG));
+}
+
+// a switch: kept in this browser (only a click is saved, as the theme)
+function setLangValue(l) {
+  if (!I18N_LANGS.includes(l)) return false;
+  LANG = l;
+  try { localStorage.setItem("dacan.lang", l); } catch (e) { /* private mode: this page only */ }
+  applyI18n();
+  return true;
+}
+
+applyI18n();

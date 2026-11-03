@@ -207,9 +207,9 @@ says so and starts the engine you had.
 
 - **Which model and size?** The original, Swift 1.5, the Coder or Unsloth's 4-bit, and Q2_0, IQ2_XS, IQ3_XXS or
   IQ3_S - see [which model](MODELS.md).
-- **How much context?** How much text it can keep in mind at once (it suggests one for your card). 384K and
-  512K (experimental) extend the model past its trained 262K by rope scaling - the setup turns it on itself (yarn and a
-  covering factor; `--rope-scaling`/`--rope-scale` override) ([details](DETAILS.md): "Context extension past
+- **How much context?** How much text it can keep in mind at once (it suggests one for your card). 384K, 512K and
+  1M (1,048,576 tokens; experimental) extend the model past its trained 262K by rope scaling - the setup turns it on itself (yarn and a
+  covering factor: 4 at 1M; `--rope-scaling`/`--rope-scale` override) ([details](DETAILS.md): "Context extension past
   262K").
 - **Images?** Whether it should also read pictures. The image encoder (0.9 GB) runs on the GPU (0.1-0.5 s per
   picture, ~1.4 GB of VRAM kept free for it) or on the CPU (about 3-13 s per picture, nothing on the GPU); with AMD cards

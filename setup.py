@@ -178,7 +178,8 @@ PREBUILT_URL = "https://github.com/tirex999/DACAN/releases/latest/download/"
 # when --prebuilt points the download somewhere else, because the hash is only worth having if it comes
 # from somewhere the download does not.
 REPO = "tirex999/DACAN"
-PREBUILT_TAG_URL = "https://github.com/tirex999/DACAN/releases/download/v{version}/"
+DACAN_RELEASE_TAG = "v0.1.42-build5"                 # current engine snapshot + matching server/UI
+PREBUILT_TAG_URL = f"https://github.com/tirex999/DACAN/releases/download/{DACAN_RELEASE_TAG}/"
 ENGINE_VERSION = "0.1.42"                       # the DACAN engine version of this release
 PREBUILT_ASSET = "dacan-windows-x64.zip" if WIN else "dacan-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
@@ -191,7 +192,7 @@ MIN_DRIVER = 580                       # CUDA 13.0
 CUDA13_MIN_ARCH = 75                   # the oldest compute capability CUDA 13 compiles for (sm_75, RTX 20)
 CUDA12_ASSET = "dacan-windows-x64-cuda12.zip" if WIN else "dacan-linux-x64-cuda12.zip"
 DACAN_ASSETS = ("dacan-windows-x64.zip", "dacan-linux-x64.zip")   # DACAN's own ready-made engines
-DACAN_BUILD = 4                 # BUILD.json "dacan" of the current DACAN engine; a lower one (true = 1) is replaced
+DACAN_BUILD = 5                 # BUILD.json "dacan" of the current DACAN engine; a lower one (true = 1) is replaced
                       # 2: scaled (NVFP4) packs load on Windows
                       # 3: the engine named dacan / dacan-vision, the Linux x64 engine
                       # 4: on two cards the engine sets its own PCIe share per card (Linux 12.10, Windows 13.10)
@@ -274,7 +275,7 @@ UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and
 # the trained range are out of spec.
 # 204800 (200K) sits between 128K and 256K: it is inside the trained 262144, so it needs no rope scaling and
 # costs ~2.8 GB of 8-bit KV with IQ3_S (vs ~3.6 GB at 256K) - a middle step for PCs that cannot hold 256K.
-CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
+CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288, 1048576]
 # The model families: the same architecture, weights in the same three GSQ-RCO sizes, different files.
 FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "by": "Qwen; GSQ-RCO quants by ISTA-DASLab",
@@ -5223,7 +5224,7 @@ def main() -> int:
                          "picks yarn; 'none' is refused for such a context")
     ap.add_argument("--rope-scale", type=float,
                     help="the extension factor (default: the final context over the trained 262144, at least 1 - "
-                         "1.5 for 384K, 2 for 512K, 1 inside the trained range)")
+                         "1.5 for 384K, 2 for 512K, 4 for 1M, 1 inside the trained range)")
     ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4"],
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
                          "precise) or k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell)")

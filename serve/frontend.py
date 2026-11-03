@@ -52,10 +52,18 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        # 26.10.2026: the server hands a template its tools flat ({"name", "description", "parameters"} - the Qwen
+        # templates' shape); MiniMax-M3.1's reads tool.function (the OpenAI shape) and every request with tools failed
+        # in it (400 «Object of type Undefined is not JSON serializable»: the agents' calls 26.10 17:0x, when they fell
+        # back to the local service).  A template that reads tool.function gets them wrapped back.
+        self.nested_tools = "tool.function" in self.source
         self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
+        if tools and self.nested_tools:
+            tools = [t if isinstance(t, dict) and isinstance(t.get("function"), dict) else {"type": "function", "function": t}
+                     for t in tools]
         # Do not use completed empty assistant turns as examples for the next reply. Keep the final message.
         # (#843.  DACAN_KEEP_EMPTY_TURNS=1 renders them as before.)
         messages = [m for i, m in enumerate(messages)
@@ -1324,3 +1332,187 @@ class OutputParser:
         self._reset_scan()
         self.state, self.lead = "content", True
         return [Event("tool_call", call=call)]
+
+
+# ------------------------------------------------------------------------------------- model formats (DACAN, 25.10.2026)
+# One server, several model families: the reasoning tags, the end-of-turn tokens and the tool-call grammar are the
+# model's own, read from its chat template - not a branch per model name.  Qwen (the default) keeps exactly what the
+# server always did; MiniMax-M3 (its template defines the `]<]minimax[>[` namespace token) writes
+#     <mm:think>reasoning</mm:think>content
+#     ]<]minimax[>[<tool_call>
+#     ]<]minimax[>[<invoke name="NAME">]<]minimax[>[<arg>value]<]minimax[>[</arg>...]<]minimax[>[</invoke>
+#     ]<]minimax[>[</tool_call>
+# where an object argument is nested elements and an array is <item> elements (the template's to_xml), and the turn
+# ends with `[e~[`.  The template ends the prompt at `]~b]ai\n` with no prefix: the model opens its reply with
+# <mm:think> (it reasons) or </mm:think> (it does not), so the parser starts undecided either way.
+
+MM_NS = "]<]minimax[>["
+MM_THINK_START, MM_THINK_END = "<mm:think>", "</mm:think>"
+MM_CALL_START, MM_CALL_END = MM_NS + "<tool_call>", MM_NS + "</tool_call>"
+_MM_TAG = re.compile(re.escape(MM_NS) + r"<(/?)([^<>\s/][^<>\s]*)>")
+_MM_INVOKE = re.compile(re.escape(MM_NS) + r'<invoke name="([^"]*)">(.*?)' + re.escape(MM_NS) + r"</invoke>", re.S)
+
+
+def _mm_elements(text: str) -> list[tuple[str, object]]:
+    """The namespace-tagged elements of `text`, in order, as (tag, value): a value is the element's text when it holds
+    no elements, else the list of its own (tag, value) pairs.  A stray closer is left as the text it is."""
+    root: list = []
+    stack: list[tuple[str, int, list]] = []          # (tag, where its text starts, its children)
+    for m in _MM_TAG.finditer(text):
+        closing, tag = m.group(1) == "/", m.group(2)
+        if not closing:
+            stack.append((tag, m.end(), []))
+            continue
+        if not stack or stack[-1][0] != tag:
+            continue
+        tag0, start, kids = stack.pop()
+        value = kids if kids else text[start:m.start()]
+        (stack[-1][2] if stack else root).append((tag0, value))
+    return root
+
+
+def _mm_value(value, schema: dict | None):
+    """An element's value as JSON: nested elements -> an object, or an array when they are all <item>; text -> the
+    string itself when the schema says string, else decoded as JSON when it is JSON (true, 3, 2.5, ...), else text -
+    the rule parse_tool_call applies to the Qwen form."""
+    schema = schema or {}
+    if isinstance(value, list):
+        if value and all(tag == "item" for tag, _ in value):
+            items = schema.get("items") if isinstance(schema.get("items"), dict) else None
+            return [_mm_value(v, items) for _, v in value]
+        props = schema.get("properties") or {}
+        return {tag: _mm_value(v, props.get(tag)) for tag, v in value}
+    if schema.get("type") == "string":
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def parse_minimax_calls(block: str, schemas: dict) -> list[ToolCall]:
+    """The body of one ]<]minimax[>[<tool_call> ... </tool_call> block -> its calls, in order."""
+    calls = []
+    for m in _MM_INVOKE.finditer(block):
+        name = m.group(1).strip()
+        props = ((schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
+        args = {tag: _mm_value(v, props.get(tag)) for tag, v in _mm_elements(m.group(2))}
+        calls.append(ToolCall(name=name, arguments=args))
+    if not calls:
+        raise ValueError("a MiniMax tool-call block without a whole <invoke>: " + block[:80])
+    return calls
+
+
+class MiniMaxOutputParser:
+    """OutputParser's interface (feed / finish, the same events; state, buf, rescued, refused, pending) for the
+    MiniMax-M3 format above.  A tag split across deltas is held back until it is complete.  Tool calls are reported
+    whole ("tool_call") at the block's end; a block cut off by the end of the turn is returned as content."""
+
+    THINK_END = MM_THINK_END
+
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 recover: bool = False):
+        self.state = "start"            # start -> reasoning | content; content <-> call
+        self.buf = ""
+        self.schemas = {t.get("name"): t for t in tools or []}
+        self.rescued = self.refused = 0
+        self.pending: list = []
+        self.after_think = False        # the first content after </mm:think>: its leading newlines go
+
+    @staticmethod
+    def _held(buf: str, tag: str) -> int:
+        """How many trailing characters of `buf` could still be the start of `tag`."""
+        for k in range(min(len(tag) - 1, len(buf)), 0, -1):
+            if tag.startswith(buf[-k:]):
+                return k
+        return 0
+
+    def _content(self, text: str) -> list[Event]:
+        if self.after_think:
+            text = text.lstrip("\n")
+            if not text:
+                return []
+            self.after_think = False
+        return [Event("content", text)] if text else []
+
+    def feed(self, delta: str) -> list[Event]:
+        self.buf += delta
+        out: list[Event] = []
+        while True:
+            if self.state == "start":
+                s = self.buf.lstrip()
+                if s.startswith(MM_THINK_START):
+                    self.buf, self.state = s[len(MM_THINK_START):], "reasoning"
+                elif s.startswith(MM_THINK_END):
+                    self.buf, self.state, self.after_think = s[len(MM_THINK_END):], "content", True
+                elif MM_THINK_START.startswith(s) or MM_THINK_END.startswith(s):
+                    return out                          # still undecided: wait for more
+                else:
+                    self.state = "content"
+                continue
+            if self.state == "reasoning":
+                i = self.buf.find(MM_THINK_END)
+                if i >= 0:
+                    if i:
+                        out.append(Event("reasoning", self.buf[:i]))
+                    self.buf, self.state, self.after_think = self.buf[i + len(MM_THINK_END):], "content", True
+                    continue
+                k = self._held(self.buf, MM_THINK_END)
+                if len(self.buf) > k:
+                    out.append(Event("reasoning", self.buf[:len(self.buf) - k]))
+                    self.buf = self.buf[len(self.buf) - k:]
+                return out
+            if self.state == "content":
+                i = self.buf.find(MM_CALL_START)
+                if i >= 0:
+                    out += self._content(self.buf[:i])
+                    self.buf, self.state = self.buf[i + len(MM_CALL_START):], "call"
+                    continue
+                k = self._held(self.buf, MM_CALL_START)
+                if len(self.buf) > k:
+                    out += self._content(self.buf[:len(self.buf) - k])
+                    self.buf = self.buf[len(self.buf) - k:]
+                return out
+            if self.state == "call":
+                i = self.buf.find(MM_CALL_END)
+                if i < 0:
+                    return out
+                block, self.buf = self.buf[:i], self.buf[i + len(MM_CALL_END):]
+                try:
+                    out += [Event("tool_call", call=c) for c in parse_minimax_calls(block, self.schemas)]
+                except ValueError:
+                    out += self._content(MM_CALL_START + block + MM_CALL_END)
+                self.state, self.after_think = "content", False
+                continue
+            return out
+
+    def finish(self, reason: str | None = None) -> list[Event]:
+        out: list[Event] = []
+        if self.state == "call":                        # cut off inside a block: the text it is
+            out += self._content(MM_CALL_START + self.buf)
+        elif self.state == "reasoning" and self.buf:
+            out.append(Event("reasoning", self.buf))
+        elif self.buf:
+            out += self._content(self.buf)
+        self.buf = ""
+        self.state = "content"
+        return out
+
+
+@dataclass
+class ModelFormat:
+    """What the server needs to know of a model family's text format."""
+    name: str
+    think_end: str
+    end_tokens: tuple[str, ...]
+    parser: type
+
+
+QWEN_FORMAT = ModelFormat("qwen", THINK_END, ("<|im_end|>", "<|endoftext|>"), OutputParser)
+MINIMAX_M3_FORMAT = ModelFormat("minimax_m3", MM_THINK_END, ("[e~[",), MiniMaxOutputParser)
+
+
+def model_format(template_source: str) -> ModelFormat:
+    """The family of the model whose chat template this is: MiniMax-M3's defines its namespace token; anything else
+    is the Qwen format the server was written for."""
+    return MINIMAX_M3_FORMAT if MM_NS in template_source else QWEN_FORMAT

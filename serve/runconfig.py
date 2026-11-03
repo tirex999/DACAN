@@ -16,7 +16,8 @@ import shutil
 from pathlib import Path
 
 # (key, kind, help).  kind: "bool", "int>=0", "num>=0", ("enum", values), "names", or ("sampling", check) for a key
-# of the "sampling" block, ("arg", flag) for an engine option kept in "args".
+# of the "sampling" block, ("arg", flag) for an engine option kept in "args", ("ctx", flag) / ("kv", flag) for the
+# engine's context size / KV cache storage kept there too (a change restarts the model, as cpu_threads).
 EDITABLE = [
     ("sampling.temperature", ("sampling", "num>=0"),
      "Default temperature for requests that send none (0 = greedy, the default without a sampling block)"),
@@ -41,8 +42,19 @@ EDITABLE = [
     ("cpu_threads", ("threads", None),
      "CPU threads (logical processors) of the engine's expert pool, its own loop counted - up to every logical "
      "thread of the CPU; empty: the engine's own count; a change restarts the model"),
+    # DACAN 21.10.2026 (Vadim: the context size and the KV cache's quant right in the web page): the engine's
+    # --max-context and --kv; a change starts the engine again (server.py restart_engine), as the threads slider
+    ("max_context", ("ctx", "--max-context"),
+     "Context size in tokens - how many the model holds (prompt, thinking and answer); a change restarts the model"),
+    ("kv_cache", ("kv", "--kv"),
+     "How the KV cache is stored: fp16 (full precision), int8 (half the memory), q4_0 (a quarter, 4-bit after a "
+     "rotation, slightly less precise), k8v4 (int8 K + 4-bit V); a change restarts the model"),
 ]
 SPEC = {k: kind for k, kind, _ in EDITABLE}
+RESTART_KEYS = ("cpu_threads", "max_context", "kv_cache")   # server.py starts the engine again when one changes
+CTX_CHOICES = [32768, 65536, 131072, 262144, 524288, 1048576]       # the page's list (any whole number CTX_MIN..CTX_MAX is taken)
+CTX_MIN, CTX_MAX = 4096, 1048576                            # 1M is validated on the deployed Flash YaRN profile
+KV_ALL = ("fp16", "int8", "q4_0", "k8v4")                  # the engine's --kv storages (its usage text)
 _KNOWS: dict = {}
 
 
@@ -56,6 +68,15 @@ def engine_knows(exe, option: bytes) -> bool:
         except (OSError, ValueError, TypeError):
             _KNOWS[key] = False
     return _KNOWS[key]
+
+
+def kv_choices(cfg: dict) -> list:
+    """The KV cache storages this engine file names in its usage text ("--kv fp16|int8", "--kv q4_0", "--kv k8v4");
+    none when the engine has no --kv (the key is then not offered: an option it does not know would stop it)."""
+    exe = cfg.get("exe") or ""
+    if not engine_knows(exe, b"--kv "):
+        return []
+    return [x for x in KV_ALL if engine_knows(exe, x.encode())]
 
 
 def threads_flag(cfg: dict) -> str:
@@ -105,8 +126,8 @@ def physical_cores() -> int:
 
 
 def cpu_threads_total() -> int:
-    """Every CPU thread the engine may run on, SMT threads too (19.10.2026: the slider's maximum is how many threads
-    the CPU has): a PC's all, a container's or a CPU set's own."""
+    """Every CPU thread the engine may run on, SMT threads too (19.10.2026, Vadim: the slider's maximum is how many
+    threads the CPU has): a PC's all, a container's or a CPU set's own."""
     try:
         return len(os.sched_getaffinity(0)) or (os.cpu_count() or 1)
     except AttributeError:                            # Windows: every processor group
@@ -142,7 +163,7 @@ def value_of(cfg: dict, key: str):
     if isinstance(kind, tuple) and kind[0] == "sampling":
         s = cfg.get("sampling")
         return s.get(key.split(".", 1)[1]) if isinstance(s, dict) else None
-    if isinstance(kind, tuple) and kind[0] == "arg":
+    if isinstance(kind, tuple) and kind[0] in ("arg", "ctx", "kv"):
         return _arg(cfg, kind[1])
     if isinstance(kind, tuple) and kind[0] == "threads":   # the engine's option, as threads in all
         flag = threads_flag(cfg)
@@ -160,11 +181,18 @@ def view(cfg: dict, path: str | Path) -> dict:
     out = []
     for key, kind, help_ in EDITABLE:
         k = kind[0] if isinstance(kind, tuple) else kind
+        extra = {}
+        if k == "enum":
+            extra = {"choices": kind[1]}
+        elif k == "threads":
+            extra = {"min": 2, "max": cpu_threads_machine(), "usable": cpu_threads_total(), "restart": True}
+        elif k == "ctx":
+            extra = {"choices": CTX_CHOICES, "min": CTX_MIN, "max": CTX_MAX, "restart": True}
+        elif k == "kv":
+            extra = {"choices": kv_choices(cfg), "restart": True}
         out.append({"key": key, "value": value_of(cfg, key), "help": help_,
-                    "kind": "number" if k in ("sampling", "arg", "int>=0", "num>=0", "threads") else k,
-                    **({"choices": kind[1]} if k == "enum" else {}),
-                    **({"min": 2, "max": cpu_threads_machine(), "usable": cpu_threads_total(),
-                        "restart": True} if k == "threads" else {})})
+                    "kind": "number" if k in ("sampling", "arg", "int>=0", "num>=0", "threads", "ctx") else
+                            "enum" if k == "kv" else k, **extra})
     return {"file": Path(path).name, "keys": out,
             "note": "Saved to the run config; used from the next start of the model."}
 
@@ -207,6 +235,14 @@ def check(key: str, v, cfg: dict):
         return _number(key, v)
     if k == "arg":
         return _number(key, v, whole=True)
+    if k == "ctx":
+        return _number(key, v, whole=True, lo=CTX_MIN, hi=CTX_MAX)
+    if k == "kv":
+        choices = kv_choices(cfg)
+        if v not in choices:
+            raise ValueError(f"{key}: expected one of {', '.join(choices) or '(none: this engine has no --kv)'}, "
+                             f"not {v!r}")
+        return v
     if k == "threads":
         return _number(key, v, whole=True, lo=2, hi=cpu_threads_machine())
     rule = kind[1]                                     # a sampling key: the server's own rules
@@ -242,7 +278,7 @@ def apply(cfg: dict, changes: dict) -> tuple[dict, list[str]]:
                 new["sampling"] = s
             else:
                 new.pop("sampling", None)
-        elif isinstance(kind, tuple) and kind[0] == "arg":
+        elif isinstance(kind, tuple) and kind[0] in ("arg", "ctx", "kv"):
             a = list(new.get("args") or [])
             flag = kind[1]
             if flag in a[:-1]:
