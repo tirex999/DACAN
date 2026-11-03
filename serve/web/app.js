@@ -267,6 +267,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
   }
   $("state-label").textContent = label;
+  if (live.parallel > 1) {
+    const busy = (live.slots || []).filter((slot) => slot.state !== "idle").length;
+    const concurrency = `Requests: ${fmt(live.running || 0)} · busy slots: ${fmt(busy)}/${fmt(live.parallel)}`;
+    detail = detail ? `${detail} · ${concurrency}` : concurrency;
+  }
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
 
@@ -276,7 +281,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   const lastDec = (requests || []).find((r) => r.decode_tok_s != null);
   const speed = live.state === "generating" ? live.tok_s : lastDec ? lastDec.decode_tok_s : null;
   setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-            live.state === "generating" ? "Decode now" : lastDec ? `Decode last answer · ${fmt(lastDec.output_tokens)} tokens` : "Decode");
+            live.state === "generating" ? (live.parallel > 1 ? "Decode now · total" : "Decode now") : lastDec ? `Decode last answer · ${fmt(lastDec.output_tokens)} tokens` : "Decode");
   // the prompt read of the last request that read enough fresh tokens to measure it: a few tokens take the engine's
   // fixed start-up time, not reading time
   // 13.10.2026 (DACAN): 512 -> 4096 — a follow-up that reads ~1300 new tokens spends ~5 s mostly on that start-up time
@@ -306,10 +311,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   spark("sp-temp", h.gpu_temp, 90);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
-  const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
-  setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
-            hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
-            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
+  // Each current link is shown separately so one GPU cannot hide another GPU's narrower link.
+  const links = (hw.gpus || []).length ? hw.gpus : [{pcie_gen: hw.gpu_pcie_gen, pcie_width: hw.gpu_pcie_width}];
+  const linkText = (gpu) => gpu.pcie_gen ? `Gen${gpu.pcie_gen} x${gpu.pcie_width || "?"}` : "–";
+  setMetric("pcie", links.map((gpu) => `x${gpu.pcie_width || "?"}`).join(" / "), "",
+            links.map((gpu) => `${gpu.index == null ? "" : `GPU ${gpu.index}: `}${linkText(gpu)}`).join(" · ") +
+            (hw.gpu_pcie_rx_mb == null ? "" : ` · to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s`));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
