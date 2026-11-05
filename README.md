@@ -223,6 +223,31 @@ entries and the engine takes every physical core. Restart the model after changi
 (performance + efficiency cores) setup writes the count measured for such CPUs; on a PC with two CPU sockets it
 prints a tip to try one socket's cores.
 
+## Several users at once
+
+The engine serves several conversations at once - slot sessions (`--batch N`). In the web chat this is the
+**Users** switch in the header (1-4); the same key `slots` sits in the gear -> **Model settings**. A change
+restarts the model (about two minutes): the restart waits for the request running now, and the queue is lost at
+that moment.
+
+Measured on 2 x RTX 2080 Ti, NVFP4 + Q8, 4 slots: four requests run at the same time, the second does not wait
+for the first, and `queued` in the monitor stays 0. The price is VRAM for the expert cache: about 16 GB at four
+slots against 26 GB at one, so under shared load the prompt read and the generation are slower than for a single
+user. For the fastest single user, keep 1 slot.
+
+Two more settings in the gear -> **Model settings**:
+
+- `conversation_cache_mib` (`--conversation-cache-mib`) - the host RAM the engine keeps for parked conversations
+  (0 turns it off);
+- `prefill_chunk` (`--prefill`) - the prompt chunk in tokens. The engine shrinks it itself when the second card's
+  cache is small: the log says `WARNING: prompt chunk 8192 tokens, not 16384...`. Do not go below 4096 - the
+  prompt read becomes about twice as slow.
+
+The monitor shows **`skipped_parks`**: how many times the host had too little RAM to park a conversation. If it
+grows, lower `conversation_cache_mib` or close programs on the machine.
+
+After updating the page press **Ctrl+F5**: the browser keeps the old script in its cache.
+
 ## Two cards and 8-bit models
 
 With an 8-bit model (Q8_0) on **two cards**: the DACAN engine of build 4 (Linux 12.10.2026, Windows 13.10.2026;
