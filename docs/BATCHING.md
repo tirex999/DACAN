@@ -19,6 +19,10 @@ asked, with a note when it is more than setup would recommend.
 "parallel": 2
 ```
 
+In the web interface the same setting is the **Users** switch in the page header (1 to 4), and the same key
+(`slots`) sits in ⚙ → **Model settings**; changing either one restarts the model. The page's cache card shows how
+many conversations the cache took in and how many it had to turn away (see the README's "Several users at once").
+
 With MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args`, or `DACAN_BATCH_MTP=1` in the server's
 environment) lets each batch slot verify one MTP proposal per window. It is opt-in; without it the batch behaviour
 described below is exactly the one without MTP. It needs VRAM per slot for the draft state and buffers, so check the
