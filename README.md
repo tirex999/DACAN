@@ -246,6 +246,14 @@ Two more settings in the gear -> **Model settings**:
 The monitor shows **`skipped_parks`**: how many times the host had too little RAM to park a conversation. If it
 grows, lower `conversation_cache_mib` or close programs on the machine.
 
+A parked conversation that goes unused is dropped on its own: `--conversation-cache-expire-min` (60 minutes in
+the example configs) sweeps the cache once per that interval and removes the entries parked longer ago than the
+interval, so the RAM comes back without a restart. The log line `conversation cache: expired N parked
+conversations` shows each sweep; entries restored by a request leave the cache by themselves. The budget above
+the machine's free RAM does not make the cache bigger - the engine simply refuses further parks
+(`skipped_parks`) and the host starts swapping, which slows decoding down, so keep the budget a few GB under the
+machine's available memory.
+
 After updating the page press **Ctrl+F5**: the browser keeps the old script in its cache.
 
 ## Two cards and 8-bit models
