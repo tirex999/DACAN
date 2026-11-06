@@ -242,6 +242,12 @@ Two more settings in the gear -> **Model settings**:
 - `prefill_chunk` (`--prefill`) - the prompt chunk in tokens. The engine shrinks it itself when the second card's
   cache is small: the log says `WARNING: prompt chunk 8192 tokens, not 16384...`. Do not go below 4096 - the
   prompt read becomes about twice as slow.
+- `ple_io` (`--ple-io direct|mmap|ram`) - how the n-gram table is read. `ram` locks the whole table in RAM (about
+  50 GB for this model), so no SSD read sits on the prompt or token path; `mmap` reads it from disk - on long
+  prompts that showed 3-4 GB/s of disk reads.
+- `kv_resident` (`--kv-resident`) - how many KV cells of each layer stay in VRAM (the rest streams from RAM).
+  Lowering it (32768 -> 20480) frees VRAM for the expert cache: measured expert hit 50% -> 78% and PCIe expert
+  transfers 14% -> 6%.
 
 The monitor shows **`skipped_parks`**: how many times the host had too little RAM to park a conversation. If it
 grows, lower `conversation_cache_mib` or close programs on the machine.
