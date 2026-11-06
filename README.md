@@ -254,6 +254,10 @@ the machine's free RAM does not make the cache bigger - the engine simply refuse
 (`skipped_parks`) and the host starts swapping, which slows decoding down, so keep the budget a few GB under the
 machine's available memory.
 
+A later turn of the same conversation replaces its parked copy instead of parking another one: the engine matches
+the entry by the conversation's own id list, so a long-running chat stays one entry (not one per turn), and the
+budget holds other conversations instead of one chat's history.
+
 After updating the page press **Ctrl+F5**: the browser keeps the old script in its cache.
 
 ## Two cards and 8-bit models
