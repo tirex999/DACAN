@@ -178,7 +178,7 @@ PREBUILT_URL = "https://github.com/tirex999/DACAN/releases/latest/download/"
 # when --prebuilt points the download somewhere else, because the hash is only worth having if it comes
 # from somewhere the download does not.
 REPO = "tirex999/DACAN"
-DACAN_RELEASE_TAG = "v0.1.42-build5"                 # current engine snapshot + matching server/UI
+DACAN_RELEASE_TAG = "v0.1.42-build6"                 # current engine snapshot + matching server/UI
 PREBUILT_TAG_URL = f"https://github.com/tirex999/DACAN/releases/download/{DACAN_RELEASE_TAG}/"
 ENGINE_VERSION = "0.1.42"                       # the DACAN engine version of this release
 PREBUILT_ASSET = "dacan-windows-x64.zip" if WIN else "dacan-linux-x64.zip"
@@ -192,7 +192,7 @@ MIN_DRIVER = 580                       # CUDA 13.0
 CUDA13_MIN_ARCH = 75                   # the oldest compute capability CUDA 13 compiles for (sm_75, RTX 20)
 CUDA12_ASSET = "dacan-windows-x64-cuda12.zip" if WIN else "dacan-linux-x64-cuda12.zip"
 DACAN_ASSETS = ("dacan-windows-x64.zip", "dacan-linux-x64.zip")   # DACAN's own ready-made engines
-DACAN_BUILD = 5                 # BUILD.json "dacan" of the current DACAN engine; a lower one (true = 1) is replaced
+DACAN_BUILD = 6                 # BUILD.json "dacan" of the current DACAN engine; a lower one (true = 1) is replaced
                       # 2: scaled (NVFP4) packs load on Windows
                       # 3: the engine named dacan / dacan-vision, the Linux x64 engine
                       # 4: on two cards the engine sets its own PCIe share per card (Linux 12.10, Windows 13.10)

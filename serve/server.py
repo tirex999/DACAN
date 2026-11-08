@@ -63,6 +63,20 @@ from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
+
+
+def _conversation_sid(req) -> int:
+    """The Codex conversation this request belongs to, as a stable int64 (0 = none / not Codex).  The engine's
+    conversation cache keys on this instead of the token prefix, so two chats that share a long system prompt are
+    no longer conflated."""
+    if not isinstance(req, dict):
+        return 0
+    _, conversation = responses_api._codex_turn(req)
+    if conversation is None:
+        return 0
+    session_id, thread_id = conversation
+    h = hashlib.sha256(f"{session_id}\x00{thread_id}".encode("utf-8")).digest()
+    return int.from_bytes(h[:8], "big", signed=True)
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 
 # A reply shorter than this is mostly its first step (the prompt's last chunk, the first draft window): its
@@ -505,6 +519,7 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    SKIPPED = re.compile(r"conversation cache: skip parking")   # 05.11: the host was too tight to park a snapshot
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -513,7 +528,7 @@ class ConvCacheLog:
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+                      "last_tokens": None, "last_at": None, "skipped_parks": 0, "last_skip_at": None}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
@@ -552,6 +567,10 @@ class ConvCacheLog:
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
+                continue
+            if self.SKIPPED.search(line):
+                self.state["skipped_parks"] += 1
+                self.state["last_skip_at"] = now
         return dict(self.state)
 
 
@@ -746,6 +765,8 @@ class DacanEngine:
         groups_run = int(self.info.get("batch_groups") or groups)
         self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
+        self.slot_release_q = [queue.Queue() for _ in range(self.batch)]
+        self._slot_release_seq = 0
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
@@ -779,6 +800,7 @@ class DacanEngine:
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
+        release_q = getattr(self, "slot_release_q", [])
         line = None
         for line in proc.stdout:
             # checked before batch routing: a fatal line is never a slot's own
@@ -793,6 +815,12 @@ class DacanEngine:
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
+            if line.startswith("BRELEASED "):
+                try:
+                    release_q[int(line.split()[1])].put(line)
+                except (IndexError, ValueError):
+                    pass
+                continue
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
@@ -806,6 +834,8 @@ class DacanEngine:
                 self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
         lines.put(None)
         for q in slot_q:
+            q.put(None)
+        for q in release_q:
             q.put(None)
 
     def death_note(self) -> str:
@@ -958,6 +988,9 @@ class DacanEngine:
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
+        sid = sampling.get("sid")
+        if isinstance(sid, int) and not isinstance(sid, bool) and sid != 0:
+            keys += f" sid={sid}"
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
@@ -1159,19 +1192,22 @@ class DacanEngine:
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
-        if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
-            return
+        with self.slot_cv:
+            if slot >= len(self.slot_q):                # the engine restarted with fewer slots: this one is gone
+                return
+            q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held
+            releasing = self.slot_releasing
+            # Hand ownership over before sending STOP or starting a worker: BDONE may already be queued.
+            releasing.add(slot)
+            self.slot_claims.discard(slot)
         try:
             self._send(f"BSTOP {slot}")
         except EngineDied:
             pass
-        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
-        releasing = self.slot_releasing
-        releasing.add(slot)
-
         def wait():
             end = time.monotonic() + 600.0
             tail = list(stream or [])
+            confirmed = False
             while time.monotonic() < end:
                 try:
                     line = q.get(timeout=5.0)
@@ -1179,6 +1215,7 @@ class DacanEngine:
                     continue
                 if line is None:
                     tail = []
+                    confirmed = True
                     break
                 if line.startswith("BT "):
                     try:
@@ -1186,12 +1223,56 @@ class DacanEngine:
                     except (IndexError, ValueError):
                         tail = []
                 if line.startswith("BDONE "):
+                    confirmed = True
                     break
+            if not confirmed:
+                print(f"[dacan] parallel: slot {slot} has no BDONE; keeping it reserved", flush=True)
+                return
             held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
                 busy[slot] = False
                 releasing.discard(slot)
                 self.slot_cv.notify_all()
+        threading.Thread(target=wait, daemon=True).start()
+
+    def _release_orphan_slot(self, slot: int):
+        """Caller holds slot_cv. An ownerless flag is reusable only after a native release fence.
+
+        BRELEASED is distinct from BDONE: an old completion or late token cannot acknowledge this release.
+        Queues/arrays belong to this process, so an old worker never frees a successor's slot after restart.
+        """
+        self._slot_release_seq += 1
+        tag = self._slot_release_seq
+        q, tokens = self.slot_release_q[slot], self.slot_q[slot]
+        busy, held, releasing = self.slot_busy, self.slot_held, self.slot_releasing
+        releasing.add(slot)
+        self.slot_claims.discard(slot)
+        try:
+            self._send(f"BRELEASE {slot} {tag}")
+        except EngineDied:
+            q.put(None)
+
+        def wait():
+            end = time.monotonic() + 600.0
+            while time.monotonic() < end:
+                try:
+                    line = q.get(timeout=min(5.0, max(0.01, end - time.monotonic())))
+                except queue.Empty:
+                    continue
+                if line is None or line.split() == ["BRELEASED", str(slot), str(tag)]:
+                    # The pump read the fence after every old BT/BDONE, before any new owner is admitted.
+                    while True:
+                        try:
+                            tokens.get_nowait()
+                        except queue.Empty:
+                            break
+                    with self.slot_cv:
+                        held[slot] = []
+                        busy[slot] = False
+                        releasing.discard(slot)
+                        self.slot_cv.notify_all()
+                    return
+            print(f"[dacan] parallel: slot {slot} release {tag} was not acknowledged; keeping it reserved", flush=True)
         threading.Thread(target=wait, daemon=True).start()
 
     ORPHAN_SLOT_S = 3.0   # #1603: a busy flag nobody owns this long is a leak and is given back
@@ -1208,14 +1289,24 @@ class DacanEngine:
             if busy and b not in self.slot_claims and b not in self.slot_releasing:
                 first = self._orphan_seen.setdefault(b, now)
                 if now - first >= self.ORPHAN_SLOT_S:
-                    self.slot_busy[b] = False
+                    if (getattr(self, "info", None) or {}).get("batch_release_ack"):
+                        self._release_orphan_slot(b)
+                    else:
+                        # Legacy engines lack a fence; preserve their recovery while also requesting native stop.
+                        try:
+                            self._send(f"BSTOP {b}")
+                        except EngineDied:
+                            pass
+                        self.slot_busy[b] = False
                     self._orphan_seen.pop(b, None)
                     freed.append(b)
             else:
                 self._orphan_seen.pop(b, None)
         if freed:
-            print(f"[dacan] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request using them "
-                  "(issue #1603); freed, the waiting request goes on", flush=True)
+            fenced = bool((getattr(self, "info", None) or {}).get("batch_release_ack"))
+            print(f"[dacan] parallel: ownerless slot(s) {', '.join(map(str, freed))}: "
+                  + ("native release requested; awaiting acknowledgement" if fenced else "legacy stop requested and flags freed"),
+                  flush=True)
             self.slot_cv.notify_all()
         return freed
 
@@ -1545,7 +1636,6 @@ class DacanEngine:
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self._release_slot_when_done(slot, stream)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
@@ -3164,7 +3254,7 @@ class Service:
         old = list(spawn[1])
         args, i = [], 0
         while i < len(old):
-            if old[i] in ("--threads", "--pool-workers") and i + 1 < len(old):
+            if old[i] in ("--threads", "--pool-workers", "--slots") and i + 1 < len(old):
                 i += 2
                 continue
             if old[i] != "--threads-smt":
@@ -3176,7 +3266,13 @@ class Service:
             args += [flag, str(want)]
             if "--threads-smt" in (cfg.get("args") or []):   # past the physical cores (runconfig.apply)
                 args.append("--threads-smt")
-        for opt in ("--max-context", "--kv"):              # 21.10: the context size and the KV cache's storage
+        slots = runconfig.value_of(cfg, "slots")           # 05.11: the slot sessions (the users at once)
+        if slots is not None and "--batch" in args[:-1]:
+            args[args.index("--batch") + 1] = str(slots)
+        elif slots is not None:
+            args += ["--batch", str(slots)]
+        for opt in ("--max-context", "--kv", "--prefill", "--conversation-cache-mib"):   # 21.10: context, KV;
+                                                          # 05.11: the prompt chunk and the parked cache
             v = runconfig._arg(cfg, opt)
             if opt in args[:-1]:
                 j = args.index(opt)
@@ -3195,7 +3291,7 @@ class Service:
         def val(a, opt):
             return a[a.index(opt) + 1] if opt in a[:-1] else None
         parts = []
-        for o in (flag, "--max-context", "--kv"):
+        for o in (flag, "--max-context", "--kv", "--batch", "--prefill", "--conversation-cache-mib"):
             if val(args, o) != val(old, o):
                 parts.append(f"{o} {val(args, o)}" if val(args, o) is not None else
                              "every physical core" if o == flag else f"no {o} (the engine's default)")
@@ -3733,10 +3829,14 @@ class Service:
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        # `sampling` is the request dict here: read its Codex session id (0 = none) before it is merged away below.
+        sid = _conversation_sid(sampling)
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
-        if defaults:                   # the request's own fields win (explicit 0 stays greedy)
+        if defaults or sid:            # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        if sid:
+            sampling["sid"] = sid
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if budget and max_new and max_new > 0:

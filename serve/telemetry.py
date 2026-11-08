@@ -116,6 +116,12 @@ class _Nvml:
         except (AttributeError, OSError):
             pass
         out["temp"] = self._uint("nvmlDeviceGetTemperature", ctypes.c_uint(0))          # NVML_TEMPERATURE_GPU
+        # The hot-spot and memory sensors are not every card's: NVML answers NOT_SUPPORTED (2) and the reading stays
+        # None, which the web app shows as NA.
+        out["temp_hotspot"] = self._uint("nvmlDeviceGetTemperature", ctypes.c_uint(2))  # NVML_TEMPERATURE_GPU_HOTSPOT
+        out["temp_vram"] = self._uint("nvmlDeviceGetTemperature", ctypes.c_uint(1))     # NVML_TEMPERATURE_MEMORY
+        out["sm_clock"] = self._uint("nvmlDeviceGetClockInfo", ctypes.c_uint(1))        # NVML_CLOCK_SM, MHz
+        out["mem_clock"] = self._uint("nvmlDeviceGetClockInfo", ctypes.c_uint(2))       # NVML_CLOCK_MEM, MHz
         mw = self._uint("nvmlDeviceGetPowerUsage")
         out["power"] = mw / 1000.0 if mw is not None else None
         lim = self._uint("nvmlDeviceGetEnforcedPowerLimit")
@@ -268,6 +274,17 @@ class _Amd:
             out["power"] = p / 1e6 if p is not None else None
             cap = self._int(os.path.join(self.hwmon, "power1_cap"))
             out["power_limit"] = cap / 1e6 if cap is not None else None
+        # The same readings as the NVML backend, from the amdgpu driver's sysfs: the clocks it reports, and the
+        # hot-spot and memory temperature sensors when the card has them (the others read as None -> NA).
+        out["sm_clock"] = self._int(os.path.join(self.dev, "pp_dpm_sclk"))
+        out["mem_clock"] = self._int(os.path.join(self.dev, "pp_dpm_mclk"))
+        if self.hwmon:
+            for key, name in (("temp_hotspot", "temp2_input"), ("temp_vram", "temp3_input")):
+                v = self._int(os.path.join(self.hwmon, name))
+                out[key] = v / 1000.0 if v is not None else None
+        else:
+            out["temp_hotspot"] = None
+            out["temp_vram"] = None
         out.update(self.link())
         return out
 
@@ -499,6 +516,14 @@ class Telemetry:
                 g["util"] = sum(u) / len(u) if u else None
                 t = vals("temp")
                 g["temp"] = max(t) if t else None
+                # The clocks of the cards are one number each: the mean of what they run at, and the hottest sensor
+                # for the temperatures (the hot-spot and memory ones, when the card has them).
+                for k in ("sm_clock", "mem_clock"):
+                    c = vals(k)
+                    g[k] = round(sum(c) / len(c)) if c else None
+                for k in ("temp_hotspot", "temp_vram"):
+                    th = vals(k)
+                    g[k] = max(th) if th else None
             s["gpus"] = [{"index": i, **r} for i, r in reads]   # DACAN: each card's full reading, one card or several
             s.update({f"gpu_{k}": v for k, v in g.items()})
         if self.ps:

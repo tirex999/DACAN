@@ -97,6 +97,39 @@ function headers(json = false) {
 $("api-key").value = store.get("apikey", "");
 $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", t("API key saved"), t("Kept in this browser only.")); };
 
+// ------------------------------------------------------------------ simultaneous users (the config's "slots", 06.11.2026)
+// Same key as About -> Model settings, but in the header: the owner asked for the switch where he looks.  The
+// value is the engine's --batch N; a change restarts the model, so the switch asks first.
+async function loadSlotsQuick() {
+  try {
+    const r = await fetch("config", {headers: headers()});
+    if (!r.ok) return;                                   // an older server, or no key yet
+    const c = await r.json();
+    const k = (c.keys || []).find((x) => x.key === "slots");
+    if (!k) return;
+    const sel = $("slots-quick");
+    sel.innerHTML = (k.choices || [1, 2, 3, 4]).map((n) => `<option value="${n}">${n}</option>`).join("");
+    if (k.value != null) sel.value = String(k.value);
+    $("slots-box").hidden = false;
+  } catch (e) { /* no switch, the card in Settings stays */ }
+}
+$("slots-quick").onchange = async () => {
+  const n = Number($("slots-quick").value);
+  if (!confirm(t("The model restarts with {n} simultaneous users (about 2 minutes). Continue?", {n}))) {
+    loadSlotsQuick();
+    return;
+  }
+  try {
+    const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set: {slots: n}})});
+    const b = await r.json();
+    if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
+    toast("success", t("Saved"), b.engine === "restarting" ? t("The model restarts; requests wait meanwhile.") : "", 6000);
+  } catch (e) {
+    toast("error", t("Not saved"), String(e.message || e), 6000);
+  }
+};
+loadSlotsQuick();
+
 let health = {model: "dacan", images: false, max_context: 0}, healthLoaded = false;
 // the texts that come from /health: the attach button's tip, the empty chat's line with the model's name
 function healthTexts() {
@@ -165,6 +198,8 @@ function buildDevices(st) {
       <div class="dev-card__value"><span class="st-metric__value" id="dv-gpu${i}">–</span><span class="muted small">${esc(t("load"))}</span></div>
       ${sparkSvg(`sp-gpu${i}`)}
       <dl class="dev-card__rows">${row(`dv-gpu${i}-mem`, "VRAM")}${row(`dv-gpu${i}-temp`, "Temperature")}
+        ${row(`dv-gpu${i}-smclock`, "SM clock")}${row(`dv-gpu${i}-memclock`, "VRAM clock")}
+        ${row(`dv-gpu${i}-hotspot`, "Hot spot")}${row(`dv-gpu${i}-vramtemp`, "VRAM temp")}
         ${row(`dv-gpu${i}-power`, "Power")}${row(`dv-gpu${i}-pcie`, "PCIe")}</dl>
     </div>`).join("") + sockets.map((s, i) => `
     <div class="st-card dev-card" data-kind="cpu">
@@ -396,6 +431,13 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     setText(`dv-gpu${i}-mem`, g.mem_total ? `${gb(g.mem_used)} / ${gb(g.mem_total, 0)} ${t("GB")}` : null);
     setText(`dv-gpu${i}-temp`, g.temp == null ? null : `${fmt(g.temp)} °C`);
     const te = $(`dv-gpu${i}-temp`); if (te) te.dataset.hot = g.temp >= 80 ? "1" : "";
+    // The clocks and the extra temperature sensors: a card that has no such sensor (no hot spot, no memory
+    // temperature) says NA rather than a dash, so a missing reading is not mistaken for a zero.
+    const na = (v) => v == null ? t("NA") : v;
+    setText(`dv-gpu${i}-smclock`, na(g.sm_clock == null ? null : `${fmt(g.sm_clock)} MHz`));
+    setText(`dv-gpu${i}-memclock`, na(g.mem_clock == null ? null : `${fmt(g.mem_clock)} MHz`));
+    setText(`dv-gpu${i}-hotspot`, na(g.temp_hotspot == null ? null : `${fmt(g.temp_hotspot)} °C`));
+    setText(`dv-gpu${i}-vramtemp`, na(g.temp_vram == null ? null : `${fmt(g.temp_vram)} °C`));
     setText(`dv-gpu${i}-power`, g.power == null ? null : `${fmt(g.power)} ${t("W")}${g.power_limit ? t(" of {x}", {x: fmt(g.power_limit)}) : ""}`);
     const gn = g.pcie_gen;
     setText(`dv-gpu${i}-pcie`, gn ? `Gen${gn} x${g.pcie_width || "?"}${g.pcie_rx_mb == null ? "" :

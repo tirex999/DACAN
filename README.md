@@ -19,9 +19,17 @@ and has been developed separately since then, with its own kernels: NVFP4 + Q8 o
 cards, one or two CPU sockets, a context up to 1M (1,048,576 tokens), vision and a live monitor. Strata's copyright notice is kept in
 [LICENSE](LICENSE), as MIT requires.
 
-## Current release: build 5
+## Current release: build 6
 
-Build 5 ships the current DACAN engine code and the same server and web interface used in our running installation.
+**Build 6 (8 November 2026):** updated engine, concurrent-request handling and the matching server/UI.
+On our two RTX 2080 Ti 22 GB cards and two Xeon 8358 CPUs, four Russian requests of 512 output tokens
+reached **90.9 and 96.2 tokens/s in total** (about 23–25 per client), including request admission.
+The measured profile keeps a **1M context limit** and **120-minute conversation-cache retention**.
+Hardware, workload, settings and limits: [multi-user measurements](docs/MULTIUSER_BUILD6.md).
+Update with `UPDATE.bat` / `./update.sh`; existing model settings are preserved.
+
+
+Build 6 ships the current DACAN engine code and the same server and web interface used in our running installation.
 The chat settings include context (up to **1M = 1,048,576 tokens = 1024K**), KV cache format and CPU threads.
 Changing an engine setting waits for the current request before restarting the model. Applying unchanged settings
 keeps the selected context. The installer and MCP server also offer 1M; setup uses **YaRN ×4** at that size.

@@ -39,8 +39,8 @@ class ReleaseContext(unittest.TestCase):
         self.assertIn(1048576, FALLBACK_CONTEXTS)
         install = next(t for t in tool_defs(setup.MODELS, setup.FAMILIES, setup.CONTEXTS) if t["name"] == "dacan_install")
         self.assertIn(1048576, install["inputSchema"]["properties"]["context"]["enum"])
-        self.assertIn("v0.1.42-build5", setup.prebuilt_bases(setup.PREBUILT_URL, setup.PREBUILT_ASSET)[0])
-        self.assertEqual(setup.DACAN_BUILD, 5)
+        self.assertIn("v0.1.42-build6", setup.prebuilt_bases(setup.PREBUILT_URL, setup.PREBUILT_ASSET)[0])
+        self.assertEqual(setup.DACAN_BUILD, 6)
 
     def test_1m_round_trip_preserves_unrelated_settings(self):
         before = copy.deepcopy(self.cfg)

@@ -49,12 +49,26 @@ EDITABLE = [
     ("kv_cache", ("kv", "--kv"),
      "How the KV cache is stored: fp16 (full precision), int8 (half the memory), q4_0 (a quarter, 4-bit after a "
      "rotation, slightly less precise), k8v4 (int8 K + 4-bit V); a change restarts the model"),
+    # DACAN 05.11.2026 (Vadim: the memory/speed balance right in the web page): the engine's parked cache and
+    # prompt chunk; a change starts the engine again (server.py restart_engine)
+    ("conversation_cache_mib", ("arg", "--conversation-cache-mib"),
+     "Host RAM for parked conversations, MiB (0: off); a change restarts the model"),
+    ("prefill_chunk", ("arg", "--prefill"),
+     "Prompt chunk in tokens: a smaller chunk keeps the other slots decoding while a prompt is read; a change "
+     "restarts the model"),
+    # DACAN 05.11.2026 (Vadim: 1, 2, 3 or 4 users at once right in the web page): the engine's --batch N opens
+    # N slot sessions; a change starts the engine again (server.py restart_engine), as the threads slider
+    ("slots", ("slots", "--batch"),
+     "Simultaneous users: slot sessions the engine serves at once (1-4); a change restarts the model"),
 ]
 SPEC = {k: kind for k, kind, _ in EDITABLE}
-RESTART_KEYS = ("cpu_threads", "max_context", "kv_cache")   # server.py starts the engine again when one changes
+RESTART_KEYS = ("cpu_threads", "max_context", "kv_cache", "slots",
+                "conversation_cache_mib", "prefill_chunk")   # server.py starts the engine again when one changes
 CTX_CHOICES = [32768, 65536, 131072, 262144, 524288, 1048576]       # the page's list (any whole number CTX_MIN..CTX_MAX is taken)
 CTX_MIN, CTX_MAX = 4096, 1048576                            # 1M is validated on the deployed Flash YaRN profile
 KV_ALL = ("fp16", "int8", "q4_0", "k8v4")                  # the engine's --kv storages (its usage text)
+SLOT_CHOICES = [1, 2, 3, 4]                               # the page's list of simultaneous users
+SLOT_MIN, SLOT_MAX = 1, 4
 _KNOWS: dict = {}
 
 
@@ -165,6 +179,9 @@ def value_of(cfg: dict, key: str):
         return s.get(key.split(".", 1)[1]) if isinstance(s, dict) else None
     if isinstance(kind, tuple) and kind[0] in ("arg", "ctx", "kv"):
         return _arg(cfg, kind[1])
+    if isinstance(kind, tuple) and kind[0] == "slots":
+        v = _arg(cfg, "--batch")
+        return v if isinstance(v, int) else _arg(cfg, "--slots")
     if isinstance(kind, tuple) and kind[0] == "threads":   # the engine's option, as threads in all
         flag = threads_flag(cfg)
         v = _arg(cfg, flag)
@@ -190,9 +207,11 @@ def view(cfg: dict, path: str | Path) -> dict:
             extra = {"choices": CTX_CHOICES, "min": CTX_MIN, "max": CTX_MAX, "restart": True}
         elif k == "kv":
             extra = {"choices": kv_choices(cfg), "restart": True}
+        elif k == "slots":
+            extra = {"choices": SLOT_CHOICES, "min": SLOT_MIN, "max": SLOT_MAX, "restart": True}
         out.append({"key": key, "value": value_of(cfg, key), "help": help_,
                     "kind": "number" if k in ("sampling", "arg", "int>=0", "num>=0", "threads", "ctx") else
-                            "enum" if k == "kv" else k, **extra})
+                            "enum" if k in ("kv", "slots") else k, **extra})
     return {"file": Path(path).name, "keys": out,
             "note": "Saved to the run config; used from the next start of the model."}
 
@@ -243,6 +262,10 @@ def check(key: str, v, cfg: dict):
             raise ValueError(f"{key}: expected one of {', '.join(choices) or '(none: this engine has no --kv)'}, "
                              f"not {v!r}")
         return v
+    if k == "slots":
+        n = v.strip() if isinstance(v, str) else v
+        return int(_number(key, int(n) if isinstance(n, str) and n.lstrip("+-").isdigit() else n,
+                           whole=True, lo=SLOT_MIN, hi=SLOT_MAX))
     if k == "threads":
         return _number(key, v, whole=True, lo=2, hi=cpu_threads_machine())
     rule = kind[1]                                     # a sampling key: the server's own rules
@@ -278,9 +301,11 @@ def apply(cfg: dict, changes: dict) -> tuple[dict, list[str]]:
                 new["sampling"] = s
             else:
                 new.pop("sampling", None)
-        elif isinstance(kind, tuple) and kind[0] in ("arg", "ctx", "kv"):
+        elif isinstance(kind, tuple) and kind[0] in ("arg", "ctx", "kv", "slots"):
             a = list(new.get("args") or [])
             flag = kind[1]
+            if kind[0] == "slots" and "--slots" in a[:-1]:   # the engine's other name for --batch
+                flag = "--slots"
             if flag in a[:-1]:
                 i = a.index(flag)
                 if v is None:
