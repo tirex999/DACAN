@@ -382,3 +382,9 @@ model on your own hardware, you can say thanks with a donation.
 > Ethereum-network assets to the Ethereum address. Anything sent over the wrong network is lost.
 
 Thank you! 🙏
+
+
+## Download rules (agents and humans)
+- Always take the newest published build by its **explicit tag URL**: `https://github.com/tirex999/DACAN/releases/download/<TAG>/<asset>` (e.g. `v0.1.42-build6`), with `curl -L -C -` so interrupted downloads resume.
+- Do **not** resolve "latest" by semantic version sorting: suffixed tags like `-build6` are semver pre-releases, and semver sorting will silently pick the older plain `v0.1.42` package that carries the same filenames.
+- Verify with `SHA256SUMS.txt` attached to every release before unpacking.
