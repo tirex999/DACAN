@@ -21,7 +21,9 @@ cards, one or two CPU sockets, a context up to 1M (1,048,576 tokens), vision and
 
 ## Optional Linux build for RTX 2080 Ti
 
-The 18 November text engine can be installed alongside build 6. On two 22 GB RTX 2080 Ti cards, it read one uncached 79,395-token prompt at **1,965.5 input tokens/s**. Two clients generating 1,024 tokens each with 64 CPU workers delivered **76.82–78.05 output tokens/s in total** in two runs. [Download, measurements and installation](https://github.com/tirex999/DACAN/releases/tag/v0.1.42-sm75.20261118)
+The 19 November engine preserves completed prompt work when a request is interrupted. In a 71,461-token retry, it reused 71,454 tokens and read the remaining seven. [Download the Linux SM75 engine and installation instructions](https://github.com/tirex999/DACAN/releases/tag/v0.1.42-sm75.20261119)
+
+Throughput measurements for the preceding build are available in the [18 November release](https://github.com/tirex999/DACAN/releases/tag/v0.1.42-sm75.20261118).
 
 ## Current release: build 6
 
