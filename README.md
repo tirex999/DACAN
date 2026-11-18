@@ -19,6 +19,10 @@ and has been developed separately since then, with its own kernels: NVFP4 + Q8 o
 cards, one or two CPU sockets, a context up to 1M (1,048,576 tokens), vision and a live monitor. Strata's copyright notice is kept in
 [LICENSE](LICENSE), as MIT requires.
 
+## Optional Linux build for RTX 2080 Ti
+
+The 18 November text engine can be installed alongside build 6. On two 22 GB RTX 2080 Ti cards, it read one uncached 79,395-token prompt at **1,965.5 input tokens/s**. Two clients generating 1,024 tokens each with 64 CPU workers delivered **76.82–78.05 output tokens/s in total** in two runs. [Download, measurements and installation](https://github.com/tirex999/DACAN/releases/tag/v0.1.42-sm75.20261118)
+
 ## Current release: build 6
 
 **Build 6 (8 November 2026):** updated engine, concurrent-request handling and the matching server/UI.
@@ -29,7 +33,7 @@ Hardware, workload, settings and limits: [multi-user measurements](docs/MULTIUSE
 Update with `UPDATE.bat` / `./update.sh`; existing model settings are preserved.
 
 
-Build 6 ships the current DACAN engine code and the same server and web interface used in our running installation.
+Build 6 includes the compiled DACAN engine and its matching server and web interface.
 The chat settings include context (up to **1M = 1,048,576 tokens = 1024K**), KV cache format and CPU threads.
 Changing an engine setting waits for the current request before restarting the model. Applying unchanged settings
 keeps the selected context. The installer and MCP server also offer 1M; setup uses **YaRN ×4** at that size.
