@@ -1,5 +1,7 @@
 # DACAN (Дацан)
 
+[DACAN 0.43 для Linux x86-64 и RTX 2080 Ti](https://github.com/tirex999/DACAN/releases/tag/v0.43). Кэш диалога по умолчанию хранится до 480 минут. В выпуске есть готовый движок и его контрольная сумма.
+
 🇬🇧 [English](README.md) | 🇷🇺 **Русский** · [❤️ Поддержать проект](#поддержать-проект)
 
 **DACAN** — движок для запуска **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** (125 млрд

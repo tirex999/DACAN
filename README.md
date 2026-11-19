@@ -1,5 +1,7 @@
 # DACAN (Дацан)
 
+[DACAN 0.43 for Linux x86-64 and RTX 2080 Ti](https://github.com/tirex999/DACAN/releases/tag/v0.43). The conversation cache now has a default lifetime of 480 minutes. The release includes the engine binary and its checksum.
+
 🇬🇧 **English** | 🇷🇺 [Русский](README.ru.md) · [❤️ Support the project](#support-the-project)
 
 **DACAN** is an inference engine for **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** (125B
