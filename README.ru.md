@@ -1,6 +1,6 @@
 # DACAN (Дацан)
 
-[DACAN 0.43.1 для Linux x86-64 и RTX 2080 Ti](https://github.com/tirex999/DACAN/releases/tag/v0.43.1). Кэш диалога по умолчанию живёт 120 минут (`--conversation-cache-expire-min`, настраивается). В выпуске есть готовый движок и его контрольная сумма.
+[DACAN 0.43.2 для Linux x86-64 и RTX 2080 Ti](https://github.com/tirex999/DACAN/releases/tag/v0.43.2). Кэш диалога по умолчанию живёт 120 минут (`--conversation-cache-expire-min`, настраивается). В выпуске есть готовый движок и его контрольная сумма.
 
 🇬🇧 [English](README.md) | 🇷🇺 **Русский** · [❤️ Поддержать проект](#поддержать-проект)
 
