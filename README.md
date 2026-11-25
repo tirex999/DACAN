@@ -270,6 +270,10 @@ grows, lower `conversation_cache_mib` or close programs on the machine.
 Before refusing, the engine evicts the least recently used parked conversations (oldest first) to admit the new
 snapshot; `skipped_parks` counts only refusals that eviction could not prevent. The system floor it keeps free is
 `--conversation-cache-min-free-mib` (16384 MiB in the example config).
+The budget keeps its own reserve: `--conversation-cache-reserve-mib` (20480 MiB by default) - the oldest
+parked conversation is evicted while that much of the budget is still free, not when the budget is already
+full; a per-minute guard also evicts the least recently used conversations when host free RAM drops below
+the floor (log: `evicted N parked conversations to keep X MiB free`).
 
 A parked conversation that goes unused is dropped on its own: `--conversation-cache-expire-min` (10 minutes in
 the example configs) sweeps the cache once per that interval and removes the entries parked longer ago than the
