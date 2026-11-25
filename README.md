@@ -267,8 +267,11 @@ Two more settings in the gear -> **Model settings**:
 
 The monitor shows **`skipped_parks`**: how many times the host had too little RAM to park a conversation. If it
 grows, lower `conversation_cache_mib` or close programs on the machine.
+Before refusing, the engine evicts the least recently used parked conversations (oldest first) to admit the new
+snapshot; `skipped_parks` counts only refusals that eviction could not prevent. The system floor it keeps free is
+`--conversation-cache-min-free-mib` (16384 MiB in the example config).
 
-A parked conversation that goes unused is dropped on its own: `--conversation-cache-expire-min` (60 minutes in
+A parked conversation that goes unused is dropped on its own: `--conversation-cache-expire-min` (10 minutes in
 the example configs) sweeps the cache once per that interval and removes the entries parked longer ago than the
 interval, so the RAM comes back without a restart. The log line `conversation cache: expired N parked
 conversations` shows each sweep; entries restored by a request leave the cache by themselves. The budget above
