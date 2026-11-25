@@ -275,7 +275,7 @@ parked conversation is evicted while that much of the budget is still free, not 
 full; a per-minute guard also evicts the least recently used conversations when host free RAM drops below
 the floor (log: `evicted N parked conversations to keep X MiB free`).
 
-A parked conversation that goes unused is dropped on its own: `--conversation-cache-expire-min` (10 minutes in
+A parked conversation that goes unused is dropped on its own: `--conversation-cache-expire-min` (120 minutes in
 the example configs) sweeps the cache once per that interval and removes the entries parked longer ago than the
 interval, so the RAM comes back without a restart. The log line `conversation cache: expired N parked
 conversations` shows each sweep; entries restored by a request leave the cache by themselves. The budget above
