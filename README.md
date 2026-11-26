@@ -284,9 +284,10 @@ the machine's free RAM does not make the cache bigger - the engine simply refuse
 machine's available memory.
 
 A later turn of the same conversation replaces its parked copy instead of parking another one: the engine matches
-the entry by the conversation's session id (Codex sends `session_id`/`thread_id`), so a long-running chat stays one
-entry (not one per turn), and two chats that share a long system prompt are not conflated. Without a session id (a
-plain OpenAI client) the engine falls back to matching the start of the token history.
+the entry by the start of the token history, and the conversation's session id (Codex sends `session_id`/`thread_id`)
+keeps two chats apart whose prompts share a long system prefix. A session id alone is not the identity: Claude Code's
+subagents carry the same `session_id` as their parent yet a different conversation, so since 0.43.3 they no longer
+evict the parent's parked copy. Without a session id (a plain OpenAI client) the token history alone decides.
 
 After updating the page press **Ctrl+F5**: the browser keeps the old script in its cache.
 
